@@ -1,0 +1,88 @@
+name: ci-shell-unsigned
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync engine
+        run: python3 tools/engine.py sync
+
+      - name: Install build tools
+        run: brew install xcodegen zstd
+
+      - name: Python packages
+        run: python3 -m pip install --break-system-packages fonttools lz4
+
+      - name: Build the unsigned shell around a synthetic framework
+        env:
+          DM_BUNDLE_ID: org.nxnative.shell
+          DM_SHELL_NAME: NX2Apple
+        run: |
+          set -euxo pipefail
+          FWROOT="$RUNNER_TEMP/fw"
+          mkdir -p "$FWROOT"
+          python3 - "$FWROOT" <<'PY'
+          import json, os, plistlib, sys
+          from pathlib import Path
+          root = Path(sys.argv[1])
+          title = '010015100B514000'
+          name = f'DmGame{title}'
+          fw = root / f'{name}.framework'
+          (fw / 'dm').mkdir(parents=True, exist_ok=True)
+          exe = f'DmGame{title}'
+          chain = 'b-' + next(l.split('"')[1] for l in Path('dm/gfx/nvn/dmsh_chain.h').read_text().splitlines() if l.startswith('#define DMSH_CHAIN "'))
+          manifest = {'schema': 1, 'title_id': title, 'name': f'Fixture {title}', 'display_version': '1.0', 'package_version': 'v0',
+                      'modules': ['main'], 'nro_count': 0, 'chain': chain, 'loader': 'FH', 'framework': f'{name}.framework',
+                      'framework_executable': exe, 'image_marker': 'dmgame_image_marker', 'profile': 'profile.tsv',
+                      'shader_map': 'dm/shader_map.tsv', 'launcher': 'dm/launcher.json', 'romfs_marker': 'fixture.marker',
+                      'romfs_identity': '', 'min_os': '26.0'}
+          (fw / 'game.manifest.json').write_text(json.dumps(manifest, indent=2))
+          (fw / 'dm/launcher.json').write_text(json.dumps({'schema': 1, 'game': title, 'settings': []}))
+          (fw / 'profile.tsv').write_text(f'id\t{title}\n')
+          (fw / 'dm/shader_map.tsv').write_text('')
+          plist = {'CFBundleExecutable': exe, 'CFBundleIdentifier': f'org.nxnative.ci.{title.lower()}', 'CFBundleName': exe,
+                   'CFBundlePackageType': 'FMWK', 'CFBundleShortVersionString': '1.0', 'CFBundleVersion': '1.0',
+                   'CFBundleSupportedPlatforms': ['iPhoneOS'], 'MinimumOSVersion': '26.0'}
+          (fw / 'Info.plist').write_bytes(plistlib.dumps(plist))
+          src = root / 'marker.c'
+          src.write_text('__attribute__((used, visibility("default"))) const char dmgame_image_marker[] = "DmGame";\n')
+          import subprocess
+          r = subprocess.run(['xcrun', '-sdk', 'iphoneos', 'clang', '-arch', 'arm64', '-mios-version-min=26.0', '-dynamiclib',
+                              '-install_name', f'@rpath/{name}.framework/{exe}', str(src), '-o', str(fw / exe)], capture_output=True, text=True)
+          if r.returncode != 0:
+              sys.exit(r.stderr)
+          print('framework at', fw)
+          PY
+          SHELL_DIR="$RUNNER_TEMP/shellproj" \
+          DM_SHELL_FRAMEWORKS="$FWROOT/DmGame010015100B514000.framework" \
+          DM_BUNDLE_ID="$DM_BUNDLE_ID" \
+          DM_SHELL_NAME="$DM_SHELL_NAME" \
+          FONT_PY=python3 \
+          bash dm/ios/tools/build_shell.sh --build
+
+      - name: Package the unsigned IPA
+        run: |
+          set -euxo pipefail
+          APP=$(find "$RUNNER_TEMP/shellproj" -maxdepth 8 -name 'DmShell.app' -type d | head -1)
+          test -n "$APP"
+          mkdir -p out/Payload
+          cp -R "$APP" out/Payload/
+          cd out
+          zip -qry NX2Apple-shell-unsigned.ipa Payload
+          ls -lh NX2Apple-shell-unsigned.ipa
+          unzip -l NX2Apple-shell-unsigned.ipa | head -20
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NX2Apple-shell-unsigned
+          path: out/NX2Apple-shell-unsigned.ipa
+          if-no-files-found: error
