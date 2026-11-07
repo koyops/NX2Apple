@@ -22,6 +22,11 @@ jobs:
       - name: Python packages
         run: python3 -m pip install --break-system-packages fonttools lz4
 
+      - name: Check engine tree
+        run: |
+          ls -la engine/dm/ios/tools/build_shell.sh
+          ls engine/dm/gfx/nvn/dmsh_chain.h
+
       - name: Build the unsigned shell around a synthetic framework
         env:
           DM_BUNDLE_ID: org.nxnative.shell
@@ -39,7 +44,7 @@ jobs:
           fw = root / f'{name}.framework'
           (fw / 'dm').mkdir(parents=True, exist_ok=True)
           exe = f'DmGame{title}'
-          chain = 'b-' + next(l.split('"')[1] for l in Path('dm/gfx/nvn/dmsh_chain.h').read_text().splitlines() if l.startswith('#define DMSH_CHAIN "'))
+          chain = 'b-' + next(l.split('"')[1] for l in Path('engine/dm/gfx/nvn/dmsh_chain.h').read_text().splitlines() if l.startswith('#define DMSH_CHAIN "'))
           manifest = {'schema': 1, 'title_id': title, 'name': f'Fixture {title}', 'display_version': '1.0', 'package_version': 'v0',
                       'modules': ['main'], 'nro_count': 0, 'chain': chain, 'loader': 'FH', 'framework': f'{name}.framework',
                       'framework_executable': exe, 'image_marker': 'dmgame_image_marker', 'profile': 'profile.tsv',
@@ -67,7 +72,7 @@ jobs:
           DM_BUNDLE_ID="$DM_BUNDLE_ID" \
           DM_SHELL_NAME="$DM_SHELL_NAME" \
           FONT_PY=python3 \
-          bash dm/ios/tools/build_shell.sh --build
+          bash engine/dm/ios/tools/build_shell.sh --build
 
       - name: Package the unsigned IPA
         run: |
