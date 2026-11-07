@@ -31,6 +31,7 @@ jobs:
         env:
           DM_BUNDLE_ID: org.nxnative.shell
           DM_SHELL_NAME: NX2Apple
+          DM_ENTITLEMENTS: ''
         run: |
           set -euxo pipefail
           FWROOT="$RUNNER_TEMP/fw"
