@@ -1,0 +1,119 @@
+name: ci-shell-real
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ROMFS_ID: "DMROMFSID1 title=0100ABF008968000 version=1.0 build=- size=10180968999 index=63ac99366071e214"
+  GAME: "0100ABF008968000"
+
+jobs:
+  shell:
+    runs-on: xcode-27
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync engine
+        run: python3 tools/engine.py sync
+
+      - name: Install build tools
+        run: |
+          brew install xcodegen zstd
+          python3 -m pip install --break-system-packages fonttools lz4
+
+      - name: Fetch private build inputs
+        env:
+          GH_TOKEN: ${{ secrets.BUILD_INPUTS_TOKEN }}
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/in
+          gh release download v1 --repo koyops/nx2apple-build-inputs -p 'game-inputs.zip' -D /tmp/in
+          gh release download v1 --repo koyops/nx2apple-build-inputs -p 'b-223f10d34f97.img' -D /tmp/in
+          ls -lh /tmp/in
+
+      - name: Stage the game's work folder
+        run: |
+          set -euxo pipefail
+          W=/tmp/w; mkdir -p "$W/build" "$W/data/$GAME" "$W/build/ios/dmsh_b"
+          unzip -q /tmp/in/game-inputs.zip -d /tmp/in/x
+          cp -R /tmp/in/x/patched_v0 "$W/build/patched_v0"
+          cp -R /tmp/in/x/profile "$W/profile"
+          cp /tmp/in/b-223f10d34f97.img "$W/build/ios/dmsh_b/b-223f10d34f97.img"
+          ls -la "$W/build" "$W/build/ios/dmsh_b"
+
+      - name: Print build_ipa.sh usage
+        run: sed -n '1,60p' engine/dm/ios/tools/build_ipa.sh
+
+      - name: Build the game framework (route C)
+        continue-on-error: true
+        run: |
+          set -uxo pipefail
+          W=/tmp/w
+          GAME="$GAME" W="$W" PATCHED="$W/build/patched_v0" \
+          ROMFS="$W/data/$GAME/RomFS.img" MSL_IOS="$W/build/ios/dmsh_b" \
+          FONT_PY=python3 DM_FRAMEWORK=1 DM_COPY_ROMFS=NO GFXAPI=nvn \
+          DM_BUNDLE_ID=org.nxnative.shell DM_DISPLAY_NAME="NX2Apple" \
+          bash engine/dm/ios/tools/build_ipa.sh "$W/out-fw.ipa" 2>&1 | tail -200
+
+      - name: Prepare the framework folder
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/fw
+          if [ -f /tmp/w/out-fw.ipa ]; then
+            unzip -q /tmp/w/out-fw.ipa -d /tmp/outfw
+            cp -R /tmp/outfw/Payload/DmIOS.app/Frameworks/*.framework /tmp/fw/ 2>/dev/null || true
+          fi
+          ls -la /tmp/fw || true
+          if [ ! -d /tmp/fw ]; then echo "no framework built"; fi
+
+      - name: Patch the manifest's romfs identity
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import json, os, glob
+          rid = os.environ['ROMFS_ID']
+          for p in glob.glob('/tmp/fw/*/game.manifest.json'):
+              m = json.load(open(p, encoding='utf-8'))
+              m['romfs_identity'] = rid
+              json.dump(m, open(p, 'w', encoding='utf-8'), indent=2)
+              print('patched', p)
+          PY
+          cat /tmp/fw/*/game.manifest.json || true
+
+      - name: Build the shell around the real framework
+        run: |
+          set -euxo pipefail
+          FW=$(ls -d /tmp/fw/*.framework | head -1)
+          test -n "$FW"
+          SHELL_DIR=/tmp/shellproj \
+          DM_SHELL_FRAMEWORKS="$FW" \
+          DM_BUNDLE_ID=org.nxnative.shell \
+          DM_SHELL_NAME=NX2Apple \
+          DM_ENTITLEMENTS='' \
+          FONT_PY=python3 \
+          bash engine/dm/ios/tools/build_shell.sh --build
+
+      - name: Package the IPA
+        run: |
+          set -euxo pipefail
+          APP=$(find /tmp/shellproj -maxdepth 8 -name 'DmShell.app' -type d | head -1)
+          test -n "$APP"
+          mkdir -p out/Payload
+          cp -R "$APP" out/Payload/
+          cd out
+          zip -qry NX2Apple-shell-real.ipa Payload
+          ls -lh NX2Apple-shell-real.ipa
+          du -sh Payload
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: NX2Apple-shell-real
+          path: |
+            out/NX2Apple-shell-real.ipa
+            /tmp/fw/*/game.manifest.json
+          if-no-files-found: warn
