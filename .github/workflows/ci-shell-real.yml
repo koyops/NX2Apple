@@ -55,14 +55,8 @@ jobs:
           echo "inputs digest: $IN"
           printf '# the game and the profile inputs this library was built from (dm/gfx/tools/dmsh_chain.py inputs)\ngame\t%s\ninputs\t%s\n' "$GAME" "$IN" > "$LIB/inputs.tsv"
           C1="$W/profile/$GAME/c1_full.tsv"
-          python3 - "$C1" "$CHAIN_BARE" "$IN" <<'PY'
-import sys
-p, chain, ins = sys.argv[1], sys.argv[2], sys.argv[3]
-lines = open(p, encoding='utf-8').read().splitlines()
-lines[0] = f'# chain b-{chain} inputs {ins} ' + ' '.join(lines[0].split()[5:])
-open(p, 'w', encoding='utf-8').write('\n'.join(lines) + '\n')
-print('c1 header:', lines[0])
-PY
+          sed -i '' -e "1s|^# chain b-[^ ]* inputs [^ ]*|# chain b-$CHAIN_BARE inputs $IN|" "$C1"
+          head -1 "$C1"
           ls -la "$W/build" "$W/build/ios/dmsh_b"
 
       - name: Print build_ipa.sh usage
