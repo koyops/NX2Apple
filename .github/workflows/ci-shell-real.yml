@@ -9,6 +9,8 @@ permissions:
 env:
   ROMFS_ID: "DMROMFSID1 title=0100ABF008968000 version=1.0 build=- size=10180968999 index=63ac99366071e214"
   GAME: "0100ABF008968000"
+  CHAIN_BARE: "223f10d34f97"
+  DM_GAMES_DIR: "/tmp/w/profile"
 
 jobs:
   shell:
@@ -48,6 +50,19 @@ jobs:
           cp -R /tmp/in/x/patched_v0 "$W/build/patched_v0"
           cp -R /tmp/in/x/profile "$W/profile"
           tar -xzf /tmp/in/shader-lib-b-223f10d34f97.tar.gz -C "$W/build/ios/dmsh_b"
+          LIB="$W/build/ios/dmsh_b/b-$CHAIN_BARE"
+          IN=$(DM_GAME="$GAME" DM_GAMES_DIR="$W/profile" python3 engine/dm/gfx/tools/dmsh_chain.py --inputs)
+          echo "inputs digest: $IN"
+          printf '# the game and the profile inputs this library was built from (dm/gfx/tools/dmsh_chain.py inputs)\ngame\t%s\ninputs\t%s\n' "$GAME" "$IN" > "$LIB/inputs.tsv"
+          C1="$W/profile/$GAME/c1_full.tsv"
+          python3 - "$C1" "$CHAIN_BARE" "$IN" <<'PY'
+import sys
+p, chain, ins = sys.argv[1], sys.argv[2], sys.argv[3]
+lines = open(p, encoding='utf-8').read().splitlines()
+lines[0] = f'# chain b-{chain} inputs {ins} ' + ' '.join(lines[0].split()[5:])
+open(p, 'w', encoding='utf-8').write('\n'.join(lines) + '\n')
+print('c1 header:', lines[0])
+PY
           ls -la "$W/build" "$W/build/ios/dmsh_b"
 
       - name: Print build_ipa.sh usage
