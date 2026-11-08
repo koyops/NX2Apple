@@ -1,0 +1,90 @@
+name: ci-violet
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GAME: "01008F6008C5E000"
+  CHAIN_BARE: "223f10d34f97"
+  ROMFS_ID: "DMROMFSID1 title=01008F6008C5E000 version=1.0 build=- size=0 index=0000000000000000"
+
+jobs:
+  violet:
+    runs-on: xcode-27
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v1.2.1
+
+      - name: Sync engine
+        run: python3 tools/engine.py sync
+
+      - name: Install build tools
+        run: |
+          brew install xcodegen zstd
+          python3 -m pip install --break-system-packages fonttools lz4 capstone zstandard
+
+      - name: Install .NET SDK 10
+        run: |
+          set -euxo pipefail
+          curl -sSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
+          bash /tmp/dotnet-install.sh --channel 10.0 --install-dir "$HOME/.dotnet"
+          echo "$HOME/.dotnet" >> "$GITHUB_PATH"
+          export PATH="$HOME/.dotnet:$PATH"
+          export DOTNET_ROOT="$HOME/.dotnet"
+          dotnet --version
+
+      - name: Fetch private build inputs
+        env:
+          GH_TOKEN: ${{ secrets.BUILD_INPUTS_TOKEN }}
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/in
+          gh release download v2 --repo koyops/nx2apple-build-inputs -p 'violet-inputs-small.zip' -D /tmp/in
+          gh release download v2 --repo koyops/nx2apple-build-inputs -p 'violet-trpfs.part00' -D /tmp/in
+          gh release download v2 --repo koyops/nx2apple-build-inputs -p 'violet-trpfs.part01' -D /tmp/in
+          gh release download v2 --repo koyops/nx2apple-build-inputs -p 'violet-trpfs.part02' -D /tmp/in
+          ls -lh /tmp/in
+
+      - name: Assemble the game dump
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/in/x /tmp/dump/exefs /tmp/dump/romfs/arc
+          unzip -q /tmp/in/violet-inputs-small.zip -d /tmp/in/x
+          cp /tmp/in/x/ExeFS/* /tmp/dump/exefs/
+          cp /tmp/in/x/RomFS/arc/data.trpfd /tmp/dump/romfs/arc/
+          cat /tmp/in/violet-trpfs.part00 /tmp/in/violet-trpfs.part01 /tmp/in/violet-trpfs.part02 > /tmp/dump/romfs/arc/data.trpfs
+          ls -l /tmp/dump/exefs /tmp/dump/romfs/arc
+
+      - name: Build the game (patch, split Trinity, iOS shaders, IPA)
+        continue-on-error: true
+        run: |
+          set -uxo pipefail
+          export DOTNET_ROOT="$HOME/.dotnet"
+          export PATH="$HOME/.dotnet:$PATH"
+          mkdir -p /tmp/w
+          cd engine
+          python3 scripts/build_ipa_from_nsp.py /tmp/dump --work-dir /tmp/w -p v0 --platform ios --romfs separate --keep-extracted 2>&1 | tee /tmp/w/build.log | tail -300
+          exit 0
+
+      - name: Show what the build produced
+        if: always()
+        run: |
+          set -uxo pipefail
+          tail -80 /tmp/w/build.log || true
+          ls -la /tmp/w || true
+          ls -la /tmp/w/shader/ios || true
+          ls -d /tmp/w/patched_* || true
+          ls -la /tmp/w/ipa || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: violet-build-logs
+          path: |
+            /tmp/w/build.log
+          if-no-files-found: warn
