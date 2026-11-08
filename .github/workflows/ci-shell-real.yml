@@ -34,7 +34,7 @@ jobs:
           set -euxo pipefail
           mkdir -p /tmp/in
           gh release download v1 --repo koyops/nx2apple-build-inputs -p 'game-inputs.zip' -D /tmp/in
-          gh release download v1 --repo koyops/nx2apple-build-inputs -p 'shader-cache.tar.gz' -D /tmp/in
+          gh release download v1 --repo koyops/nx2apple-build-inputs -p 'shader-lib-b-223f10d34f97.tar.gz' -D /tmp/in
           ls -lh /tmp/in
 
       - name: Stage the game's work folder
@@ -47,7 +47,7 @@ jobs:
           unzip -q /tmp/in/game-inputs.zip -d /tmp/in/x
           cp -R /tmp/in/x/patched_v0 "$W/build/patched_v0"
           cp -R /tmp/in/x/profile "$W/profile"
-          tar -xzf /tmp/in/shader-cache.tar.gz -C "$W/build/ios/dmsh_b" --strip-components=1
+          tar -xzf /tmp/in/shader-lib-b-223f10d34f97.tar.gz -C "$W/build/ios/dmsh_b"
           ls -la "$W/build" "$W/build/ios/dmsh_b"
 
       - name: Print build_ipa.sh usage
