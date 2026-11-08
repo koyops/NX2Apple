@@ -38,7 +38,10 @@ jobs:
       - name: Stage the game's work folder
         run: |
           set -euxo pipefail
-          W=/tmp/w; mkdir -p "$W/build" "$W/data/$GAME" "$W/build/ios/dmsh_b"
+          W=/tmp/w; mkdir -p "$W/build" "$W/data/$GAME" "$W/build/ios/dmsh_b" /tmp/romfs_stub/bin/sound/NX64/wwise/bank
+          : > /tmp/romfs_stub/bin/sound/NX64/wwise/bank/Stream.pck
+          python3 engine/dm/tools/romfs_image.py /tmp/romfs_stub "$W/data/$GAME/RomFS.img"
+          ls -l "$W/data/$GAME/RomFS.img"
           unzip -q /tmp/in/game-inputs.zip -d /tmp/in/x
           cp -R /tmp/in/x/patched_v0 "$W/build/patched_v0"
           cp -R /tmp/in/x/profile "$W/profile"
