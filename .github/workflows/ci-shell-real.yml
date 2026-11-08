@@ -11,6 +11,7 @@ env:
   GAME: "0100ABF008968000"
   CHAIN_BARE: "223f10d34f97"
   DM_GAMES_DIR: "/tmp/w/profile"
+  DM_GAMES_FIRST: "1"
 
 jobs:
   shell:
