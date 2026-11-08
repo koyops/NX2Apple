@@ -9,7 +9,7 @@ permissions:
 env:
   GAME: "01008F6008C5E000"
   CHAIN_BARE: "223f10d34f97"
-  ROMFS_ID: "DMROMFSID1 title=01008F6008C5E000 version=1.0 build=- size=0 index=0000000000000000"
+  ROMFS_ID: "DMROMFSID1 title=01008F6008C5E000 version=1.0 build=- size=6678553818 index=040fff3c5772fbdf"
 
 jobs:
   violet:
@@ -81,10 +81,87 @@ jobs:
           ls -d /tmp/w/patched_* || true
           ls -la /tmp/w/ipa || true
 
+      - name: Build the game framework (route C)
+        continue-on-error: true
+        run: |
+          set -uxo pipefail
+          W=/tmp/w
+          mkdir -p /tmp/romfs_stub/arc
+          : > /tmp/romfs_stub/arc/data.trpfs
+          : > /tmp/romfs_stub/arc/data.trpfd
+          python3 engine/dm/tools/romfs_image.py /tmp/romfs_stub "$W/RomFS_stub.img"
+          PATCHED=$(ls -d $W/patched_* 2>/dev/null | head -1)
+          echo "patched: $PATCHED"
+          ls -la $W/shader/ios 2>/dev/null || true
+          if [ -z "$PATCHED" ] || [ ! -d "$W/shader/ios" ]; then echo "nothing to build from"; exit 1; fi
+          GAME="$GAME" W="$W" PATCHED="$PATCHED" \
+          ROMFS="$W/RomFS_stub.img" MSL_IOS="$W/shader/ios" \
+          FONT_PY=python3 DM_FRAMEWORK=1 DM_FRAMEWORK_ONLY=/tmp/fw DM_COPY_ROMFS=NO GFXAPI=nvn \
+          DM_BUNDLE_ID=org.nxnative.shell DM_DISPLAY_NAME="NX2Apple" DM_GAMES_FIRST=1 \
+          bash engine/dm/ios/tools/build_ipa.sh "$W/out-fw.ipa" 2>&1 | tail -200
+          exit 0
+
+      - name: Prepare the framework folder
+        if: always()
+        run: |
+          set -uxo pipefail
+          mkdir -p /tmp/fw
+          if [ -f /tmp/w/out-fw.ipa ]; then
+            unzip -q /tmp/w/out-fw.ipa -d /tmp/outfw
+            cp -R /tmp/outfw/Payload/DmIOS.app/Frameworks/*.framework /tmp/fw/ 2>/dev/null || true
+          fi
+          ls -la /tmp/fw || true
+
+      - name: Patch the manifest's romfs identity
+        if: always()
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import json, os, glob
+          rid = os.environ['ROMFS_ID']
+          for p in glob.glob('/tmp/fw/*/game.manifest.json'):
+              m = json.load(open(p, encoding='utf-8'))
+              m['romfs_identity'] = rid
+              json.dump(m, open(p, 'w', encoding='utf-8'), indent=2)
+              print('patched', p)
+          PY
+          cat /tmp/fw/*/game.manifest.json 2>/dev/null || true
+
+      - name: Build the shell around the real framework
+        if: always()
+        continue-on-error: true
+        run: |
+          set -uxo pipefail
+          FW=$(ls -d /tmp/fw/*.framework 2>/dev/null | head -1)
+          if [ -z "$FW" ]; then echo "no framework"; exit 1; fi
+          SHELL_DIR=/tmp/shellproj \
+          DM_SHELL_FRAMEWORKS="$FW" \
+          DM_BUNDLE_ID=org.nxnative.shell \
+          DM_SHELL_NAME=NX2Apple \
+          DM_ENTITLEMENTS='' \
+          FONT_PY=python3 \
+          bash engine/dm/ios/tools/build_shell.sh --build 2>&1 | tail -120
+          exit 0
+
+      - name: Package the IPA
+        if: always()
+        run: |
+          set -uxo pipefail
+          APP=$(find /tmp/shellproj -maxdepth 8 -name 'DmShell.app' -type d 2>/dev/null | head -1)
+          mkdir -p out/Payload
+          if [ -n "$APP" ]; then cp -R "$APP" out/Payload/; fi
+          if [ -d out/Payload/DmShell.app ]; then
+            (cd out && zip -qry NX2Apple-violet.ipa Payload && ls -lh NX2Apple-violet.ipa)
+          fi
+          if [ -f /tmp/w/PokemonViolet.ipa ]; then cp /tmp/w/PokemonViolet.ipa out/standalone.ipa; fi
+          ls -la out || true
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: violet-build-logs
+          name: violet-build
           path: |
+            out/*.ipa
             /tmp/w/build.log
+            /tmp/fw/*/game.manifest.json
           if-no-files-found: warn
