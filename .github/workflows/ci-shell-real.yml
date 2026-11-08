@@ -70,7 +70,7 @@ jobs:
           W=/tmp/w
           GAME="$GAME" W="$W" PATCHED="$W/build/patched_v0" \
           ROMFS="$W/data/$GAME/RomFS.img" MSL_IOS="$W/build/ios/dmsh_b" \
-          FONT_PY=python3 DM_FRAMEWORK=1 DM_COPY_ROMFS=NO GFXAPI=nvn \
+          FONT_PY=python3 DM_FRAMEWORK=1 DM_FRAMEWORK_ONLY=/tmp/fw DM_COPY_ROMFS=NO GFXAPI=nvn \
           DM_BUNDLE_ID=org.nxnative.shell DM_DISPLAY_NAME="NX2Apple" \
           bash engine/dm/ios/tools/build_ipa.sh "$W/out-fw.ipa" 2>&1 | tail -200
 
