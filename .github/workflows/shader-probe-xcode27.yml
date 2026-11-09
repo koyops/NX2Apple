@@ -1,0 +1,108 @@
+name: shader-probe-xcode27
+
+# Phase 0 of the GitHub-CI shader route: is there a working Metal device on this runner?
+# The engine's shader split (build_ipa.sh DM_FRAMEWORK_ONLY) boots the game's own arm64 code in a
+# Mac host and compiles Metal; without a Metal device the whole CI route is dead. This answers only
+# that, plus what the runner actually has (tools, RAM, disk). No game data is involved.
+#
+# Label note: the same probe as shader-probe.yml, but on xcode-27 instead of macos-14. GitHub
+# answers every dispatch of the macos-14 variant with the annotation "The configuration
+# 'macos-14-arm64-us-default' is not supported" and cancels the job before a runner is assigned.
+# xcode-27 (image xcode-27-arm64) is the label every macOS job in this repo actually runs on.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: xcode-27
+    timeout-minutes: 20
+    steps:
+      - name: macOS, CPU, RAM, Xcode
+        run: |
+          set -x
+          sw_vers
+          uname -a
+          sysctl -n machdep.cpu.brand_string || true
+          sysctl -n hw.memsize || true
+          sysctl -n hw.ncpu || true
+          xcode-select -p || true
+          xcodebuild -version || true
+          swift --version || true
+          df -h /
+
+      - name: Metal toolchain
+        run: |
+          set -x
+          xcrun --find metal || true
+          xcrun metal --version || true
+          xcrun --find metallib || true
+          xcrun --find metal-tt || true
+
+      - name: GPU and tools the later phases need
+        run: |
+          set -x
+          system_profiler SPDisplaysDataType | head -80 || true
+          for t in 7z 7zz 7za p7zip xz gzip cat split python3 tar zip unzip rsync brew cmake ninja; do
+            printf '%-8s %s\n' "$t" "$(command -v $t || echo MISSING)"
+          done
+          python3 -c 'import sys; print("python3", sys.version)' || true
+
+      - name: Metal device and shader compile probe
+        run: |
+          cat > /tmp/probe.swift <<'SWIFT'
+          import Foundation
+          import Metal
+
+          let all = MTLCopyAllDevices()
+          print("MTLCopyAllDevices.count = \(all.count)")
+          for d in all {
+              print("  device: \(d.name) lowPower=\(d.isLowPower) removable=\(d.isRemovable) headless=\(d.isHeadless)")
+          }
+
+          guard let d = MTLCreateSystemDefaultDevice() else {
+              print("NO METAL")
+              exit(2)
+          }
+          print("DEVICE NAME: \(d.name)")
+          print("hasUnifiedMemory = \(d.hasUnifiedMemory)")
+          print("recommendedMaxWorkingSetSize = \(d.recommendedMaxWorkingSetSize) bytes (\(Double(d.recommendedMaxWorkingSetSize) / 1048576.0) MiB)")
+          print("maxThreadsPerThreadgroup = \(d.maxThreadsPerThreadgroup.width)x\(d.maxThreadsPerThreadgroup.height)x\(d.maxThreadsPerThreadgroup.depth)")
+          print("maxBufferLength = \(d.maxBufferLength)")
+          for f in [MTLGPUFamily.apple3, MTLGPUFamily.apple4, MTLGPUFamily.apple5, MTLGPUFamily.apple6, MTLGPUFamily.apple7, MTLGPUFamily.mac2, MTLGPUFamily.common1, MTLGPUFamily.common2, MTLGPUFamily.common3] {
+              print("supportsFamily \(f) = \(d.supportsFamily(f))")
+          }
+
+          let src = """
+          #include <metal_stdlib>
+          using namespace metal;
+          vertex float4 v_main(uint vid [[vertex_id]]) { return float4(0.0, 0.0, 0.0, 1.0); }
+          fragment float4 f_main() { return float4(1.0, 0.0, 0.0, 1.0); }
+          kernel void k_main(device float *out [[buffer(0)]], uint i [[thread_position_in_grid]]) { out[i] = out[i] * 2.0; }
+          """
+          do {
+              let lib = try d.makeLibrary(source: src, options: nil)
+              print("makeLibrary(source:) OK, functions = \(lib.functionNames.sorted())")
+              let vfn = lib.makeFunction(name: "v_main")!
+              let ffn = lib.makeFunction(name: "f_main")!
+              let kfn = lib.makeFunction(name: "k_main")!
+              let rp = MTLRenderPipelineDescriptor()
+              rp.vertexFunction = vfn
+              rp.fragmentFunction = ffn
+              rp.colorAttachments[0].pixelFormat = .bgra8Unorm
+              _ = try d.makeRenderPipelineState(descriptor: rp)
+              print("makeRenderPipelineState OK")
+              let cp = MTLComputePipelineDescriptor()
+              cp.computeFunction = kfn
+              _ = try d.makeComputePipelineState(descriptor: cp, options: [], reflection: nil)
+              print("makeComputePipelineState OK")
+          } catch {
+              print("METAL PIPELINE FAILED: \(error)")
+              exit(3)
+          }
+
+          print("PROBE RESULT: METAL OK")
+          SWIFT
+          swift /tmp/probe.swift
