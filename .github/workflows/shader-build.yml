@@ -1,0 +1,307 @@
+name: shader-build
+
+# Phase 2 of the GitHub-CI shader route: build ONE game's DmGame<TID>.framework on a macOS arm64
+# runner, because the shader library can only be produced on a host that can run the game's own
+# arm64 code (the Trinity/Oodle shader split does exactly that) and that has Apple's Metal toolchain.
+#
+# Phase 0 (run 42591519763) proved this runner has a working Metal device:
+#   DEVICE NAME: Apple Paravirtual device, recommendedMaxWorkingSetSize 4778.6 MiB,
+#   makeLibrary(source:) / makeRenderPipelineState / makeComputePipelineState all OK.
+# The runner's Metal is 32023.921 while dm/gfx/tools/dmsh_chain.lock pins 32023.922
+# (metalfe-32023.922.4), and dm/gfx/tools/own_compilers.py stops the build on that unless
+# DM_ALLOW_OTHER_METAL=1 (dm/gfx/README.md line 54; issue #242 reports corruption with an untested
+# compiler). So this workflow first tries to obtain the pinned toolchain - a newer Xcode on the
+# image, then xcodebuild -downloadComponent MetalToolchain - and only then falls back to the
+# override. The version actually used is printed and uploaded either way.
+#
+# Inputs come from the private repository's release. No game data is stored in this repository.
+
+on:
+  workflow_dispatch:
+    inputs:
+      game_id:
+        description: 'Title id of the game to build (16 hex digits)'
+        required: true
+        default: '01008F6008C5E000'
+      asset_tag:
+        description: 'Release tag in koyops/nx2apple-build-inputs that holds the inputs'
+        required: true
+        default: 'v2'
+      update_version:
+        description: 'Update version for the romfs identity (- when there is none)'
+        required: true
+        default: '-'
+      inputs_zip:
+        description: 'Release asset holding ExeFS/ and RomFS/arc/data.trpfd'
+        required: true
+        default: 'violet-inputs-small.zip'
+      trpfs_glob:
+        description: 'Glob of the release assets that rebuild data.trpfs when concatenated in name order'
+        required: true
+        default: 'violet-trpfs.part*'
+      romfs_size:
+        description: 'RomFS.img size in bytes, for the manifest romfs identity'
+        required: true
+        default: '6678553818'
+      romfs_index:
+        description: 'RomFS.img index value, for the manifest romfs identity'
+        required: true
+        default: '040fff3c5772fbdf'
+      allow_other_metal:
+        description: 'Permit a Metal compiler that is not the pinned one, when the pinned one cannot be obtained'
+        type: boolean
+        required: true
+        default: true
+      upload_shader_raw:
+        description: 'Also upload the raw shader/ios set (another ~1.8 GB)'
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  framework:
+    runs-on: xcode-27
+    timeout-minutes: 350
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: v1.2.1
+
+      - name: Sync engine
+        run: python3 tools/engine.py sync
+
+      - name: Install build tools
+        run: |
+          brew install xcodegen zstd glslang
+          python3 -m pip install --break-system-packages fonttools lz4 capstone zstandard
+
+      - name: Install .NET SDK 10
+        run: |
+          set -euxo pipefail
+          curl -sSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
+          bash /tmp/dotnet-install.sh --channel 10.0 --install-dir "$HOME/.dotnet"
+          echo "$HOME/.dotnet" >> "$GITHUB_PATH"
+          "$HOME/.dotnet/dotnet" --version
+
+      - name: Metal compiler gate
+        run: |
+          set -uxo pipefail
+          LOCK=engine/dm/gfx/tools/dmsh_chain.lock
+          echo "--- lock ---";     grep -E 'metal_(macosx|iphoneos)' "$LOCK" || true
+          echo "--- xcodes ---";   ls -d /Applications/Xcode*.app 2>/dev/null || true
+          echo "--- selected ---"; xcode-select -p || true; xcodebuild -version || true
+          echo "--- metal ---";    xcrun metal --version || true
+
+          if ! xcrun metal --version 2>&1 | grep -q '32023\.922'; then
+            NEW=""
+            for c in /Applications/Xcode_27.2*.app /Applications/Xcode_27.3*.app; do
+              if [ -d "$c" ]; then NEW="$c"; break; fi
+            done
+            if [ -n "$NEW" ]; then
+              echo "trying $NEW"
+              export DEVELOPER_DIR="$NEW"
+              echo "DEVELOPER_DIR=$NEW" >> "$GITHUB_ENV"
+              xcrun metal --version || true
+            fi
+          fi
+
+          if ! xcrun metal --version 2>&1 | grep -q '32023\.922'; then
+            echo "::warning::still not 32023.922: downloading the Metal toolchain component"
+            xcodebuild -downloadComponent MetalToolchain || true
+            xcrun metal --version || true
+          fi
+
+          {
+            echo "lock:";             grep -E 'metal_(macosx|iphoneos)' "$LOCK" || true
+            echo "xcode:";            xcodebuild -version || true
+            echo "runner-metal:";     xcrun metal --version || true
+            echo "override-allowed: ${{ inputs.allow_other_metal }}"
+          } | tee metal-version.txt
+
+          if ! xcrun metal --version 2>&1 | grep -q '32023\.922'; then
+            echo "::warning::the pinned 32023.922 was not obtained; the build uses the runner's compiler"
+          fi
+
+      - name: Fetch private build inputs
+        env:
+          GH_TOKEN: ${{ secrets.BUILD_INPUTS_TOKEN }}
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/in
+          gh release download '${{ inputs.asset_tag }}' --repo koyops/nx2apple-build-inputs -p '${{ inputs.inputs_zip }}' -D /tmp/in
+          gh release download '${{ inputs.asset_tag }}' --repo koyops/nx2apple-build-inputs -p '${{ inputs.trpfs_glob }}' -D /tmp/in
+          ls -l /tmp/in
+          shasum -a 256 /tmp/in/* | tee /tmp/in/SHA256SUMS.txt
+
+      - name: Assemble the game dump
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/in/x /tmp/dump/exefs /tmp/dump/romfs/arc
+          unzip -q "/tmp/in/${{ inputs.inputs_zip }}" -d /tmp/in/x
+          cp /tmp/in/x/ExeFS/* /tmp/dump/exefs/
+          cp /tmp/in/x/RomFS/arc/data.trpfd /tmp/dump/romfs/arc/
+          PARTS=$(ls /tmp/in/*.part* 2>/dev/null | sort || true)
+          if [ -z "$PARTS" ]; then echo "[RED] no data.trpfs parts were downloaded"; exit 1; fi
+          echo "parts: $PARTS"
+          cat $PARTS > /tmp/dump/romfs/arc/data.trpfs
+          ls -lh /tmp/dump/exefs /tmp/dump/romfs/arc
+          df -h /
+          rm -f /tmp/in/*.part*
+          df -h /
+
+      - name: Build the game (patch, shader split, iOS shaders)
+        env:
+          DM_ALLOW_OTHER_METAL: ${{ inputs.allow_other_metal && '1' || '0' }}
+        run: |
+          set -euxo pipefail
+          export DOTNET_ROOT="$HOME/.dotnet"
+          export PATH="$HOME/.dotnet:$PATH"
+          mkdir -p /tmp/w
+          cd engine
+          python3 scripts/build_ipa_from_nsp.py /tmp/dump --work-dir /tmp/w -p v0 --platform ios --romfs separate --keep-extracted 2>&1 | tee /tmp/w/build.log
+
+      - name: Show what the build produced
+        if: always()
+        run: |
+          set -uxo pipefail
+          tail -150 /tmp/w/build.log || true
+          ls -la /tmp/w || true
+          ls -la /tmp/w/shader/ios || true
+          ls -d /tmp/w/patched_* || true
+          du -sh /tmp/w/* 2>/dev/null || true
+          df -h /
+
+      - name: Build the game framework (route C, DM_FRAMEWORK_ONLY)
+        if: always()
+        env:
+          DM_ALLOW_OTHER_METAL: ${{ inputs.allow_other_metal && '1' || '0' }}
+        run: |
+          set -euxo pipefail
+          W=/tmp/w
+          mkdir -p /tmp/romfs_stub/arc
+          : > /tmp/romfs_stub/arc/data.trpfs
+          : > /tmp/romfs_stub/arc/data.trpfd
+          python3 engine/dm/tools/romfs_image.py /tmp/romfs_stub "$W/RomFS_stub.img"
+          PATCHED=$(ls -d $W/patched_* 2>/dev/null | head -1 || true)
+          echo "patched: $PATCHED"
+          if [ -z "$PATCHED" ] || [ ! -d "$W/shader/ios" ]; then
+            echo "[RED] nothing to build the framework from (no patched_* or no shader/ios)"; exit 1
+          fi
+          GAME="${{ inputs.game_id }}" W="$W" PATCHED="$PATCHED" \
+          ROMFS="$W/RomFS_stub.img" MSL_IOS="$W/shader/ios" \
+          FONT_PY=python3 DM_FRAMEWORK=1 DM_FRAMEWORK_ONLY=/tmp/fw DM_COPY_ROMFS=NO GFXAPI=nvn \
+          DM_BUNDLE_ID=org.nxnative.shell DM_DISPLAY_NAME="NX2Apple" DM_GAMES_FIRST=1 \
+          bash engine/dm/ios/tools/build_ipa.sh "$W/out-fw.ipa"
+
+      - name: Extract the framework
+        if: always()
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/fw
+          if [ -f /tmp/w/out-fw.ipa ]; then
+            unzip -q /tmp/w/out-fw.ipa -d /tmp/outfw
+            cp -R /tmp/outfw/Payload/DmIOS.app/Frameworks/*.framework /tmp/fw/ 2>/dev/null || true
+          fi
+          FW=$(ls -d /tmp/fw/*.framework 2>/dev/null | head -1 || true)
+          if [ -z "$FW" ]; then echo "[RED] no framework came out of /tmp/w/out-fw.ipa"; exit 1; fi
+          ls -la "$FW"
+          ls -la "$FW/msl" 2>/dev/null || true
+          ls -la "$FW/dm" 2>/dev/null || true
+          du -sh "$FW" || true
+
+      - name: Patch the manifest romfs identity
+        if: always()
+        env:
+          GID: ${{ inputs.game_id }}
+          UVER: ${{ inputs.update_version }}
+          RSIZE: ${{ inputs.romfs_size }}
+          RIDX: ${{ inputs.romfs_index }}
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import glob, json, os
+          rid = 'DMROMFSID1 title={} version={} build=- size={} index={}'.format(
+              os.environ['GID'], os.environ['UVER'], os.environ['RSIZE'], os.environ['RIDX'])
+          n = 0
+          for p in glob.glob('/tmp/fw/*/game.manifest.json'):
+              m = json.load(open(p, encoding='utf-8'))
+              m['romfs_identity'] = rid
+              with open(p, 'w', encoding='utf-8') as f:
+                  json.dump(m, f, indent=2)
+              print('patched', p, rid)
+              n += 1
+          if not n:
+              raise SystemExit('[RED] no game.manifest.json to patch')
+          PY
+          cat /tmp/fw/*/game.manifest.json || true
+
+      - name: Verify the framework (hard gate)
+        if: always()
+        run: |
+          set -uxo pipefail
+          FW=$(ls -d /tmp/fw/*.framework 2>/dev/null | head -1 || true)
+          if [ -z "$FW" ]; then echo "[RED] FAIL: no DmGame framework was produced"; exit 1; fi
+          python3 - "$FW" <<'PY'
+          import glob, json, os, struct, sys
+          fw = sys.argv[1]
+          chain = '223f10d34f97'
+          fails = []
+          def ck(tag, ok, detail=''):
+              print(('  [PASS] ' if ok else '  [FAIL] ') + tag.ljust(26) + str(detail))
+              if not ok:
+                  fails.append(tag)
+          exe = [p for p in glob.glob(os.path.join(fw, 'DmGame*')) if os.path.isfile(p)]
+          ck('01-dylib-present', bool(exe), exe[:1])
+          if exe:
+              b = open(exe[0], 'rb').read(32)
+              magic, cputype, _s, ftype = struct.unpack_from('<IIII', b, 0)
+              ck('02-dylib-arm64', magic == 0xfeedfacf and cputype == 0x0100000c and ftype == 6,
+                 'magic=0x%08x cputype=0x%08x ftype=%d' % (magic, cputype, ftype))
+          man = os.path.join(fw, 'game.manifest.json')
+          m = json.load(open(man, encoding='utf-8')) if os.path.isfile(man) else {}
+          ck('03-manifest', os.path.isfile(man), man)
+          ck('04-loader-fh', m.get('loader') == 'FH', m.get('loader'))
+          ck('05-chain', m.get('chain') == 'b-' + chain, m.get('chain'))
+          ck('06-romfs-id', str(m.get('romfs_identity', '')).startswith('DMROMFSID1 '), m.get('romfs_identity'))
+          ck('07-shader-map', os.path.isfile(os.path.join(fw, 'dm/shader_map.tsv')), 'dm/shader_map.tsv')
+          ck('08-c1-full', os.path.isfile(os.path.join(fw, 'dm/c1_full.tsv')), 'dm/c1_full.tsv')
+          ck('09-launcher', os.path.isfile(os.path.join(fw, 'dm/launcher.json')), 'dm/launcher.json')
+          ck('10-profile', os.path.isfile(os.path.join(fw, 'profile.tsv')), 'profile.tsv')
+          img = os.path.join(fw, 'msl', 'b-' + chain + '.img')
+          d = os.path.join(fw, 'msl', 'b-' + chain)
+          ck('11-msl-present', os.path.isfile(img) or os.path.isdir(d),
+             'img=%s folder=%s' % (os.path.isfile(img), os.path.isdir(d)))
+          if os.path.isfile(img):
+              ck('12-msl-size>100MB', os.path.getsize(img) > 100 * 1024 * 1024, os.path.getsize(img))
+          elif os.path.isdir(d):
+              n = sum(1 for e in os.scandir(d) if e.is_file())
+              ck('12-msl-files>10000', n > 10000, n)
+          print('SUMMARY FAIL=%d %s' % (len(fails), 'RESULT=PASS' if not fails else 'RESULT=FAIL'))
+          sys.exit(1 if not fails else 0)
+          PY
+
+      - name: Upload the framework
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: framework-${{ inputs.game_id }}
+          compression-level: 6
+          if-no-files-found: warn
+          path: |
+            /tmp/fw/*.framework
+            /tmp/w/build.log
+            metal-version.txt
+            /tmp/in/SHA256SUMS.txt
+
+      - name: Upload the raw shader set
+        if: ${{ always() && inputs.upload_shader_raw }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: shader-raw-${{ inputs.game_id }}
+          compression-level: 0
+          if-no-files-found: warn
+          path: /tmp/w/shader/ios
