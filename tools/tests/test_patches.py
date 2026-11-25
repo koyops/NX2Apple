@@ -129,7 +129,7 @@ class ApplySeries(unittest.TestCase):
 class ChainRule(unittest.TestCase):
     def test_the_chain_paths_come_from_the_engines_agents_md(self):
         g = P.chain_paths(SRC)
-        for want in ('dm/gfx/nvn/dmsh_chain.h', 'dm/gfx/tools/dmsh_*', 'dm/gfx/tools/Program.cs', 'dm/gfx/tools/ios_metal.py', 'dm/gfx/tools/dmsh_chain.lock', 'dm/gfx/tools/dmsh_xlate_bin*'):
+        for want in ('dm/gfx/nvn/dmsh_chain.h', 'dm/gfx/tools/dmsh_*', 'dm/gfx/tools/Program.cs', 'dm/gfx/tools/ios_metal.py', 'dm/gfx/tools/dmsh_chain.lock', 'dm/gfx/nvn/dmsh_abi.h'):
             self.assertIn(want, g)
 
     def test_hits(self):
@@ -149,14 +149,47 @@ class ForkPatchList(unittest.TestCase):
         self.assertEqual(mod.fork_patches(), '')
         (self.tmp / 'dm/fork_patches.txt').write_text('runtime-profile\nbc-cpu-decode\n')
         self.assertEqual(mod.fork_patches(), 'runtime-profile,bc-cpu-decode')
-        args = type('A', (), dict(name='G', bundle_id=None, title_id='0100000000000000', version=None, category=None, marker=None, lang=None, settings=None))()
+        args = type('A', (), dict(name='G', bundle_id=None, title_id='0100000000000000', version=None, package_version=None, category=None, marker=None, lang=None, settings=None))()
         self.assertEqual(mod.info_plist(args, '26.0', False)['DMForkPatches'], 'runtime-profile,bc-cpu-decode')
 
     def test_the_first_log_line_and_the_ios_key_are_in_the_sources(self):
         """a read of the sources, not a run: the iOS app and the Mac launcher write the line, project.yml carries the key"""
         self.assertIn('"fork patches: %s\\n"', (SRC / 'dm/ios/Sources/main.m').read_text())
-        self.assertIn('"fork patches: %s\\n"', (SRC / 'dm/mac/launcher.c').read_text())
+        launcher = (SRC / 'dm/mac/launcher.c').read_text()
+        self.assertIn('"fork patches: %s\\n"', launcher)
         self.assertIn('DMForkPatches: ${DM_FORK_PATCHES}', (SRC / 'dm/ios/project.yml').read_text())
+        import re
+        m = re.search(r'char\s+fork_patches\[(\d+)\]', launcher)
+        self.assertIsNotNone(m, 'fork_patches buffer declaration missing in dm/mac/launcher.c')
+        buf_size = int(m.group(1))
+        joined_len = len(','.join((SRC / 'dm/fork_patches.txt').read_text().splitlines()))
+        self.assertGreaterEqual(buf_size, 4096)
+        self.assertGreater(buf_size, joined_len + 512)
+
+
+class EnvSwitchesMerge(unittest.TestCase):
+    def test_merge_overlays_fork_rows_onto_engine_table(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix='test-env-merge-'))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        root = self.tmp / 'repo'
+        eng = self.tmp / 'engine'
+        (root / 'patches').mkdir(parents=True)
+        (eng / 'docs').mkdir(parents=True)
+        (root / 'patches/fork_env_switches.tsv').write_text(
+            'name\tclass\tmeaning\n'
+            'DM_FORK_ALPHA\thost-interface\talpha description\n'
+        )
+        (eng / 'docs/env_switches.tsv').write_text(
+            'name\tclass\tmeaning\n'
+            'DM_UPSTREAM\tdebug\tupstream meaning\n'
+        )
+        P.merge_env_switches(root, eng)
+        lines = (eng / 'docs/env_switches.tsv').read_text().splitlines()
+        self.assertEqual(lines, [
+            'name\tclass\tmeaning',
+            'DM_FORK_ALPHA\thost-interface\talpha description',
+            'DM_UPSTREAM\tdebug\tupstream meaning',
+        ])
 
 
 class HostTestRules(unittest.TestCase):

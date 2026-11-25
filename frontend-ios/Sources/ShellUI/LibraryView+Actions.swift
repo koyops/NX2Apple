@@ -1,0 +1,657 @@
+import SwiftUI
+#if canImport(PhotosUI)
+import PhotosUI
+#endif
+
+/// The library's actions, panels opening and closing, and the focus rules.
+extension LibraryView {
+    // MARK: Actions and focus
+
+    /// The system's echo of a controller button (see `SystemEchoWindow`), for the actions that close or go back: they
+    /// do not change the touch mode, but the echo must not close the panel the button just opened.
+    var fromSystemEcho: Bool { gate.isSystemEcho }
+    /// `actions` for the views that change settings or data themselves (a switch, a row, a button in the settings): the
+    /// system's echo of a controller button changes nothing through them.
+    var guardedActions: ShellActions {
+        let gate = gate
+        func echo() -> Bool { gate.isSystemEcho }
+        var a = actions
+        let o = actions
+        a.onSelect = { if !echo() { o.onSelect($0) } }
+        a.onPlay = { if !echo() { o.onPlay($0) } }
+        a.onChange = { if !echo() { o.onChange($0, $1, $2) } }
+        a.onPickGameData = { if !echo() { o.onPickGameData($0) } }
+        a.onUseAppData = { if !echo() { o.onUseAppData($0) } }
+        a.onPickCloudSaves = { if !echo() { o.onPickCloudSaves($0) } }
+        a.onDisableCloudSaves = { if !echo() { o.onDisableCloudSaves($0) } }
+        a.onResetDefaults = { if !echo() { o.onResetDefaults($0) } }
+        a.onShowLog = { if !echo() { o.onShowLog($0) } }
+        a.onAppUpdate = { if !echo() { o.onAppUpdate() } }
+        a.onPickShellData = { if !echo() { o.onPickShellData() } }
+        a.onPickShellCloud = { if !echo() { o.onPickShellCloud() } }
+        a.onUseShellCloud = { if !echo() { o.onUseShellCloud($0) } }
+        a.onClearShellData = { if !echo() { o.onClearShellData() } }
+        a.onClearShellCloud = { if !echo() { o.onClearShellCloud() } }
+        a.onGlobalPadMapChange = { if !echo() { o.onGlobalPadMapChange($0, $1) } }
+        a.onGlobalPadMapReset = { if !echo() { o.onGlobalPadMapReset() } }
+        a.onPadMergeChange = { if !echo() { o.onPadMergeChange($0) } }
+        a.onRestoreSaveBackup = { if !echo() { o.onRestoreSaveBackup($0) } }
+        a.onDeleteGame = { if !echo() { o.onDeleteGame($0, $1) } }
+        a.onOpenHomeButtonSettings = { if !echo() { o.onOpenHomeButtonSettings() } }
+        a.onCopyShortcutURL = o.onCopyShortcutURL.map { copy in
+            { if !echo() { copy($0) } }
+        }
+        if let add = o.onAddToHomeScreen {
+            a.onAddToHomeScreen = { @MainActor id in
+                guard !gate.isSystemEcho else { return false }
+                return await add(id)
+            }
+        }
+        if let addWithGuide = o.onAddToHomeScreenWithGuide {
+            a.onAddToHomeScreenWithGuide = { @MainActor id, floatingGuide in
+                guard !gate.isSystemEcho else { return false }
+                return await addWithGuide(id, floatingGuide)
+            }
+        }
+        a.onSaveCustomCover = o.onSaveCustomCover.map { save in
+            { id, data in if !echo() { save(id, data) } }
+        }
+        a.onResetCustomCover = o.onResetCustomCover.map { reset in
+            { id in if !echo() { reset(id) } }
+        }
+        if let pickCert = o.onPickSideloadCertificateFile {
+            a.onPickSideloadCertificateFile = { @MainActor in
+                guard !gate.isSystemEcho else { return .cancelled }
+                return await pickCert()
+            }
+        }
+        if let confirmCert = o.onConfirmSideloadCertificatePassword {
+            a.onConfirmSideloadCertificatePassword = { @MainActor password in
+                guard !gate.isSystemEcho else { return nil }
+                return await confirmCert(password)
+            }
+        }
+        if let cancelCert = o.onCancelSideloadCertificateImport {
+            a.onCancelSideloadCertificateImport = { @MainActor in
+                if !gate.isSystemEcho { cancelCert() }
+            }
+        }
+        if let removeCert = o.onRemoveSideloadCertificate {
+            a.onRemoveSideloadCertificate = { @MainActor in
+                if !gate.isSystemEcho { removeCert() }
+            }
+        }
+        if let loadCheats = o.onLoadCheatsAsync {
+            a.onLoadCheatsAsync = { @MainActor id in
+                await loadCheats(id)
+            }
+        }
+        if let importCheat = o.onImportCheatFile {
+            a.onImportCheatFile = { @MainActor id in
+                guard !gate.isSystemEcho else { return .cancelled }
+                return await importCheat(id)
+            }
+        }
+        a.onToggleCheatMaster = o.onToggleCheatMaster.map { toggle in
+            { id, on in echo() ? (o.onLoadCheats?(id) ?? GameCheatsSnapshot(gameID: id, gameTitle: "")) : toggle(id, on) }
+        }
+        if let toggleMasterAsync = o.onToggleCheatMasterAsync {
+            a.onToggleCheatMasterAsync = { @MainActor id, on in
+                if gate.isSystemEcho {
+                    if let load = o.onLoadCheatsAsync { return await load(id) }
+                    return GameCheatsSnapshot(gameID: id, gameTitle: "")
+                }
+                return await toggleMasterAsync(id, on)
+            }
+        }
+        a.onToggleCheatEntry = o.onToggleCheatEntry.map { toggle in
+            { id, key, on in echo() ? (o.onLoadCheats?(id) ?? GameCheatsSnapshot(gameID: id, gameTitle: "")) : toggle(id, key, on) }
+        }
+        if let toggleEntryAsync = o.onToggleCheatEntryAsync {
+            a.onToggleCheatEntryAsync = { @MainActor id, key, on in
+                if gate.isSystemEcho {
+                    if let load = o.onLoadCheatsAsync { return await load(id) }
+                    return GameCheatsSnapshot(gameID: id, gameTitle: "")
+                }
+                return await toggleEntryAsync(id, key, on)
+            }
+        }
+        a.onConfirmMismatchCheatImport = o.onConfirmMismatchCheatImport.map { confirm in
+            { id, token in echo() ? .cancelled : confirm(id, token) }
+        }
+        if let confirmAsync = o.onConfirmMismatchCheatImportAsync {
+            a.onConfirmMismatchCheatImportAsync = { @MainActor id, token in
+                guard !gate.isSystemEcho else { return .cancelled }
+                return await confirmAsync(id, token)
+            }
+        }
+        a.onCancelMismatchCheatImport = o.onCancelMismatchCheatImport.map { cancel in
+            { id in if !echo() { cancel(id) } }
+        }
+        a.onDismissCheatFuseAlert = o.onDismissCheatFuseAlert.map { dismiss in
+            { id in echo() ? (o.onLoadCheats?(id) ?? GameCheatsSnapshot(gameID: id, gameTitle: "")) : dismiss(id) }
+        }
+        if let dismissAsync = o.onDismissCheatFuseAlertAsync {
+            a.onDismissCheatFuseAlertAsync = { @MainActor id in
+                if gate.isSystemEcho {
+                    if let load = o.onLoadCheatsAsync { return await load(id) }
+                    return GameCheatsSnapshot(gameID: id, gameTitle: "")
+                }
+                return await dismissAsync(id)
+            }
+        }
+        return a
+    }
+    /// An action that did not come from a controller or key came from touch: hints and focus ring step back. False when
+    /// it came from neither but is the system's echo of a controller button (see `SystemEchoWindow`): the shell's own
+    /// focus already took that button, so the press is not acted on.
+    func noteTouch() -> Bool {
+        guard !gate.handling else { return true }
+        if gate.isSystemEcho { return false }
+        if !touchMode { touchMode = true }
+        if focus.visible { focus.visible = false }
+        return true
+    }
+    /// A press on the library's own buttons that the shell may act on: from `handle`, or with nothing over the library.
+    /// Under a dialog or a panel no finger reaches the library (it takes no hits there), so a press on its buttons is the
+    /// system's echo of a controller button, whatever the window says: a finger that came down elsewhere just before the
+    /// echo (a tap in the settings pane right after A) ends the window, and Play behind the pane started the game.
+    var libraryPressAllowed: Bool { FocusLayer.libraryTakesPress(fromShell: gate.handling, under: topLayer) }
+    func primary(_ detail: GameDetail, fromSettings: Bool = false) {
+        guard (fromSettings && topLayer == .settings) || libraryPressAllowed, noteTouch() else { return }
+        if detail.game.state.needsHelp { openHelp(detail.id); return }
+        let targetActions = settingsOpen ? menuActions : actions
+        switch detail.game.state {
+        case .playable: targetActions.onPlay(detail.id)
+        case .needsGameData, .needsDataUpdate: targetActions.onPickGameData(detail.id)
+        case .joiningGameData: break
+        case .needsAppUpdate: targetActions.onAppUpdate()
+        case .broken: targetActions.onShowLog(detail.id)
+        }
+    }
+    func select(_ id: String) {
+        guard libraryPressAllowed, noteTouch() else { return }
+        guard id != selectedID else { return }
+        selectedID = id
+        actions.onSelect(id)
+        settingsHeroVisible = true
+        settingsPosition.scrollTo(edge: .top)
+    }
+    func openSettings() {
+        guard !shellSettingsOpen else { return }
+        guard noteTouch() else { return }
+        controllersOpen = false
+        settingsOpen = true
+        focus.id = "set.back"
+    }
+    func closeSettings() {
+        guard !fromSystemEcho else { return }
+        settingsOpen = false
+        focus.id = "lib.settings"
+    }
+    func openControllers() { guard !shellSettingsOpen else { return }; guard noteTouch() else { return }; retention.reset(); controllersOpen = true; focus.id = "ctl.close" }
+    func openShellSettings() { guard noteTouch() else { return }; retention.reset(); shellSettingsOpen = true; focus.id = "shs.close" }
+    func closeShellSettings() { guard !fromSystemEcho else { return }; shellSettingsOpen = false; retention.closed(.shellSettings, sheetStaysOpen: menuPresented); focus.id = settingsOpen ? "set.back" : "lib.shellSettings" }
+    func openActivityLog() { guard noteTouch() else { return }; retention.reset(); activityLogOpen = true; focus.id = "act.close" }
+    func closeActivityLog() { guard !fromSystemEcho else { return }; activityLogOpen = false; retention.closed(.activityLog, sheetStaysOpen: menuPresented); focus.id = settingsOpen ? "set.back" : "lib.activityLog" }
+    func selectFromActivityLog(_ id: String) {
+        guard !fromSystemEcho else { return }
+        activityLogOpen = false
+        shellSettingsOpen = false
+        controllersOpen = false
+        settingsOpen = false
+        retention.closed(.activityLog, sheetStaysOpen: false)
+        selectedID = id
+        actions.onSelect(id)
+        focus.id = "lib.tile.\(id)"
+    }
+    /// Where the Options button opens the shell's settings: over the library and over a game's settings, never over another panel or dialog.
+    static func optionsOpensShellSettings(under top: FocusLayer?) -> Bool { top == nil || top == .settings }
+    func openTouchLayout(_ window: CGSize, _ insets: EdgeInsets) {
+        guard noteTouch() else { return }
+        touchLayout = TouchLayoutEditorModel.forDevice(window: window, insets: insets)
+        focus.id = "lay.options"
+    }
+    func closeTouchLayout() { guard !fromSystemEcho else { return }; touchLayout = nil; focus.id = "shs.arrange"; focusRefresh &+= 1 }
+    func confirmTouchLayout() {
+        guard !fromSystemEcho, let touchLayout, !touchLayout.invalidPlacement else { return }
+        touchLayout.commit()
+        closeTouchLayout()
+    }
+    func openHelp(_ id: String) { guard !fromSystemEcho else { return }; returnFocus = focus.id; helpGameID = id; focus.id = "help.done" }
+    func closeHelp() { guard !fromSystemEcho else { return }; helpGameID = nil; focus.id = returnFocus; focusRefresh &+= 1 }
+    func openRestoreBackup(_ id: String, label: String) {
+        guard noteTouch() else { return }
+        returnFocus = focus.id
+        restoreBackupLabel = label
+        restoreBackupGameID = id
+        focus.id = "rst.cancel"
+    }
+    func closeRestoreBackup() {
+        guard !fromSystemEcho else { return }
+        restoreBackupGameID = nil
+        focus.id = returnFocus
+        focusRefresh &+= 1
+    }
+    func confirmRestoreBackup(_ id: String) {
+        guard !fromSystemEcho else { return }
+        restoreBackupGameID = nil
+        menuActions.onRestoreSaveBackup(id)
+    }
+    func openHomeScreen(_ id: String) {
+        guard noteTouch() else { return }
+        returnFocus = focus.id
+        homeScreenGameID = id
+        focus.id = "hsc.save"
+    }
+    func closeHomeScreen() {
+        guard !fromSystemEcho else { return }
+        homeScreenGameID = nil
+        focus.id = returnFocus
+        focusRefresh &+= 1
+    }
+    func openCheats(_ id: String) {
+        guard noteTouch(), actions.supportsCheats else { return }
+        returnFocus = focus.id
+        cheatsGameID = id
+        focus.id = "cht.close"
+    }
+    func closeCheats() {
+        guard !fromSystemEcho else { return }
+        cheatsGameID = nil
+        focus.id = returnFocus
+        focusRefresh &+= 1
+    }
+    var activeCoverCrop: CoverCropSession? {
+        coverCropInSheetSession ?? coverCropSession
+    }
+    func openCoverPicker(_ id: String) {
+        guard noteTouch(), actions.supportsCustomCover else { return }
+        coverPickerGameID = id
+        coverPickerGeneration &+= 1
+        if menuPresented {
+            coverPickerInSheetPresented = true
+        } else {
+            coverPickerPresented = true
+        }
+    }
+    func resetCustomCover(_ id: String) {
+        guard noteTouch() else { return }
+        actions.onResetCustomCover?(id)
+    }
+    func confirmCoverCrop(_ jpegData: Data, for gameID: String) {
+        guard !fromSystemEcho else { return }
+        coverCropSession = nil
+        coverCropInSheetSession = nil
+        focus.id = returnFocus
+        focusRefresh &+= 1
+        actions.onSaveCustomCover?(gameID, jpegData)
+    }
+    func closeCoverCrop() {
+        guard !fromSystemEcho else { return }
+        coverCropSession = nil
+        coverCropInSheetSession = nil
+        focus.id = returnFocus
+        focusRefresh &+= 1
+    }
+    #if canImport(PhotosUI)
+    func handlePickedCoverPhoto(_ item: PhotosPickerItem) {
+        guard let gameID = coverPickerGameID else { return }
+        let generation = coverPickerGeneration
+        let inSheet = menuPresented
+        Task {
+            let rawData = try? await item.loadTransferable(type: Data.self)
+            let decoded: CGImage?
+            if let rawData {
+                decoded = await Task.detached(priority: .userInitiated) {
+                    CoverImageProcessor.decodeNormalizedImage(from: rawData)
+                }.value
+            } else {
+                decoded = nil
+            }
+            guard coverPickerGeneration == generation, let decoded else { return }
+            let title = games.first(where: { $0.id == gameID })?.game.title ?? ""
+            let session = CoverCropSession(gameID: gameID, gameTitle: title, image: decoded)
+            returnFocus = focus.id
+            focus.id = "crp.done"
+            if inSheet && menuPresented {
+                coverCropInSheetSession = session
+            } else {
+                coverCropSession = session
+            }
+        }
+    }
+    #endif
+    func coverCropModal(_ session: CoverCropSession) -> some View {
+        CoverCropView(
+            gameTitle: session.gameTitle,
+            image: session.image,
+            allowsPhotoRepick: true,
+            onConfirm: { jpeg in confirmCoverCrop(jpeg, for: session.gameID) },
+            onCancel: { closeCoverCrop() }
+        )
+        .coordinateSpace(name: "shell")
+        .environment(\.shellFocus, focus)
+        .environment(\.shellFocusRefresh, focusRefresh)
+        .environment(\.shellIgnoresPress, { [gate] in gate.isSystemEcho })
+        .onPreferenceChange(FocusTargets.self) { targets.values = visibleTargets($0) }
+        .tint(ShellPalette.cream)
+        .preferredColorScheme(.dark)
+        .interactiveDismissDisabled()
+        .alert(
+            Text(verbatim: noticeTitle),
+            isPresented: Binding(
+                get: { coverCropShowsNotice },
+                set: { if !$0 { onDismissNotice() } }
+            )
+        ) {
+            Button(noticeDismissTitle) { onDismissNotice() }
+        } message: {
+            Text(notice ?? "")
+        }
+        .modifier(ShellKeyboardNavigation(active: !coverCropShowsNotice) { handle($0, from: .keyboard) })
+    }
+    /// The question starts on Cancel, with the saves kept.
+    func openDelete(_ id: String) { guard noteTouch() else { return }; returnFocus = focus.id; deleteSaves = false; deleteGameID = id; focus.id = "del.cancel" }
+    func closeDelete() { guard !fromSystemEcho else { return }; deleteGameID = nil; focus.id = returnFocus; focusRefresh &+= 1 }
+    func confirmDelete(_ id: String) {
+        guard !fromSystemEcho else { return }
+        let saves = deleteSaves
+        handOffMenu { actions.onDeleteGame(id, saves) }
+    }
+    func openChoice(_ request: ChoiceRequest) {
+        guard noteTouch() else { return }
+        returnFocus = focus.id
+        choice = request
+        focus.id = "pick." + request.row.value
+    }
+    func closeChoice() {
+        guard !fromSystemEcho else { return }
+        guard let request = choice else { return }
+        choice = nil
+        let prefix = request.gameID == ShellSettingsRows.gameID ? ShellSettingsRows.targetPrefix : request.gameID == TouchLayoutEditorView.gameID ? "lay.row." : "set.row."
+        focus.id = prefix + request.row.id
+        focusRefresh &+= 1
+    }
+    func pickChoice(_ value: String) {
+        guard noteTouch() else { return }
+        guard let request = choice else { return }
+        if value != request.row.value {
+            if request.gameID == TouchLayoutEditorView.gameID { touchLayout?.apply(row: request.row.id, value: value) }
+            else if request.gameID == ShellSettingsRows.gameID { ShellSettingsRows.apply(request.row.id, value: value, to: .current) }
+            else { actions.onChange(request.gameID, request.row.id, value) }
+        }
+        closeChoice()
+    }
+    // The mapping card: the shell's map or a game's, a row's options in place of the rows once one is picked.
+    func padMappingRows(_ id: String) -> [SettingRow] {
+        if id == ControllersView.mappingID { return PadMappingRows.global(globalPadMap) }
+        return games.first { $0.id == id }.map(PadMappingRows.game) ?? []
+    }
+    func padMappingTitle(_ id: String) -> String {
+        if id == ControllersView.mappingID { return ShellStrings.text("All games") }
+        return games.first { $0.id == id }?.game.title ?? ""
+    }
+    func openPadMapping(_ id: String) {
+        guard noteTouch() else { return }
+        returnFocus = focus.id
+        padMapping = PadMappingState(gameID: id)
+        focus.id = "map.close"
+    }
+    func closePadMapping() { guard !fromSystemEcho else { return }; padMapping = nil; focus.id = returnFocus; focusRefresh &+= 1 }
+    func openPadRow(_ row: String) {
+        guard noteTouch() else { return }
+        padMapping?.row = row
+        focus.id = "map.opt." + (padMappingRows(padMapping?.gameID ?? "").first { $0.id == row }?.value ?? "")
+    }
+    func closePadRow() {
+        guard !fromSystemEcho else { return }
+        guard let row = padMapping?.row else { return }
+        padMapping?.row = nil
+        focus.id = "map.row." + row
+    }
+    func pickPadValue(_ row: String, _ value: String) {
+        guard noteTouch() else { return }
+        guard let id = padMapping?.gameID else { return }
+        if id == ControllersView.mappingID { actions.onGlobalPadMapChange(row, value) } else { actions.onChange(id, row, value) }
+        closePadRow()
+    }
+    func resetPadMapping() {
+        guard noteTouch() else { return }
+        guard let id = padMapping?.gameID else { return }
+        let global = id == ControllersView.mappingID
+        if global { actions.onGlobalPadMapReset() } else { actions.onChange(id, PadMappingRows.resetID, "") }
+        // Reset is disabled now: the focus goes to the swap, which is back at its default.
+        focus.id = "map.swap.toggle"
+    }
+    func openButtonTest() { guard noteTouch() else { return }; buttonTestOpen = true; focus.id = "test.close"; actions.onButtonTest(true) }
+    func closeButtonTest() {
+        guard buttonTestOpen else { return }
+        buttonTestOpen = false
+        actions.onButtonTest(false)
+        focus.id = "ctl.test"
+        focusRefresh &+= 1
+    }
+    /// Unconditionally reconciles secondary route state when NavigationStack pops via edge swipe or system back,
+    /// avoiding `fromSystemEcho` drops that would leave state desynced from the stack.
+    func clearSecondaryMenuRouteFromNavigationPop() {
+        if padMapping != nil {
+            padMapping = nil
+            focus.id = returnFocus
+            focusRefresh &+= 1
+        } else if buttonTestOpen {
+            buttonTestOpen = false
+            actions.onButtonTest(false)
+            focus.id = "ctl.test"
+            focusRefresh &+= 1
+        } else if let request = choice {
+            choice = nil
+            let prefix = request.gameID == ShellSettingsRows.gameID ? ShellSettingsRows.targetPrefix : request.gameID == TouchLayoutEditorView.gameID ? "lay.row." : "set.row."
+            focus.id = prefix + request.row.id
+            focusRefresh &+= 1
+        } else if helpGameID != nil {
+            helpGameID = nil
+            focus.id = returnFocus
+            focusRefresh &+= 1
+        } else if cheatsGameID != nil {
+            cheatsGameID = nil
+            focus.id = returnFocus
+            focusRefresh &+= 1
+        } else if restoreBackupGameID != nil {
+            restoreBackupGameID = nil
+            focus.id = returnFocus
+            focusRefresh &+= 1
+        } else if homeScreenGameID != nil {
+            homeScreenGameID = nil
+            focus.id = returnFocus
+            focusRefresh &+= 1
+        } else if deleteGameID != nil {
+            deleteGameID = nil
+            focus.id = returnFocus
+            focusRefresh &+= 1
+        }
+    }
+    func back() {
+        guard !fromSystemEcho else { return }
+        if activeCoverCrop != nil { closeCoverCrop() }
+        else if buttonTestOpen { closeButtonTest() }
+        else if padMapping?.row != nil { closePadRow() }
+        else if padMapping != nil { closePadMapping() }
+        else if choice != nil { closeChoice() }
+        else if let touchLayout {
+            if touchLayout.held { touchLayout.putDown() }
+            else if touchLayout.confirmingReset { touchLayout.cancelReset() }
+            else if touchLayout.confirmingExit { touchLayout.confirmingExit = false }
+            else if touchLayout.requestExit() { closeTouchLayout() }
+        }
+        else if helpGameID != nil { closeHelp() }
+        else if cheatsGameID != nil { closeCheats() }
+        else if restoreBackupGameID != nil { closeRestoreBackup() }
+        else if homeScreenGameID != nil { closeHomeScreen() }
+        else if deleteGameID != nil { closeDelete() }
+        else if activityLogOpen { closeActivityLog() }
+        else if controllersOpen { controllersOpen = false; retention.closed(.controllers, sheetStaysOpen: menuPresented); focus.id = settingsOpen ? "set.back" : "lib.controllers" }
+        else if shellSettingsOpen { closeShellSettings() }
+        else if settingsOpen { closeSettings() }
+        else { actions.onBack() }
+    }
+    func handle(_ action: ShellInput.Action, from source: InputDevice) {
+        gate.handling = true
+        defer { gate.handling = false }
+        if case .controller = source { gate.controller(action) }
+        // Every controller button belongs to the button test while it is open: it closes on B held, touch or Escape.
+        if buttonTestOpen, case .controller = source { return }
+        if device != source { device = source }
+        if touchMode { touchMode = false }
+        focus.visible = true
+        // A control the editor holds: the D-pad (or the arrow keys) moves it, A or B puts it down.
+        if let touchLayout, touchLayout.held, choice == nil {
+            switch action {
+            case .left, .right, .up, .down: touchLayout.nudge(action); return
+            case .activate, .back: touchLayout.putDown(); return
+            default: break
+            }
+        }
+        let hadTileFocus = focus.id?.hasPrefix("lib.tile.") == true
+        let settingsRowFocused = isKnownSettingsRowFocus(focus.id)
+        if focus.id == nil || (!activeTargets.contains(where: { $0.id == focus.id }) && !settingsRowFocused) {
+            focus.id = defaultFocus
+            if !Self.shouldDispatchWhenFocusMissing(action: action, topLayer: topLayer, hadTileFocus: hadTileFocus, isCoverFlow: layout.isCoverFlow, hasGames: !games.isEmpty) { return }
+        }
+        let tileFocused = focus.id == nil || focus.id?.hasPrefix("lib.tile.") == true
+        switch action {
+        case .activate:
+            if let target = activeTargets.first(where: { $0.id == focus.id }) {
+                target.activate()
+            } else if topLayer == nil, let game = Self.fallbackActivatedGame(games: games, selected: selected, focusID: focus.id) {
+                primary(game)
+            }
+        case .back: back()
+        case .settings: openSettings()
+        case .controllers: openControllers()
+        case .shellSettings:   // Options: the gear's panel from the library or a game's settings, and Options again closes it
+            if shellSettingsOpen { closeShellSettings() } else if Self.optionsOpensShellSettings(under: topLayer) { openShellSettings() }
+        case .left, .right, .up, .down:
+            let hasTileTargets = activeTargets.contains { $0.id.hasPrefix("lib.tile.") }
+            if tileFocused, let nextID = Self.fallbackSteppedGameID(games: games, selectedID: selected?.id, focusID: focus.id, action: action, isCoverFlow: layout.isCoverFlow, topLayer: topLayer, hasTileTargets: hasTileTargets) {
+                select(nextID)
+                focus.id = "lib.tile.\(nextID)"
+                return
+            }
+            move(action)
+        }
+    }
+    static func shouldDispatchWhenFocusMissing(action: ShellInput.Action, topLayer: FocusLayer?, hadTileFocus: Bool, isCoverFlow: Bool, hasGames: Bool) -> Bool {
+        if action == .activate || action == .back || action == .settings || action == .controllers || action == .shellSettings {
+            return true
+        }
+        if action == .left || action == .right || action == .up || action == .down {
+            return topLayer == nil && hasGames && (hadTileFocus || isCoverFlow)
+        }
+        return false
+    }
+    static func fallbackActivatedGame(games: [GameDetail], selected: GameDetail?, focusID: String?) -> GameDetail? {
+        if let focusID {
+            guard focusID.hasPrefix("lib.tile.") else { return nil }
+            let id = String(focusID.dropFirst("lib.tile.".count))
+            return games.first { $0.id == id } ?? selected
+        }
+        return selected
+    }
+    static func fallbackSteppedGameID(games: [GameDetail], selectedID: String?, focusID: String?, action: ShellInput.Action, isCoverFlow: Bool, topLayer: FocusLayer?, hasTileTargets: Bool) -> String? {
+        guard topLayer == nil, !games.isEmpty,
+              let index = games.firstIndex(where: { $0.id == selectedID }) ?? (games.isEmpty ? nil : 0) else {
+            return nil
+        }
+        if isCoverFlow, (action == .left || action == .right), focusID?.hasPrefix("lib.tile.") == true {
+            let next = min(games.count - 1, max(0, index + (action == .left ? -1 : 1)))
+            return games[next].id
+        }
+        if !hasTileTargets, (action == .left || action == .right || action == .up || action == .down),
+           focusID == nil || focusID?.hasPrefix("lib.tile.") == true {
+            let delta = (action == .left || action == .up) ? -1 : 1
+            let next = min(games.count - 1, max(0, index + delta))
+            return games[next].id
+        }
+        return nil
+    }
+    /// The dialog or panel on top, in the order of `FocusLayer`.
+    var topLayer: FocusLayer? {
+        if activeCoverCrop != nil { return .coverCrop }
+        if buttonTestOpen { return .buttonTest }
+        if padMapping != nil { return .padMapping }
+        if choice != nil { return .choice }
+        if touchLayout != nil { return .touchLayout }
+        if cheatsGameID != nil { return .cheats }
+        if activityLogOpen { return .activityLog }
+        if controllersOpen { return .controllers }
+        if shellSettingsOpen { return .shellSettings }
+        if helpGameID != nil { return .help }
+        if restoreBackupGameID != nil { return .restoreBackup }
+        if homeScreenGameID != nil { return .homeScreen }
+        if deleteGameID != nil { return .delete }
+        if settingsOpen { return .settings }
+        return nil
+    }
+    var orderedSettingsRowIDs: [String] {
+        guard topLayer == .settings, let selected else { return [] }
+        return GameDetailView.orderedFocusRowIDs(
+            detail: selected,
+            showsCheats: actions.supportsCheats,
+            showsHomeScreen: actions.supportsHomeScreen,
+            showsChangeCover: actions.supportsCustomCover,
+            showsDelete: true
+        )
+    }
+    func isKnownSettingsRowFocus(_ id: String?) -> Bool {
+        guard topLayer == .settings, let id, id.hasPrefix("set.") else { return false }
+        if id == "set.back" || id == "set.play" { return false }
+        return orderedSettingsRowIDs.contains(GameDetailView.focusRowID(for: id))
+    }
+    func move(_ action: ShellInput.Action) {
+        let candidates = layout.isCoverFlow
+            ? activeTargets.filter { !$0.id.hasPrefix("lib.tile.") || $0.id == "lib.tile.\(selected?.id ?? "")" }
+            : activeTargets
+        let current = focus.id
+        if topLayer == .settings, (action == .down || action == .up) {
+            let ordered = orderedSettingsRowIDs
+            let originPresent = current.map { id in candidates.contains { $0.id == id } } ?? false
+            if !originPresent {
+                if let stepped = GameDetailView.fallbackVerticalTarget(from: current, action: action, orderedRows: ordered) {
+                    focus.id = stepped
+                    return
+                }
+            } else {
+                let next = FocusNavigation.next(from: current, action: action, targets: candidates)
+                if next != current {
+                    focus.id = next
+                    return
+                }
+                if let stepped = GameDetailView.fallbackVerticalTarget(from: current, action: action, orderedRows: ordered) {
+                    focus.id = stepped
+                    return
+                }
+                return
+            }
+        }
+        focus.id = FocusNavigation.next(from: current, action: action, targets: candidates)
+        if let id = focus.id, id.hasPrefix("lib.tile.") { select(String(id.dropFirst("lib.tile.".count))) }
+    }
+    var defaultFocus: String? {
+        if activeCoverCrop != nil { return "crp.done" }
+        if buttonTestOpen { return "test.close" }
+        if let padMapping { return padMapping.row == nil ? "map.close" : "map.back" }
+        if let choice { return "pick." + choice.row.value }
+        if touchLayout != nil { return activeTargets.contains { $0.id == "lay.done" } ? "lay.done" : "lay.options" }
+        if helpGameID != nil { return "help.done" }
+        if cheatsGameID != nil { return "cht.close" }
+        if restoreBackupGameID != nil { return "rst.cancel" }
+        if homeScreenGameID != nil { return "hsc.save" }
+        if deleteGameID != nil { return "del.cancel" }
+        if activityLogOpen { return "act.close" }
+        if controllersOpen { return "ctl.close" }
+        if shellSettingsOpen { return "shs.close" }
+        if settingsOpen { return "set.back" }
+        return selected.map { "lib.tile.\($0.id)" } ?? "lib.empty.settings"
+    }
+}

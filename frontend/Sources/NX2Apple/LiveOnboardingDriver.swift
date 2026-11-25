@@ -11,13 +11,23 @@ enum OnboardingDefaults {
     static let completed = "onboarding.completed"
     static let step = "onboarding.step"
     static let platform = "onboarding.platform"
+    static let keysSkipped = "onboarding.keysSkipped"
     static let inProgress = "onboarding.inProgress"
+
+    /// A selection made in the main window supersedes an earlier skip, even if its drive is currently disconnected.
+    static func resumeKeysSkip(in defaults: UserDefaults, keysSlotIsEmpty: Bool) -> Bool {
+        guard defaults.bool(forKey: keysSkipped) else { return false }
+        if keysSlotIsEmpty { return true }
+        defaults.removeObject(forKey: keysSkipped)
+        return false
+    }
 }
 
 /// What `xcode-select`, `xcodebuild -license check` and `-checkFirstLaunchStatus` say, without anything of the machine's
 /// other state. License and first launch only count while an Xcode (not the Command Line Tools) is selected.
 struct XcodeProbe: Equatable {
     var appPath: String?            // an Xcode.app: the selected one, else the first in /Applications
+    var selectedAppUnavailable = false
     var selectedIsXcode = false     // `xcode-select -p` points into an Xcode.app, not the Command Line Tools
     var licenseAccepted = false
     var firstLaunchDone = false
@@ -38,7 +48,7 @@ struct OnboardingEnvironment {
     /// because the App Store creates Xcode.app while it is still downloading. Runs off the main thread.
     var xcodeInstalled: () async -> Bool = { await Task.detached { OnboardingEnvironment.xcodeApps().first != nil }.value }
     /// Only whether an Xcode*.app folder exists (no process): the Welcome estimate reads it.
-    var xcodeFolderExists: () -> Bool = { OnboardingEnvironment.xcodeFolders().first != nil }
+    var xcodeFolderExists: () -> Bool = { XcodeSelection.app().map(XcodeSelection.isXcode) ?? (OnboardingEnvironment.xcodeFolders().first != nil) }
     var xcodeProbe: () async -> XcodeProbe = { await OnboardingEnvironment.liveProbe() }
     /// One administrator prompt around the whole script (`OnboardingAdmin.source`).
     var runAdmin: (_ developerDir: String) async -> AdminResult = { await OnboardingAdmin.run(developerDir: $0) }
@@ -49,13 +59,34 @@ struct OnboardingEnvironment {
     /// One install through the launcher's own mechanics (`DependencyStore.install`); its end shows as a new detection.
     var installDep: (DependencyStore, Dep) -> Void = { dependencies, d in MainActor.assumeIsolated { _ = dependencies.install(d) } }
     var openURL: (URL) -> Void = { NSWorkspace.shared.open($0) }
-    var keyCheck: (_ keys: String, _ base: String) async -> KeyCheck.Outcome = { keys, base in
-        await Task.detached { KeyCheck.run(KeyCheck.Inputs(keys: keys, files: base.isEmpty ? [] : [base])) }.value
+    private var customKeyCheck: ((_ keys: String, _ base: String) async -> KeyCheck.Outcome)?
+    var keyCheck: (_ keys: String, _ base: String) async -> KeyCheck.Outcome {
+        get {
+            if let customKeyCheck { return customKeyCheck }
+            return { keys, base in
+                await Task.detached { KeyCheck.run(KeyCheck.Inputs(keys: keys, files: base.isEmpty ? [] : [base])) }.value
+            }
+        }
+        set {
+            customKeyCheck = newValue
+        }
     }
-    var scanGames: (_ folder: URL, _ repo: String) async -> [LibraryGame] = { folder, repo in
-        await Task.detached { GameLibrary.sourceGames(in: folder, repo: repo) }.value
+    var keyCheckFiles: ((_ keys: String, _ files: [String]) async -> KeyCheck.DetailedOutcome)?
+
+    func checkKeys(_ keys: String, files: [String]) async -> KeyCheck.DetailedOutcome {
+        if let keyCheckFiles {
+            return await keyCheckFiles(keys, files)
+        }
+        if let customKeyCheck {
+            let outcome = await customKeyCheck(keys, files.first ?? "")
+            return KeyCheck.DetailedOutcome(outcome: outcome, file: files.dropFirst().first { !$0.isEmpty }.map { ($0 as NSString).lastPathComponent })
+        }
+        return await Task.detached { KeyCheck.runDetailed(KeyCheck.Inputs(keys: keys, files: files)) }.value
     }
-    var fetchArtwork: (_ titleIDs: [String]) async -> Void = { ids in _ = await ArtworkStore.shared.fetchMissing(ids) }
+    var scanGames: (_ folder: URL, _ repo: String, _ keys: String) async -> [LibraryGame] = { folder, repo, keys in
+        await Task.detached { GameLibrary.sourceGames(in: folder, repo: repo, headerKey: PackageTitleID.headerKey(keysFile: keys)) }.value
+    }
+    var fetchArtwork: (_ titleIDs: [String]) async -> Void = { ids in _ = await ArtworkStore.shared.fetchMissing(ids, language: Lang.initial().code) }
     var pollInterval = 3.0
     var advanceDelay = 0.7
 
@@ -67,9 +98,7 @@ struct OnboardingEnvironment {
     }
 
     static func homeVolumeFreeBytes() -> Int64? {
-        let values = try? URL(fileURLWithPath: NSHomeDirectory())
-            .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-        return values?.volumeAvailableCapacityForImportantUsage
+        BuildSpace.available(at: NSHomeDirectory())
     }
 
     static func xcodeFolders(in directory: String = "/Applications") -> [String] {
@@ -83,23 +112,27 @@ struct OnboardingEnvironment {
         xcodeFolders(in: directory).filter { Toolchain.runOK($0 + "/Contents/Developer/usr/bin/xcodebuild", ["-version"]) }
     }
 
-    static func liveProbe() async -> XcodeProbe {
+    static func liveProbe(defaults: UserDefaults = .standard) async -> XcodeProbe {
         await Task.detached {
             var probe = XcodeProbe()
-            let runner = SystemProcessRunner()
+            if let app = XcodeSelection.app(in: defaults), !XcodeSelection.isXcode(app) {
+                probe.selectedAppUnavailable = true
+                return probe
+            }
+            let runner = SystemProcessRunner(defaults: defaults)
             let selected = runner.output("/usr/bin/xcode-select", ["-p"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if let r = selected.range(of: ".app/Contents/Developer") {
+            if selected.hasSuffix(".app/Contents/Developer") {
                 probe.selectedIsXcode = true
-                probe.appPath = String(selected[..<r.lowerBound]) + ".app"
-            } else { probe.appPath = xcodeApps().first }
+                probe.appPath = String(selected.dropLast("/Contents/Developer".count))
+            } else if XcodeSelection.app(in: defaults) == nil { probe.appPath = xcodeApps().first }
             if let dir = probe.developerDir {
                 if let text = runner.output("/usr/bin/xcodebuild", ["-version"], env: ["DEVELOPER_DIR": dir, "PATH": "/usr/bin:/bin"]) {
                     probe.version = OnboardingNVN.xcodeVersion(from: text)
                 }
             }
             if probe.selectedIsXcode {
-                probe.licenseAccepted = Toolchain.runOK("/usr/bin/xcodebuild", ["-license", "check"])
-                probe.firstLaunchDone = Toolchain.runOK("/usr/bin/xcodebuild", ["-checkFirstLaunchStatus"])
+                probe.licenseAccepted = runner.runOK("/usr/bin/xcodebuild", ["-license", "check"])
+                probe.firstLaunchDone = runner.runOK("/usr/bin/xcodebuild", ["-checkFirstLaunchStatus"])
             }
             return probe
         }.value
@@ -170,8 +203,20 @@ enum OnboardingLaunch {
     /// Setup counts as complete when the tools are all present, a keys file is known and a games folder is set. A player
     /// who has built a game already has all three in effect.
     static func setupComplete(depsPresent: Bool, keysKnown: Bool, gamesKnown: Bool) -> Bool { depsPresent && keysKnown && gamesKnown }
-    /// `force` (NSPB_ONBOARDING_FORCE=1) shows it whatever the state.
-    static func shouldShow(completed: Bool, setupComplete: Bool, force: Bool = false) -> Bool { force || (!completed && !setupComplete) }
+    enum Destination { case launcher, onboarding, forced }
+
+    @MainActor static func decide(defaults: UserDefaults, force: Bool, keysSlotIsEmpty: Bool, setupComplete: () async -> Bool) async -> Destination {
+        if force { return .forced }
+        if defaults.bool(forKey: OnboardingDefaults.completed) { return .launcher }
+        // A discovered file must not complete an explicitly keyless setup behind the player's back.
+        if defaults.bool(forKey: OnboardingDefaults.inProgress), OnboardingDefaults.resumeKeysSkip(in: defaults, keysSlotIsEmpty: keysSlotIsEmpty) {
+            return .onboarding
+        }
+        guard await setupComplete() else { return .onboarding }
+        defaults.set(true, forKey: OnboardingDefaults.completed)
+        defaults.set(false, forKey: OnboardingDefaults.inProgress)
+        return .launcher
+    }
     static func forced(_ environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool { environment["NSPB_ONBOARDING_FORCE"] == "1" }
 }
 
@@ -182,34 +227,39 @@ enum OnboardingLaunch {
 /// the games folder is the library's. Nothing about prod.keys' content is kept: the keys are checked by `KeyCheck`, and
 /// only their path is stored.
 @MainActor final class LiveOnboardingDriver: OnboardingDriver {
-    @Published private(set) var state = OnboardingState()
+    @Published var state = OnboardingState()
     let stores: LauncherStores
     var model: BuildStore { stores.build }
     let library: GameLibrary
-    private let env: OnboardingEnvironment
+    let env: OnboardingEnvironment
     /// Called once when the setup closes: to the launcher, either way.
     var onExit: (OnboardingState.Exit) -> Void = { _ in }
 
-    private var probe = XcodeProbe()
-    private var probed = false
-    private var waitingForXcode = false      // Get Xcode was pressed: poll /Applications
-    private var xcodeBusy = false            // the finish-setup run owns state.xcode
-    private var backgroundStarted = false
-    private var failedDeps: [String: OnboardingFailure] = [:]
-    private var currentInstall: String?
-    private var sawRecheck = false
-    private var logMark = 0
-    private var suppressAdvance = false
-    private var tasks: [String: Task<Void, Never>] = [:]
-    private var subscription: AnyCancellable?
-    private let ephemeral: Bool
-    private var installApproved: Bool       // background installs may start (always, except in an ephemeral run before an install action)
+    var probe = XcodeProbe()
+    var probed = false
+    var importedGames: [LibraryGame] = []
+    var waitingForXcode = false      // Get Xcode was pressed: poll /Applications
+    private var recheckingXcode = false
+    var xcodeBusy = false            // the finish-setup run owns state.xcode
+    var backgroundStarted = false
+    var failedDeps: [String: OnboardingFailure] = [:]
+    var currentInstall: String?
+    var sawRecheck = false
+    var logMark = 0
+    var tasks: [String: Task<Void, Never>] = [:]
+    var subscriptions: Set<AnyCancellable> = []
+    let ephemeral: Bool
+    var installApproved: Bool       // background installs may start (always, except in an ephemeral run before an install action)
     private var pending: [String: Any] = [:]   // an ephemeral run's preference writes, applied by `flush`
     private var pendingTarget: String?
+    private var pendingKeys: String?   // an ephemeral run's saved keys (#996): a path to save, "" to forget them, applied by `flush`
 
-    /// A preference write; an ephemeral run holds it back.
-    private func store(_ value: Any?, _ key: String) {
-        if ephemeral { pending[key] = value ?? NSNull(); return }
+    /// A preference write — an ephemeral run holds it back.
+    func store(_ value: Any?, _ key: String) {
+        if ephemeral {
+            pending[key] = value ?? NSNull()
+            return
+        }
         if let value { env.defaults.set(value, forKey: key) } else { env.defaults.removeObject(forKey: key) }
     }
 
@@ -219,10 +269,26 @@ enum OnboardingLaunch {
         for (key, value) in pending { if value is NSNull { env.defaults.removeObject(forKey: key) } else { env.defaults.set(value, forKey: key) } }
         pending.removeAll()
         OnboardingDefaults.sessionPlatform = nil
-        if let target = pendingTarget { model.target = target; pendingTarget = nil }
+        if let target = pendingTarget {
+            model.target = target
+            pendingTarget = nil
+        }
+        if let keys = pendingKeys {
+            applyKeys(keys)
+            pendingKeys = nil
+        }
     }
 
-    private func t(_ key: String) -> String { L10n.string(key, stores.localizer.lang) }
+    /// The keys of every game (Settings, "Keys", #996): a file chosen here is saved, Skip leaves the saved one alone. An ephemeral run holds it back.
+    func keepKeys(_ path: String) {
+        if ephemeral { pendingKeys = path } else { applyKeys(path) }
+    }
+
+    private func applyKeys(_ path: String) {
+        if path.isEmpty { model.forgetSavedKeys() } else { model.saveKeys(path) }
+    }
+
+    func t(_ key: String) -> String { L10n.string(key, stores.localizer.lang) }
 
     /// `fresh` ignores a stored step (Run setup again); otherwise a stored, unfinished run resumes where it stopped.
     /// `ephemeral` (NSPB_ONBOARDING_FORCE) starts from Welcome, keeps every preference write in memory until the player finishes
@@ -233,11 +299,13 @@ enum OnboardingLaunch {
         installApproved = !ephemeral
         let d = env.defaults
         if ephemeral {
+            store(nil, OnboardingDefaults.keysSkipped)
             updateWelcome()
             return
         }
         if fresh {
             d.removeObject(forKey: OnboardingDefaults.step); d.removeObject(forKey: OnboardingDefaults.platform)
+            d.removeObject(forKey: OnboardingDefaults.keysSkipped)
             d.set(false, forKey: OnboardingDefaults.inProgress)
         }
         if let raw = d.string(forKey: OnboardingDefaults.platform), let platform = OnboardingPlatform(rawValue: raw) {
@@ -245,8 +313,15 @@ enum OnboardingLaunch {
         }
         if d.bool(forKey: OnboardingDefaults.inProgress), let raw = d.string(forKey: OnboardingDefaults.step),
            let step = OnboardingStep(rawValue: raw) {
+            state.step = step
+            if OnboardingDefaults.resumeKeysSkip(in: d, keysSlotIsEmpty: model.keysPath.isEmpty) {
+                state.keys = .skipped
+            } else if step.index > OnboardingStep.keys.index {
+                if model.keysReady { state.keysFile = URL(fileURLWithPath: model.keysPath); state.keys = .valid }   // the row's keys, or the ones saved in Settings
+                else { state.step = .keys }
+            }
             // A stored step beyond Platform without a platform cannot be right; start from the choice.
-            state.step = (step.index > OnboardingStep.platform.index && state.selectedPlatform == nil) ? .platform : step
+            if step.index > OnboardingStep.platform.index && state.selectedPlatform == nil { state.step = .platform }
         }
         updateWelcome()
     }
@@ -254,11 +329,16 @@ enum OnboardingLaunch {
 
     /// Starts watching the model and revalidates the stored step. Called once by whoever shows the view.
     func activate() {
-        subscription = stores.dependencies.$checked.removeDuplicates().sink { [weak self] checked in
+        subscriptions.removeAll()
+        stores.dependencies.$checked.removeDuplicates().sink { [weak self] checked in
             guard let self else { return }
-            if !checked { self.sawRecheck = true; return }
+            if !checked {
+                self.sawRecheck = true
+                return
+            }
             self.spawn("refresh") { d in await d.modelDidRefresh() }
-        }
+        }.store(in: &subscriptions)
+        bindProgressStreams()
         spawn("activate") { d in
             await d.revalidate()
             d.enter(d.state.step)
@@ -297,6 +377,19 @@ enum OnboardingLaunch {
         pollForXcode()
     }
 
+    /// Read-only refresh without a transient checking state, prompts or navigation.
+    func recheckXcode() {
+        guard state.step == .xcode, state.xcode == .downloading, state.exit == nil,
+              !xcodeBusy, !recheckingXcode else { return }
+        recheckingXcode = true
+        spawn("xcode-recheck") { d in
+            defer { d.recheckingXcode = false }
+            guard await d.env.xcodeInstalled(), !Task.isCancelled,
+                  d.state.step == .xcode, d.state.exit == nil else { return }
+            await d.refreshXcode()
+        }
+    }
+
     func finishXcodeSetup() {
         guard state.step == .xcode, state.xcode == .needsSetup, state.exit == nil else { return }
         installApproved = true
@@ -313,7 +406,10 @@ enum OnboardingLaunch {
             failedDeps.removeAll()
             if case .failed = state.xcode { state.xcode = .needsSetup }
             xcodeBusy = false
-            spawn("retry") { d in await d.modelDidRefresh() }
+            spawn("retry") { d in
+                if d.state.xcode == .disconnected { await d.env.detectDeps(d.stores.dependencies) }
+                await d.modelDidRefresh()
+            }
         case .keys: enter(.keys)
         case .games: state.games = .empty; enter(.games)
         default: break
@@ -326,8 +422,21 @@ enum OnboardingLaunch {
     }
 
     func confirmKeys() {
-        guard state.step == .keys, state.exit == nil, case let .found(url) = state.keys else { return }
-        validateKeys(url)
+        guard state.step == .keys, state.exit == nil, state.keys == .valid, let file = state.keysFile else { return }
+        model.updateSlot("keys") { $0.paths = [file.path]; $0.problem = "" }
+        keepKeys(file.path)
+        next()
+    }
+
+    func skipKeys() {
+        guard state.canSkipKeys else { return }
+        model.updateSlot("keys") { $0.paths = []; $0.problem = "" }
+        // Skip leaves a keys file that is already saved alone: the keys stay optional here, and Settings holds them (#996)
+        state.keysFile = nil
+        state.keys = .skipped
+        store(true, OnboardingDefaults.keysSkipped)
+        state.games = .empty   // rescan a previously visited folder for a build input that works without keys
+        next()
     }
 
     func chooseGames(_ url: URL) {
@@ -340,7 +449,6 @@ enum OnboardingLaunch {
         let old = state.step
         state.back()
         guard old != state.step else { return }
-        suppressAdvance = true   // a step left behind stays reachable: Back must not bounce forward again
         enter(state.step)
     }
 
@@ -348,7 +456,6 @@ enum OnboardingLaunch {
         let old = state.step
         state.next()
         guard old != state.step else { return }
-        suppressAdvance = false
         enter(state.step)
     }
 
@@ -365,6 +472,7 @@ enum OnboardingLaunch {
         store(true, OnboardingDefaults.completed)
         store(false, OnboardingDefaults.inProgress)
         store(nil, OnboardingDefaults.step)
+        store(nil, OnboardingDefaults.keysSkipped)
         flush()
         if library.selectedID == nil { library.selectedID = library.games.first?.id }
         close(.library)
@@ -372,21 +480,22 @@ enum OnboardingLaunch {
 
     private func close(_ exit: OnboardingState.Exit) {
         state.exit = exit
-        tasks.values.forEach { $0.cancel() }; tasks.removeAll()
-        subscription = nil
+        tasks.values.forEach { $0.cancel() }
+        tasks.removeAll()
+        subscriptions.removeAll()
         onExit(exit)
     }
 
     // MARK: Steps
 
-    /// Waits for the work started so far (tests; the view never needs it).
+    /// Waits for the work started so far (tests, the view never needs it).
     func settle() async {
         for _ in 0..<6 { for task in Array(tasks.values) { await task.value } }
     }
 
-    private func persistStep() { store(state.step.rawValue, OnboardingDefaults.step) }
+    func persistStep() { store(state.step.rawValue, OnboardingDefaults.step) }
 
-    private func spawn(_ name: String, _ body: @escaping (LiveOnboardingDriver) async -> Void) {
+    func spawn(_ name: String, _ body: @escaping (LiveOnboardingDriver) async -> Void) {
         tasks[name]?.cancel()
         tasks[name] = Task { @MainActor [weak self] in
             guard let self, self.state.exit == nil else { return }
@@ -409,6 +518,7 @@ enum OnboardingLaunch {
                 await d.modelDidRefresh()
             }
         case .keys:
+            guard state.keys != .skipped else { return }
             state.keys = .searching
             spawn("enter.keys") { d in await d.searchKeys() }
         case .games:
@@ -438,10 +548,10 @@ enum OnboardingLaunch {
 
     /// Rough room the setup takes, not a measurement: Xcode when it is missing (about 3 GB to download, about 12 GB installed,
     /// and the room twice over while it unpacks: 15), the Metal Toolchain (about 1), the iOS platform when the player plays
-    /// on an iPhone (about 8, as the Platform step says), and the tools, Python packages, .NET SDK and caches (about 4).
+    /// on an iPhone (about 8, as the Platform step says), and the tools, Python packages and caches (about 3).
     /// Platform is not chosen yet at Welcome, so it counts the Mac only; choosePlatform computes it again.
     nonisolated static func neededGB(xcodeMissing: Bool, includesIOS: Bool) -> Int {
-        (xcodeMissing ? 15 : 0) + 1 + (includesIOS ? 8 : 0) + 4
+        (xcodeMissing ? 15 : 0) + 1 + (includesIOS ? 8 : 0) + 3
     }
 
     func updateWelcome() {
@@ -456,7 +566,7 @@ enum OnboardingLaunch {
 
     // MARK: Xcode
 
-    private func dep(_ id: String) -> Dep? { stores.dependencies.deps.first { $0.id == id } }
+    func dep(_ id: String) -> Dep? { stores.dependencies.deps.first { $0.id == id } }
 
     /// Every detection that finished: Xcode's state, the background tasks, and the next install.
     func modelDidRefresh() async {
@@ -465,7 +575,6 @@ enum OnboardingLaunch {
         await refreshXcode()
         recomputeBackground()
         pumpInstalls()
-        advanceIfReady()
     }
 
     func refreshXcode() async {
@@ -476,7 +585,7 @@ enum OnboardingLaunch {
         let (xcode, setup) = OnboardingXcode.evaluate(probe: probe, metalReady: dep("metal")?.present ?? false,
                                                       iosReady: dep("xcode")?.present ?? false, includesIOS: includesIOS)
         state.setup = setup
-        if case .failed = state.xcode, xcode != .ready { return }   // a failure stays until Retry
+        if case .failed = state.xcode, xcode != .ready && xcode != .disconnected { return }   // a failure stays until Retry
         if xcode == .missing {
             state.xcode = waitingForXcode ? .downloading : .missing
         } else {
@@ -495,7 +604,6 @@ enum OnboardingLaunch {
                 if await d.env.xcodeInstalled() {
                     d.waitingForXcode = false
                     await d.refreshXcode()
-                    d.advanceIfReady()
                     return
                 }
             }
@@ -509,6 +617,11 @@ enum OnboardingLaunch {
             state.xcode = .failed(OnboardingFailure(message: t(key), details: Self.tail(details)))
         }
         if probe.needsAdmin {
+            // The normal admin script switches the system Xcode. Let a launcher-only Xcode finish its own first launch.
+            if let app = stores.dependencies.xcodeApp {
+                if XcodeSelection.isXcode(app) { env.openURL(URL(fileURLWithPath: app)) }
+                return fail("xcodeChoice.finishSetup", app)
+            }
             guard let dir = probe.developerDir else { return fail("onboarding.error.xcode", "No Xcode.app was found.") }
             for task in [OnboardingSetupTask.selected, .license, .firstLaunch] where state.setup[task] != .done { state.setup[task] = .running(nil) }
             switch await env.runAdmin(dir) {
@@ -567,145 +680,13 @@ enum OnboardingLaunch {
     nonisolated static func tail(_ text: String, limit: Int = 4000) -> String {
         text.count <= limit ? text : "…" + text.suffix(limit)
     }
-
-    // MARK: Background tools
-
-    /// The "tools" card is Homebrew and the brew formulas the build uses: every row that is none of Xcode, Python or .NET.
-    private static let handled: Set<String> = ["xcode", "metal", "python", "dotnet"]
-    private func deps(for task: OnboardingBackgroundTask) -> [Dep] {
-        switch task {
-        case .python: return stores.dependencies.deps.filter { $0.id == "python" }
-        case .dotnet: return stores.dependencies.deps.filter { $0.id == "dotnet" }
-        case .tools: return stores.dependencies.deps.filter { !Self.handled.contains($0.id) }
-        }
-    }
-
-    func recomputeBackground() {
-        guard backgroundStarted, stores.dependencies.checked else { return }
-        for task in OnboardingBackgroundTask.allCases {
-            let rows = deps(for: task)
-            if rows.allSatisfy(\.present) { state.background[task] = .done }
-            else if let failure = rows.compactMap({ failedDeps[$0.id] }).first { state.background[task] = .failed(failure) }
-            else if rows.contains(where: \.installing) || rows.contains(where: { $0.id == currentInstall }) { state.background[task] = .running(nil) }
-            else { state.background[task] = .queued }
-        }
-    }
-
-    /// One install at a time, in the order Python, .NET, tools. Homebrew and its formulas need Xcode's command line tools,
-    /// so they wait for Xcode to be ready; the other two start at once.
-    func pumpInstalls() {
-        guard installApproved, backgroundStarted, stores.dependencies.checked, currentInstall == nil, state.exit == nil else { return }
-        for task in OnboardingBackgroundTask.allCases {
-            if task == .tools && state.xcode != .ready { continue }
-            guard let next = deps(for: task).first(where: { !$0.present && failedDeps[$0.id] == nil && !$0.installing }) else { continue }
-            currentInstall = next.id
-            sawRecheck = false
-            logMark = model.logTail.count
-            env.installDep(stores.dependencies, next)
-            recomputeBackground()
-            return
-        }
-    }
-
-    /// An install finished and detection ran again: either its row is present now, or it failed.
-    private func concludeInstall() {
-        guard let id = currentInstall, sawRecheck else { return }
-        currentInstall = nil
-        if dep(id)?.present == false {
-            let name = dep(id).map { t($0.name) } ?? id
-            let output = model.logTail.count >= logMark ? String(model.logTail.dropFirst(logMark)) : model.logTail
-            failedDeps[id] = OnboardingFailure(message: String(format: t("dep.install.fail"), name), details: Self.tail(output))
-        }
-    }
-
-    // MARK: Keys
-
-    func searchKeys() async {
-        let known = model.keysPath
-        let candidates = ([known].filter { !$0.isEmpty && FileManager.default.fileExists(atPath: $0) })
-            + env.keyCandidates(gamesFolder: library.folder.isEmpty ? model.gameDir : library.folder)
-        if let first = candidates.first { state.keys = .found(URL(fileURLWithPath: first)) } else { state.keys = .empty }
-    }
-
-    private func validateKeys(_ url: URL) {
-        state.keys = .validating
-        spawn("keys") { d in
-            let scoped = url.startAccessingSecurityScopedResource()   // a no-op outside a sandbox
-            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-            let outcome = await d.env.keyCheck(url.path, d.model.basePath)
-            guard d.state.exit == nil else { return }
-            switch outcome {
-            case .fits, .cannotCheck:
-                d.model.updateSlot("keys") { $0.paths = [url.path]; $0.problem = "" }
-                d.state.keys = .valid
-                d.advanceIfReady()
-            default:
-                d.state.keys = .invalid(KeyCheck.message(outcome, d.t))   // names a key or a file, never a value
-            }
-        }
-    }
-
-    // MARK: Games
-
-    private func enterGames() async {
-        let known = library.folder.isEmpty ? model.gameDir : library.folder
-        if case .found = state.games { return }
-        if !known.isEmpty, FileManager.default.fileExists(atPath: known) { state.games = .scanning; await scanGames(URL(fileURLWithPath: known)) }
-        else { state.games = .empty }
-    }
-
-    func scanGames(_ url: URL) async {
-        let scoped = url.startAccessingSecurityScopedResource()
-        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        let found = await env.scanGames(url, stores.repo.path)
-        guard state.exit == nil else { return }
-        guard !found.isEmpty else { state.games = .none; return }
-        // The same slots and folder the main UI sets: the Builds page's inputs and the library's games folder.
-        let keys = model.keysPath
-        model.scan(folder: url.path)
-        if !keys.isEmpty { model.updateSlot("keys") { $0.paths = [keys]; $0.problem = "" } }   // the keys the player confirmed stay
-        library.setFolder(url)
-        if !model.running { model.outDir = url.path }
-        state.games = .found(found.map { OnboardingGame(id: $0.titleID, title: $0.name, version: "",
-                                                         cover: GameLibrary.artwork(for: $0, slot: .thumbnail, repo: stores.repo.path, maxPixel: ArtworkImages.cardPixels)) })
-        let ids = found.map(\.titleID)
-        spawn("covers") { d in
-            await d.env.fetchArtwork(ids)
-            guard case .found(var games) = d.state.games else { return }
-            for i in games.indices where games[i].cover == nil {
-                if let g = found.first(where: { $0.titleID == games[i].id }) { games[i].cover = GameLibrary.artwork(for: g, slot: .thumbnail, repo: d.stores.repo.path, maxPixel: ArtworkImages.cardPixels) }
-            }
-            d.state.games = .found(games)
-        }
-        // The keys against the game they will open: a mismatch sends the player back to the keys, with the reason.
-        if !model.keysPath.isEmpty, !model.basePath.isEmpty {
-            let outcome = await env.keyCheck(model.keysPath, model.basePath)
-            switch outcome {
-            case .fits, .cannotCheck: break
-            default:
-                state.keys = .invalid(KeyCheck.message(outcome, t))
-                state.step = .keys; persistStep()
-            }
-        }
-    }
-
-    // MARK: Advancing
-
-    /// Xcode with its background tasks and the keys move on by themselves after a moment; the games wait for Continue.
-    func advanceIfReady() {
-        guard !suppressAdvance, state.exit == nil, state.step == .xcode || state.step == .keys, state.canAdvance else { return }
-        let step = state.step
-        spawn("advance") { d in
-            try? await Task.sleep(nanoseconds: UInt64(d.env.advanceDelay * 1_000_000_000))
-            if d.state.step == step, !d.suppressAdvance { d.next() }
-        }
-    }
 }
 
 /// The Xcode step's states from what was probed: a pure function, so the mapping is tested without a machine.
 enum OnboardingXcode {
     static func evaluate(probe: XcodeProbe, metalReady: Bool, iosReady: Bool, includesIOS: Bool)
         -> (xcode: OnboardingState.Xcode, setup: [OnboardingSetupTask: OnboardingTaskState]) {
+        if probe.selectedAppUnavailable { return (.disconnected, [:]) }
         guard probe.appPath != nil else { return (.missing, [:]) }
         var setup: [OnboardingSetupTask: OnboardingTaskState] = [
             .selected: probe.selectedIsXcode ? .done : .queued,

@@ -39,6 +39,10 @@ ENV_TOOLCHAIN = 'NSPB_TOOLCHAIN_JSON'
 ENV_LLVM = 'NSPB_LLVM_DIR'
 ENV_SDK = 'NSPB_IOS_SDK'
 ENV_METAL = 'NSPB_METAL_DIR'
+ENV_SYSTEM32 = 'NSPB_SYSTEM32_DIR'
+
+VCREDIST_DLLS = ('vcruntime140.dll', 'vcruntime140_1.dll', 'msvcp140.dll')
+VCREDIST_URL = 'https://aka.ms/vs/17/release/vc_redist.x64.exe'
 
 # ---------------------------------------------------------------- pinned versions
 
@@ -175,6 +179,17 @@ PYTHON_ASSET = {
     'url': f'https://www.python.org/ftp/python/{PYTHON_VERSION}/python-{PYTHON_VERSION}-amd64.exe',
     'sha256': '67b5635e80ea51072b87941312d00ec8927c4db9ba18938f7ad2d27b328b95fb',
     'size': 26964224,
+}
+#: Official standalone NuGet package (`python.3.12.10.nupkg`, published by the Python Software
+#: Foundation on nuget.org). Unlike the embeddable zip, this archive ships the full standard
+#: library including `Lib/venv` and `Lib/ensurepip` under `tools/` without touching the Windows
+#: Installer (MSI) registry — used as a conflict-free fallback when an existing system Python 3.12
+#: installation causes the WiX Burn installer to exit without writing `TargetDir`.
+PYTHON_NUPKG_ASSET = {
+    'name': f'python.{PYTHON_VERSION}.nupkg',
+    'url': f'https://www.nuget.org/api/v2/package/python/{PYTHON_VERSION}',
+    'sha256': '0eb85c2dfccccf1b17352de4c397f69194035b7d37149eacc16f1147d93de3b8',
+    'size': 14515433,
 }
 
 #: zstd for Windows, from facebook/zstd's own release (the build's decompression step calls the
@@ -384,7 +399,9 @@ def ld64_lld() -> Path | None:
     for base in ([root / 'bin'] if root else []) + [Path(p) for p in os.environ.get('PATH', '').split(os.pathsep) if p]:
         for n in ('ld64.lld.exe', 'ld64.lld'):
             p = base / n
-            if p.is_file():
+            # not Path.is_file: before Python 3.14 it raises what stat raises, and Windows refuses
+            # stat in some PATH folders (WinError 448 in one an app keeps for itself)
+            if os.path.isfile(p):
                 return p
     return None
 
@@ -431,6 +448,81 @@ def _lld_has_macho(exe: Path) -> bool:
     return b'MachO' in data and b'ld64.lld' in data
 
 
+def win_system32_dir() -> Path | None:
+    """Return the Windows 64-bit System32 directory when running on Windows or overridden."""
+    if override := os.environ.get(ENV_SYSTEM32):
+        return Path(override)
+    if os.name != 'nt':
+        return None
+    windir = Path(os.environ.get('SystemRoot') or os.environ.get('WINDIR') or r'C:\Windows')
+    sysnative = windir / 'Sysnative'
+    if sysnative.is_dir():
+        return sysnative
+    return windir / 'System32'
+
+
+def missing_vc_runtime_dlls(sys32: Path | None = None) -> list[str]:
+    """Return the missing Microsoft Visual C++ 2015-2022 (x64) runtime DLLs."""
+    target = sys32 if sys32 is not None else win_system32_dir()
+    if target is None or not target.is_dir():
+        return []
+    try:
+        present = {p.name.lower() for p in target.iterdir()}
+        return [dll for dll in VCREDIST_DLLS if dll.lower() not in present]
+    except OSError:
+        return [dll for dll in VCREDIST_DLLS if not (target / dll).is_file()]
+
+
+def probe_vcredist() -> Probe | None:
+    """Check whether Visual C++ 2015-2022 Redistributable (x64) runtime DLLs exist."""
+    sys32 = win_system32_dir()
+    if sys32 is None:
+        return None
+    missing = missing_vc_runtime_dlls(sys32)
+    if not missing:
+        return Probe(
+            'vcredist',
+            'Visual C++ Redistributable (x64)',
+            'ok',
+            str(sys32),
+            path=str(sys32),
+            pinned='2015-2022 x64',
+        )
+    return Probe(
+        'vcredist',
+        'Visual C++ Redistributable (x64)',
+        'missing',
+        f'missing {", ".join(missing)} in {sys32} — install Microsoft Visual C++ 2015-2022 Redistributable (x64): {VCREDIST_URL}',
+        hint=VCREDIST_URL,
+        pinned='2015-2022 x64',
+    )
+
+
+def explain_process_exit(returncode: int, exe: Path | str = '') -> str:
+    """Translate common Windows NTSTATUS process exit codes into actionable root-cause hints."""
+    u32 = returncode & 0xFFFFFFFF
+    tool = Path(exe).name if exe else 'tool'
+    if u32 == 0xC0000135:
+        missing = missing_vc_runtime_dlls()
+        if missing:
+            return (
+                f'{tool} exited with 0xC0000135 (DLL not found): missing {", ".join(missing)} — '
+                f'install Microsoft Visual C++ 2015-2022 Redistributable (x64) ({VCREDIST_URL})'
+            )
+        return (
+            f'{tool} exited with 0xC0000135 (a required DLL is missing; '
+            f'install Microsoft Visual C++ 2015-2022 Redistributable x64: {VCREDIST_URL})'
+        )
+    if u32 == 0xC000007B:
+        return (
+            f'{tool} exited with 0xC000007B (32-bit/64-bit DLL mismatch; '
+            f'repair Microsoft Visual C++ 2015-2022 Redistributable x64: {VCREDIST_URL})'
+        )
+    if u32 == 0xC0000142:
+        return f'{tool} exited with 0xC0000142 (DLL initialization failed)'
+    return ''
+
+
 def llvm_version(clang: Path) -> tuple[str, str]:
     """clang's version line and, when it could not be read, why — (version, diagnostics).
 
@@ -446,8 +538,10 @@ def llvm_version(clang: Path) -> tuple[str, str]:
     except (OSError, subprocess.SubprocessError) as e:
         return '', f'--version cannot start: {e}'
     if r.returncode != 0:
-        return '', (f'--version exit {r.returncode} (0x{r.returncode & 0xFFFFFFFF:08x}), '
-                    f'output: {(r.stderr or r.stdout or "(empty)")[:200]}')
+        hint = explain_process_exit(r.returncode, clang)
+        base = (f'--version exit {r.returncode} (0x{r.returncode & 0xFFFFFFFF:08x}), '
+                f'output: {(r.stderr or r.stdout or "(empty)")[:200]}')
+        return '', f'{hint} ({base})' if hint else base
     # `r.stdout` is None when capture came back empty — `text=True` with no output, or a
     # redirected stdout on Windows. `re.search` then raises TypeError, which used to take the
     # whole dependency check down (the report: "dependency check failed: TypeError: expected
@@ -480,6 +574,9 @@ def clang_compiles(clang: Path) -> tuple[bool, str]:
         except OSError as e:
             return False, f'cannot run {clang}: {e}'
         if r.returncode != 0:
+            hint = explain_process_exit(r.returncode, clang)
+            if hint:
+                return False, hint
             tail = ((r.stderr or r.stdout or '').strip().splitlines() or ['(no output)'])[-1]
             return False, f'compile exit {r.returncode} (0x{r.returncode & 0xFFFFFFFF:08x}): {tail[:200]}'
         try:
@@ -501,18 +598,52 @@ def python_dir() -> Path | None:
     git: a machine with no system Python is exactly the machine that ran the in-app installer,
     and after installing, the interpreter has to be found again without the user editing PATH.
     """
-    for root in (tools_dir() / f'python-{PYTHON_VERSION}',
-                 bundled_tools_dir() / f'python-{PYTHON_VERSION}'):
+    cands: list[Path] = [
+        tools_dir() / f'python-{PYTHON_VERSION}',
+        bundled_tools_dir() / f'python-{PYTHON_VERSION}',
+    ]
+    if cfg := setting('python_dir'):
+        p = Path(cfg)
+        cands.insert(0, p.parent if p.name.lower() == 'python.exe' else p)
+    for root in cands:
         exe = root / 'python.exe'
         if exe.is_file() and _runs_quiet(exe):
             return root
     return None
 
 
+def _clean_python_env() -> dict[str, str]:
+    """Environment for probing an external `python.exe` from a frozen PyInstaller process."""
+    env = dict(os.environ)
+    meipass = getattr(sys, '_MEIPASS', None) or env.get('_MEIPASS') or env.get('_MEIPASS2')
+    is_frozen = bool(getattr(sys, 'frozen', False) or meipass)
+    env.pop('_MEIPASS', None)
+    env.pop('_MEIPASS2', None)
+    env.pop('VIRTUAL_ENV', None)
+    env.pop('PYTHONSTARTUP', None)
+    env.pop('PIP_USER', None)
+    env.pop('PIP_TARGET', None)
+    env.pop('PIP_REQUIRE_VIRTUALENV', None)
+    if is_frozen:
+        env.pop('PYTHONHOME', None)
+    if meipass and 'PYTHONPATH' in env:
+        meipass_norm = os.path.normcase(os.path.normpath(meipass))
+        sep = ';' if (sys.platform.startswith('win') or ';' in env['PYTHONPATH']) else ':'
+        kept = [
+            d for d in env['PYTHONPATH'].split(sep)
+            if d and os.path.normcase(os.path.normpath(d)) != meipass_norm
+        ]
+        if kept:
+            env['PYTHONPATH'] = sep.join(kept)
+        else:
+            env.pop('PYTHONPATH', None)
+    return env
+
+
 def _runs_quiet(exe: Path) -> bool:
     try:
         r = subprocess.run([str(exe), '-c', 'print(1)'], capture_output=True, text=True,
-                           timeout=60, **no_window())
+                           timeout=60, env=_clean_python_env(), **no_window())
     except (OSError, subprocess.SubprocessError):
         return False
     return r.returncode == 0 and (r.stdout or '').strip() == '1'
@@ -561,6 +692,80 @@ def dotnet_sdks(root: Path) -> list[str]:
         if m:
             out.append(m.group(0))
     return sorted(out, key=lambda v: tuple(int(x) for x in v.split('.')), reverse=True)
+
+
+def csc_tool_args() -> list[str]:
+    """MSBuild arguments that run Roslyn as `dotnet csc.dll`, or [] when the SDK's own compiler works.
+
+    Windows 11 build 22000 has incomplete user-mode CET, and .NET 10's coreclr fails fast in every
+    apphost it marks CET-compatible: "Your Windows doesn't fully support CET", exit 0x80131506. The SDK's
+    `csc.exe` is such an apphost, so `dotnet publish` / `dotnet build` die in
+    Microsoft.CSharp.Core.targets before compiling one file — which is how the shader translator's
+    on-demand publish (shim.py `_dmsh_xlate_dll`) failed, and `tool_lock.check_tools()` then
+    reported "the translator does not run" and stopped the whole shader build. The `dotnet` host
+    is not marked, and `dotnet csc.dll` is the same compiler: measured on SDK 10.0.403,
+    `csc.exe -?` exits 0x80131506 with that message while `dotnet csc.dll -?` exits 0 and prints its version.
+
+    CscToolExe / CscToolPath are MSBuild's own knobs (Microsoft.CSharp.Core.targets), so neither
+    the SDK nor the engine is modified; UseSharedCompilation=false keeps MSBuild off
+    VBCSCompiler.exe, another marked apphost. Only the CET message enables this: a compiler that
+    fails for any other reason is left to fail visibly rather than papered over.
+
+    The probe's answer is cached in tools_dir() keyed on the compiler's path and stamp, so a
+    healthy machine pays one `csc.exe -?` and then nothing.
+    """
+    root = dotnet_dir()
+    if root is None:
+        return []
+    sdks = dotnet_sdks(root)
+    if not sdks:
+        return []
+    bincore = root / 'sdk' / sdks[0] / 'Roslyn' / 'bincore'
+    apphost, dll = bincore / 'csc.exe', bincore / 'csc.dll'
+    if not (apphost.is_file() and dll.is_file()):
+        return []
+    st = apphost.stat()
+    # 'v1': bump when the probe below changes, so a cached answer from an older probe is not reused
+    key = hashlib.sha256(f'v1\0{apphost}\0{st.st_mtime_ns}\0{st.st_size}'.encode()).hexdigest()[:16]
+    cache = tools_dir() / f'csc-cet-{key}.json'
+    needed = None
+    try:
+        needed = json.loads(cache.read_text(encoding='utf-8')).get('needed')
+    except (OSError, ValueError, AttributeError):
+        pass
+    if not isinstance(needed, bool):
+        # DOTNET_ROOT as shim.build_env sets it for the real build: without it the apphost looks
+        # in C:\Program Files\dotnet and fails with "You must install or update .NET", a different
+        # error that would hide the CET one this probe is looking for.
+        env = {**os.environ, 'DOTNET_ROOT': str(root), 'DOTNET_ROOT_X64': str(root)}
+        try:
+            r = subprocess.run([str(apphost), '-?'], capture_output=True, text=True,
+                               timeout=120, env=env, **no_window())
+        except (OSError, subprocess.SubprocessError):
+            return []
+        needed = r.returncode != 0 and 'CET' in ((r.stdout or '') + (r.stderr or ''))
+        try:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps({'needed': needed, 'csc': str(apphost)}), encoding='utf-8')
+        except OSError:
+            pass   # a read-only tools folder must not stop the build; the probe just repeats
+    if not needed:
+        return []
+    wrap = tools_dir() / 'csc-wrap'
+    body = ('@echo off\r\n'
+            'rem Generated by nspb_qt.win.toolchain.csc_tool_args: this Windows build has incomplete\r\n'
+            'rem CET, so the SDK\'s csc.exe apphost cannot start. Run the same compiler through the\r\n'
+            'rem unmarked dotnet host. See that function for the measurement.\r\n'
+            f'"{root / "dotnet.exe"}" "{dll}" %*\r\n')
+    cmd = wrap / 'csc.cmd'
+    data = body.encode('utf-8')
+    try:
+        if not cmd.is_file() or cmd.read_bytes() != data:   # as shim._write_if_changed
+            wrap.mkdir(parents=True, exist_ok=True)
+            cmd.write_bytes(data)
+    except OSError:
+        return []
+    return ['-p:UseSharedCompilation=false', '-p:CscToolExe=csc.cmd', f'-p:CscToolPath={wrap}']
 
 
 def probe_dotnet() -> Probe:
@@ -643,6 +848,7 @@ def repair_tbd_stubs(
     sdk: Path | str,
     log=None,
     *,
+    quota=None,
     max_bytes: int | None = None,
     bytes_used: int = 0,
     max_entries: int | None = None,
@@ -664,6 +870,14 @@ def repair_tbd_stubs(
 
     def _charge(added_entries: int, added_bytes: int) -> None:
         nonlocal entries_used, bytes_used
+        if quota is not None:
+            quota.charge(
+                added_entries,
+                added_bytes,
+                label='text-stub materialization',
+                error_cls=exc_type,
+            )
+            return
         entries_used += added_entries
         bytes_used += added_bytes
         if max_entries is not None and entries_used > max_entries:
@@ -938,9 +1152,9 @@ def metal_dir() -> Path | None:
 def metal_tool(name: str, sdk: str = 'iphoneos') -> Path | None:
     """`metal.exe` / `metallib.exe` for one SDK family.
 
-    `metal-tt` is deliberately **not** looked up: the Windows tools do not ship it, so the
-    pipeline's offline pipeline archive (`pso_offline.py`) cannot run here. `metal_tool` returning
-    None for it is what makes `driver.py` switch that step off with a clear message.
+    `metal-tt` is looked up like any other tool: some Windows Metal builds ship it (32023.850
+    has `bin/metal-tt.exe`), older ones do not. When it is absent this returns None, which is
+    what makes the caller switch the offline pipeline archive (`pso_offline.py`) off.
     """
     root = metal_dir()
     if root is None:
@@ -1081,8 +1295,11 @@ def probe_compile(sdk: Path, clang: Path | None = None) -> tuple[bool, str]:
         except OSError as e:
             return False, f'cannot run {clang}: {e}'
         if r.returncode != 0:
+            hint = explain_process_exit(r.returncode, clang)
+            if hint:
+                return False, hint
             tail = ((r.stderr or r.stdout or '').strip().splitlines() or ['no output'])[-1]
-            return False, f'clang refused the probe: {tail[:300]}'
+            return False, f'clang refused the probe (exit {r.returncode}, 0x{r.returncode & 0xFFFFFFFF:08x}): {tail[:300]}'
         try:
             head = o.read_bytes()[:32]
         except OSError as e:
@@ -1122,11 +1339,17 @@ def ascii_temp_dir(prefix: str = 'nspb-'):
             return False
     candidates = [tempfile.gettempdir()]
     if os.name == 'nt' or 'PUBLIC' in os.environ:
-        candidates += [os.environ.get('PUBLIC', r'C:\Users\Public') + (r'\Temp' if os.name == 'nt' else '/Temp'),
-                       r'C:\Windows\Temp', 'C:\\Temp']
+        pub = os.environ.get('PUBLIC', r'C:\Users\Public' if os.name == 'nt' else '')
+        if pub:
+            sep = '\\' if ('\\' in pub or (len(pub) >= 2 and pub[1] == ':')) else '/'
+            candidates.append(pub.rstrip('\\/') + sep + 'Temp')
+        if os.sep == '\\':
+            candidates += [r'C:\Windows\Temp', r'C:\Temp']
     for allow_space in (False, True):
         for base in candidates:
             if not base or not ok(base) or (not allow_space and ' ' in base):
+                continue
+            if os.sep == '/' and not base.startswith('/'):
                 continue
             try:
                 os.makedirs(base, exist_ok=True)
@@ -1160,8 +1383,10 @@ def probe_metal(sdk: Path) -> tuple[bool, str]:
         dep_maj = int(IOS_DEPLOYMENT.split('.')[0])
         maj = min(sdk_major(sdk_version(sdk)[0]) or dep_maj, dep_maj)
         tgt = f'air64-apple-ios{maj}.0'
-        for cmd, what in (([str(metal), '-target', tgt, '-c', str(m), '-o', str(a)], 'metal'),
-                          ([str(metallib), str(a), '-o', str(lib)], 'metallib')):
+        for cmd, what in (
+            ([str(metal), '-target', tgt, '-fmetal-math-mode=relaxed', '-fpreserve-invariance', '-fwrapv', '-c', str(m), '-o', str(a)], 'metal'),
+            ([str(metallib), str(a), '-o', str(lib)], 'metallib'),
+        ):
             try:
                 r = subprocess.run(cmd, capture_output=True, text=True, timeout=180,
                                    cwd=td, **no_window())
@@ -1170,8 +1395,17 @@ def probe_metal(sdk: Path) -> tuple[bool, str]:
             except OSError as e:
                 return False, f'cannot run {cmd[0]}: {e}'
             if r.returncode != 0:
-                tail = ((r.stderr or r.stdout or '').strip().splitlines() or ['no output'])[-1]
-                return False, f'{what} failed: {tail[:300]}'
+                if hint := explain_process_exit(r.returncode, cmd[0]):
+                    return False, f'{what} failed: {hint}'
+                out_text = (r.stderr or '') + '\n' + (r.stdout or '')
+                tail = (out_text.strip().splitlines() or ['no output'])[-1]
+                if re.search(r'unknown argument|unsupported option|invalid value .* in .*-target', out_text, re.I):
+                    return (
+                        False,
+                        f'{what} failed ({tail[:220]}): installed Metal Developer Tools for Windows is too old — '
+                        f'install Metal Developer Tools {METAL_TOOLS_VERSION} ({METAL_TOOLS_URL})',
+                    )
+                return False, f'{what} failed (exit {r.returncode}, 0x{r.returncode & 0xFFFFFFFF:08x}): {tail[:260]}'
         if not lib.is_file() or lib.stat().st_size == 0:
             return False, 'metallib wrote no output (empty library)'
         return True, f'{lib.stat().st_size} byte metallib for {tgt}'
@@ -1344,6 +1578,8 @@ def check_all(deep: bool = False, t=None) -> list[Probe]:
 
     # ---- .NET (the extractor and the shader translator both target net10.0)
     out.append(probe_dotnet())
+    if vc := probe_vcredist():
+        out.append(vc)
 
     # ---- LLVM. The verdict is the compile probe (clang_compiles), not --version: the report's
     # machine compiles fine and its --version exits non-zero silently, so a version-only check
@@ -1420,10 +1656,10 @@ def check_all(deep: bool = False, t=None) -> list[Probe]:
         out.append(Probe('metal', 'Metal Developer Tools', 'missing',
                          f'not found under {mroot}' if mroot else 'metal.exe / metallib.exe not found',
                          hint=METAL_TOOLS_URL, pinned=METAL_TOOLS_VERSION))
-    # metal-tt is Apple-internal-only: report it so nobody expects the pipeline archive here
+    # metal-tt ships in some Windows Metal builds and not others: report which this one is
     out.append(Probe('metal_tt', 'metal-tt (pipeline archive)', 'ok' if metal_tool('metal-tt') else 'missing',
                      'available' if metal_tool('metal-tt') else
-                     'not in the Windows Metal tools: the offline pipeline archive is disabled here',
+                     'not in this Metal Developer Tools build: the offline pipeline archive is disabled here',
                      required=False))
 
     # ---- the rest of the toolchain

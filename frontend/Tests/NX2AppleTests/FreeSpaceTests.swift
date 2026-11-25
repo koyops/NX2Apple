@@ -1,7 +1,10 @@
+import AppKit
+import SwiftUI
 import XCTest
 @testable import NX2Apple
 @testable import NXCore
 @testable import NXLauncher
+import NXModel
 
 /// Free space (#67): a synthetic <title ID>_build folder in a temporary directory, laid out as build_ipa_from_nsp.py
 /// leaves it, with the finished app, the IPA and the game data archive beside it.
@@ -55,6 +58,37 @@ final class FreeSpaceTests: IsolatedDefaultsTestCase {
         return game
     }
 
+    /// #232: Remove build files takes every part Free space offers and keeps what the folder keeps for its own sake and every protected path.
+    @MainActor func testRemoveBuildFilesKeepsTheGameWorkingAndTheFolderLogs() throws {
+        let game = try fixture()
+        let entry = try XCTUnwrap(BuildFiles.games([game], lang: .en).first)
+        XCTAssertEqual(entry.folder, build.path)
+        let before = BuildFiles.measure(entry)
+        XCTAssertGreaterThan(before, 0)
+        let freed = try BuildFiles.remove(entry)
+        XCTAssertGreaterThan(freed, 0)
+        for gone in ["extract", "nsp", "shader", "pso", "xcode", "tmp", "aoc", "patched_v0", "patched_v0.key"] { XCTAssertFalse(exists(gone), gone) }
+        for kept in ["logs/split.log", "profile/\(titleID)/game.tsv", "run/save/save.bin",
+                     "xcode-derived-data/Build/Products/Release-iphoneos/DmIOS.app/Info.plist"] { XCTAssertTrue(exists(kept), kept) }
+        for kept in [titleID + ".app/Contents/Info.plist", titleID + ".ipa", "games/\(titleID)/romfs.img"] { XCTAssertTrue(exists(kept, in: out), kept) }
+        XCTAssertEqual(BuildFiles.measure(entry), 0, "nothing left to remove: the item and the row go")
+    }
+
+    func testBuildFilesTextsAreInEnglishGermanAndChineseWithoutSemicolons() {
+        for lang in Lang.all {
+            for key in ["buildfiles.title", "buildfiles.note", "buildfiles.menu", "buildfiles.card", "buildfiles.cardNote", "buildfiles.remove",
+                        "buildfiles.total", "buildfiles.building", "buildfiles.removeNamed", "buildfiles.frees", "buildfiles.stays",
+                        "buildfiles.details", "buildfiles.detailsNamed", "free.keptNote"] {
+                let text = L10n.string(key, lang)
+                XCTAssertNotEqual(text, key, "\(lang.code) \(key)")
+                XCTAssertFalse(text.contains(";") || text.contains("；"), "\(lang.code) \(key)")
+            }
+        }
+        XCTAssertEqual(L10n.string("buildfiles.note", .en), "The game keeps working. The next build of this game starts over and takes longer.")
+        XCTAssertEqual(String(format: L10n.string("buildfiles.frees", .en), "31 GB") + " " + L10n.string("buildfiles.stays", .en),
+                       "Frees 31 GB. Logs and saves of development builds stay.")
+    }
+
     func testTheFolderIsFoundInTheOutputFolderOrBesideTheNSPs() throws {
         let game = try fixture()
         XCTAssertEqual(BuildFolder.location(for: game), build.path)
@@ -65,17 +99,82 @@ final class FreeSpaceTests: IsolatedDefaultsTestCase {
         XCTAssertNil(BuildFolder.location(for: beside))
     }
 
+    @MainActor func testVariantBuildFoldersAreListedSeparatelyAndUseMatchingShaderChain() throws {
+        let tid = "0400C3F00006E000"
+        let baseBuild = out.appendingPathComponent(tid + "_build")
+        let variantBuild = out.appendingPathComponent(tid + "_nolagkart_build")
+        try file("extract/v0/RomFS/data.bin", in: baseBuild, kb: 64)
+        try file("shader/cache/b-111122223333/k_b.metallib", in: baseBuild, kb: 64)
+        try file("extract/v0/RomFS/data.bin", in: variantBuild, kb: 128)
+        try file("shader/cache/b-aaaa11112222/k_b.metallib", in: variantBuild, kb: 96)
+        try file("shader/cache/b-000099998888/k_b.metallib", in: variantBuild, kb: 48)
+
+        var game = LibraryGame(titleID: tid, name: "Mario Kart World")
+        game.outputDirectory = out.path
+
+        // 1. Both existing folders must be returned by BuildFolder.locations and BuildFiles.games.
+        let foundLocations = BuildFolder.locations(for: game)
+        XCTAssertEqual(Set(foundLocations.map(BuildFolder.resolved)), Set([baseBuild.path, variantBuild.path].map(BuildFolder.resolved)))
+
+        let entries = BuildFiles.games([game], lang: .en, extraRoots: [out.path])
+        XCTAssertEqual(entries.count, 2, "Both default and variant build folders must be listed as separate BuildFiles entries")
+        let baseEntry = try XCTUnwrap(entries.first { $0.folder == baseBuild.path })
+        let variantEntry = try XCTUnwrap(entries.first { $0.folder == variantBuild.path })
+        XCTAssertEqual(baseEntry.ownerID, game.id)
+        XCTAssertEqual(variantEntry.ownerID, game.id)
+        XCTAssertNotEqual(baseEntry.id, variantEntry.id)
+        XCTAssertTrue(variantEntry.name.contains("No Lag Kart"), variantEntry.name)
+        XCTAssertFalse(entries.contains { $0.name.contains("Unlisted build") }, "Known variant folder must not appear as an orphan")
+
+        // 2. Removing build files from the variant entry cleans only the variant folder and updates BuildFilesStore.
+        let store = BuildFilesStore(measure: { BuildFiles.measure($0) }, remove: { try BuildFiles.remove($0) })
+        let exp = expectation(description: "refresh build files")
+        let task = store.refresh(entries)
+        Task { await task.value; exp.fulfill() }
+        wait(for: [exp], timeout: 3.0)
+        let target = BuildFiles.freeSpaceTarget(id: variantEntry.id, in: [game], store: store)
+        XCTAssertEqual(target?.game.id, game.id)
+        XCTAssertEqual(target?.folder, variantBuild.path)
+
+        // 3. Matching shader chain: nxnative chain must NOT mark No Lag Kart's current chain as old.
+        let nxRepo = temporary.appendingPathComponent("nx-repo")
+        let nlkRepo = temporary.appendingPathComponent("nlk-repo")
+        try file("dm/tools/nx_extract/Program.cs", in: nxRepo, kb: 1)
+        try file("dm/gfx/nvn/dmsh_chain.h", in: nxRepo, kb: 1)
+        try "// chain\n#define DMSH_CHAIN \"111122223333\"\n".write(
+            to: nxRepo.appendingPathComponent("dm/gfx/nvn/dmsh_chain.h"), atomically: true, encoding: .utf8
+        )
+        // First without No Lag Kart configured -> chain is nil -> nothing in variant folder marked as oldShaders.
+        XCTAssertNil(BuildFolder.currentChain(forFolder: variantBuild.path, repo: nxRepo.path, noLagKartPath: ""))
+        let noForkSurvey = BuildFolder.survey(
+            variantBuild.path,
+            protecting: [],
+            chain: BuildFolder.currentChain(forFolder: variantBuild.path, repo: nxRepo.path, noLagKartPath: "")
+        )
+        XCTAssertEqual(noForkSurvey.oldShaders, [], "Missing fork chain must not fall back to nxnative chain and flag variant shaders as old")
+
+        // With No Lag Kart's own dmsh_chain.h configured -> matches aaaa11112222 and flags only 000099998888 as old.
+        try file("dm/gfx/nvn/dmsh_chain.h", in: nlkRepo, kb: 1)
+        try "// nlk\n#define DMSH_CHAIN \"aaaa11112222\"\n".write(
+            to: nlkRepo.appendingPathComponent("dm/gfx/nvn/dmsh_chain.h"), atomically: true, encoding: .utf8
+        )
+        let variantChain = BuildFolder.currentChain(forFolder: variantBuild.path, repo: nxRepo.path, noLagKartPath: nlkRepo.path)
+        XCTAssertEqual(variantChain, "aaaa11112222")
+        let variantSurvey = BuildFolder.survey(variantBuild.path, protecting: [], chain: variantChain)
+        XCTAssertEqual(variantSurvey.oldShaders.map(\.name), ["b-000099998888"])
+    }
+
     func testThePartsAreSizedAndWhatStaysIsNotOffered() throws {
         let game = try fixture()
         let survey = BuildFolder.survey(build.path, protecting: BuildFolder.protectedPaths(for: game))
         XCTAssertEqual(survey.parts, BuildFolderPart.allCases.filter { $0 != .oldShaders }, "no chain given: no shader version is old")
         let kb: Int64 = 1024
-        XCTAssertGreaterThanOrEqual(survey.sizes[.extracted] ?? 0, 4 * 64 * kb)
+        XCTAssertGreaterThanOrEqual(survey.sizes[.extracted] ?? 0, 5 * 64 * kb)
         XCTAssertGreaterThanOrEqual(survey.sizes[.shaders] ?? 0, 3 * 64 * kb)
         // the installed app inside xcode-derived-data is kept, not counted with the Xcode files
         XCTAssertGreaterThanOrEqual(survey.sizes[.xcode] ?? 0, 3 * 64 * kb)
         XCTAssertLessThan(survey.sizes[.xcode] ?? 0, 4 * 64 * kb + 16 * kb)
-        XCTAssertGreaterThanOrEqual(survey.kept, 5 * 64 * kb, "logs, profile, saves, converted NSPs and the installed app")
+        XCTAssertGreaterThanOrEqual(survey.kept, 4 * 64 * kb, "logs, profile, saves and the installed app")
     }
 
     /// Two old chain versions and the current one, as build_shaders leaves them (Mac and iPhone libraries, their keys), and
@@ -149,19 +248,19 @@ final class FreeSpaceTests: IsolatedDefaultsTestCase {
     func testRemovingOnePartLeavesTheRest() throws {
         let game = try fixture()
         let freed = try BuildFolder.remove([.extracted], in: build.path, protecting: BuildFolder.protectedPaths(for: game), buildRunning: false)
-        XCTAssertGreaterThanOrEqual(freed, 4 * 64 * 1024)
-        XCTAssertFalse(exists("extract")); XCTAssertFalse(exists("extract.partial")); XCTAssertFalse(exists("exefs.partial"))
+        XCTAssertGreaterThanOrEqual(freed, 5 * 64 * 1024)
+        XCTAssertFalse(exists("extract")); XCTAssertFalse(exists("extract.partial")); XCTAssertFalse(exists("exefs.partial")); XCTAssertFalse(exists("nsp"))
         for path in ["shader/package.bin", "pso", "xcode", "tools", "patched_v0", "logs"] { XCTAssertTrue(exists(path), path) }
     }
 
     func testTheFinishedAppTheArchiveAndTheNSPsAreNeverRemoved() throws {
         let game = try fixture()
         try BuildFolder.remove(Set(BuildFolderPart.allCases), in: build.path, protecting: BuildFolder.protectedPaths(for: game), buildRunning: false)
-        for path in ["extract", "shader", "pso", "xcode", "ipa", "tools", "tmp", "patched_v0", "patched_v0.key", "nro_v0", "aoc", "aoc.key", "font",
+        for path in ["extract", "nsp", "shader", "pso", "xcode", "ipa", "tools", "tmp", "patched_v0", "patched_v0.key", "nro_v0", "aoc", "aoc.key", "font",
                      "xcode-derived-data/Build/Intermediates.noindex"] {
             XCTAssertFalse(exists(path), path)
         }
-        for path in ["logs/split.log", "profile/\(titleID)/game.tsv", "run/save/save.bin", "nsp/game.nsp",
+        for path in ["logs/split.log", "profile/\(titleID)/game.tsv", "run/save/save.bin",
                      "xcode-derived-data/Build/Products/Release-iphoneos/DmIOS.app/Info.plist"] {
             XCTAssertTrue(exists(path), path)
         }
@@ -209,10 +308,70 @@ final class FreeSpaceTests: IsolatedDefaultsTestCase {
     func testWhichPartAnEntryBelongsTo() {
         XCTAssertEqual(BuildFolderPart.of("extract"), .extracted)
         XCTAssertEqual(BuildFolderPart.of("exefs.partial"), .extracted)
+        XCTAssertEqual(BuildFolderPart.of("nsp"), .extracted)
+        XCTAssertEqual(BuildFolderPart.of("nsp.partial"), .extracted)
         XCTAssertEqual(BuildFolderPart.of("shader"), .shaders)
         XCTAssertEqual(BuildFolderPart.of("xcode-derived-data"), .xcode)
+        XCTAssertEqual(BuildFolderPart.of("shell-framework"), .xcode)
         XCTAssertEqual(BuildFolderPart.of("patched_v65536.key"), .caches)
         XCTAssertEqual(BuildFolderPart.of("nro_v0"), .caches)
-        for kept in ["logs", "profile", "profile.derived.key", "run", "nsp", "survey.md", "unknown"] { XCTAssertNil(BuildFolderPart.of(kept), kept) }
+        for kept in ["logs", "profile", "profile.derived.key", "run", "survey.md", "unknown"] { XCTAssertNil(BuildFolderPart.of(kept), kept) }
+    }
+
+    func testHardLinkedFilesInsideATreeAreCountedOnce() throws {
+        let folder = temporary.appendingPathComponent("hardlink-tree")
+        try file("a.bin", in: folder, kb: 256)
+        let single = BuildFolder.size(folder.path)
+        XCTAssertGreaterThanOrEqual(single, 256 * 1024)
+        try FileManager.default.linkItem(at: folder.appendingPathComponent("a.bin"), to: folder.appendingPathComponent("b.bin"))
+        XCTAssertEqual(BuildFolder.size(folder.path), single)
+    }
+
+    /// Free space and Remove build files sheets for visual QA (`NX_LAUNCHER_CAPTURE_DIR`, `NX_CAPTURE_LANG`).
+    @MainActor func testRenderFreeSpaceForVisualQA() throws {
+        guard let directory = ProcessInfo.processInfo.environment["NX_LAUNCHER_CAPTURE_DIR"] else { throw XCTSkip("Set NX_LAUNCHER_CAPTURE_DIR to capture native views") }
+        let output = URL(fileURLWithPath: directory)
+        try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+        NSApplication.shared.setActivationPolicy(.accessory)
+        let stores = LauncherStores(defaults: testDefaults)
+        let localizer = stores.localizer
+        var game = LibraryGame(titleID: titleID, name: "Hades")
+        game.appPath = "/Volumes/Games/Hades/Hades.app"
+        let survey = BuildFolderSurvey(
+            folder: "/Volumes/Games/Hades/\(titleID)_build",
+            sizes: [.extracted: 8_400_000_000, .shaders: 4_200_000_000, .xcode: 1_900_000_000, .caches: 620_000_000],
+            kept: 12_400_000
+        )
+        let entry = BuildFilesStore.Entry(id: game.id, name: "Hades", folder: survey.folder, bytes: 15_120_000_000)
+        for lang in CaptureLanguage.all(Lang.all) {
+            localizer.lang = lang
+            stores.build.lang = lang
+            let freeHost = NSHostingView(rootView: FreeSpaceView(m: stores.build, game: game, survey: survey, chosen: [.extracted, .xcode])
+                .environmentObject(PadFocus()).environmentObject(localizer))
+            freeHost.frame = NSRect(origin: .zero, size: freeHost.fittingSize)
+            let freeWin = OffscreenWindow(size: freeHost.frame.size)
+            freeWin.contentView = freeHost
+            freeWin.orderFront(nil)
+            RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+            freeHost.layoutSubtreeIfNeeded()
+            let freeRep = try XCTUnwrap(freeHost.bitmapImageRepForCachingDisplay(in: freeHost.bounds))
+            freeHost.cacheDisplay(in: freeHost.bounds, to: freeRep)
+            try XCTUnwrap(freeRep.representation(using: .png, properties: [:])).write(to: output.appendingPathComponent("free-space-\(lang.code).png"))
+            freeWin.orderOut(nil)
+
+            let removeHost = NSHostingView(rootView: BuildFilesRemoveSheet(entry: entry, cancel: {}, confirm: {})
+                .environmentObject(PadFocus()).environmentObject(localizer)
+                .preferredColorScheme(.dark).launcherAppearance())
+            removeHost.frame = NSRect(origin: .zero, size: removeHost.fittingSize)
+            let removeWin = OffscreenWindow(size: removeHost.frame.size)
+            removeWin.contentView = removeHost
+            removeWin.orderFront(nil)
+            RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+            removeHost.layoutSubtreeIfNeeded()
+            let removeRep = try XCTUnwrap(removeHost.bitmapImageRepForCachingDisplay(in: removeHost.bounds))
+            removeHost.cacheDisplay(in: removeHost.bounds, to: removeRep)
+            try XCTUnwrap(removeRep.representation(using: .png, properties: [:])).write(to: output.appendingPathComponent("build-files-remove-\(lang.code).png"))
+            removeWin.orderOut(nil)
+        }
     }
 }

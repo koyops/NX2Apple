@@ -1,16 +1,19 @@
 120 fps
 16:9 (Switch)
 30 fps
+40 fps
 60 fps
-Adjusts resolution between 70% and 100% under load. Turn off to keep full resolution for the selected console mode.
 American English
+Automatic
 Brazilian Portuguese
 British English
 Canadian French
 Console mode
 Controls
+Corner
 Display mode
 Docked
+Downsample HDR textures
 Dutch
 Dynamic resolution
 Encode thread
@@ -18,6 +21,7 @@ Fill
 Fill crops the game's 16:9 picture to cover the screen. Health bars, subtitles or maps near the edges can be cut off. A full-screen picture without cropping needs a patch for each game.
 Fit
 Frame buffering
+Frame generation
 Frame rate
 Frame-rate counter
 French
@@ -29,35 +33,67 @@ Game's own
 Game's upscaler
 German
 Handheld
+Higher
 Hold frames when late
+Inward
 Italian
 Japanese
 Keeps a pipeline archive; uses more memory.
 Korean
+Landscape
+Large
 Latin American Spanish
+Left stick
+Lets the game hear your microphone. macOS asks for access when you launch with this enabled.
+Lets the game lower its resolution under load. Turn off to keep full resolution for the selected console mode.
+Loads each program's shader libraries in the background, whether a draw uses them or not.
+MacBook (16:10)
 Match screen
+Medium
 Metal 4 pipelines
 MetalFX
+Microphone
+Microphone gain
+Mix with other audio
+Original
 Performance
 Performance HUD
 Picture
 Picture shape
 Pipeline prebuild
+Plays Joy-Con 2 and Pro Controller 2 over Bluetooth: hold Sync on one during the game to pair it. macOS asks once for Bluetooth access.
+Plays game audio alongside other apps instead of stopping them.
+Polish
+Portrait
 Portuguese
 Press a button to join
+Recommended
 Render scale
-Renders about a quarter more pixels: a little slower and warmer.
+Rotation
 Rumble cutoff
 Rumble strength
 Russian
+Saves memory on devices without hardware BC textures, with slightly less precise HDR textures.
+Shader prefetch
+Shows 60 frames a second while the game draws 30. MetalFX makes a frame between each two, with less work and heat than 60 fps, slightly more input delay, and possible smearing on fast motion.
 Simplified Chinese
+Size
+Skips top mip levels of large static textures to save GPU memory and reduce heat. Takes effect on next launch.
+Small
+Smooth
 Spanish
 Standard
+Switch 2 controllers
+Taller shapes render more pixels and can increase GPU time and heat.
+Texture quality
+Thai
 The first start waits a few minutes for it, once.
+The size of the on-screen controls. Controls move toward medium when a size does not fit the screen.
 Touch feedback
 Traditional Chinese
 Up to one frame more display latency.
 Upscaling
 Uses more GPU time and can increase heat.
+Where the left stick of the on-screen controls sits.
 Window
 iPhone Duo screen (1.43:1)

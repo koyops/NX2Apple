@@ -5,6 +5,9 @@ import CoreGraphics
 public enum GameState: Equatable, Sendable {
     case playable
     case needsGameData
+    case needsDataUpdate(staleChain: Bool = false)
+    /// Background `.nxpart` split-file assembly in `Documents/games/<titleID>/` with percentage and formatted byte counts.
+    case joiningGameData(percent: Int, doneSize: String, totalSize: String)
     case needsAppUpdate
     /// `reason` is one short line for under the title, such as "Game files damaged". `detail` is a plain sentence
     /// for the player (what happened, what to do), shown under the title and in the How to fix sheet. `technical`
@@ -12,23 +15,95 @@ public enum GameState: Equatable, Sendable {
     case broken(reason: String, detail: String = "", technical: String = "")
 }
 
+/// Mild heads-up shown when the app's provisioning profile expires within 48 hours (such as a 7-day free Apple ID signature).
+public enum SigningWarning: Equatable, Sendable {
+    case expiringHours(Int)
+    case expiringSoon
+    case expired
+}
+
+/// Read-only summary of an imported sideload `.p12` signing certificate shown in Settings.
+public struct SideloadCertificateSummary: Equatable, Sendable {
+    public var commonName: String
+    public var teamID: String
+    public var expiresAt: Date?
+    public var isExpired: Bool
+    public var fingerprintHex: String
+
+    public init(commonName: String, teamID: String, expiresAt: Date?, isExpired: Bool, fingerprintHex: String) {
+        self.commonName = commonName
+        self.teamID = teamID
+        self.expiresAt = expiresAt
+        self.isExpired = isExpired
+        self.fingerprintHex = fingerprintHex
+    }
+}
+
+/// Outcome of selecting a `.p12` / `.pfx` certificate file from Settings before asking for its password.
+public enum SideloadCertificatePickResult: Equatable, Sendable {
+    case picked(fileName: String)
+    case cancelled
+    case failed(String)
+}
+
+/// Player choice in `CloudSaveConflictView`.
+public enum CloudSaveDecision: Equatable, Sendable {
+    case useCloud
+    case useDevice
+    case playOffline
+    case cancel
+}
+
+/// Pre-launch cloud save prompt data supplied by `ShellHost` when both sides changed or the cloud save could not be read.
+public struct CloudSavePrompt: Identifiable, Equatable, Sendable {
+    public var id: String
+    public var gameID: String
+    public var gameTitle: String
+    public var isUnreadable: Bool
+    public var reason: String
+    public var cloudDevice: String
+    public var cloudSaved: String
+    public var localSaved: String
+
+    public init(id: String = UUID().uuidString, gameID: String, gameTitle: String, isUnreadable: Bool = false,
+                reason: String = "", cloudDevice: String = "", cloudSaved: String = "", localSaved: String = "") {
+        self.id = id
+        self.gameID = gameID
+        self.gameTitle = gameTitle
+        self.isUnreadable = isUnreadable
+        self.reason = reason
+        self.cloudDevice = cloudDevice
+        self.cloudSaved = cloudSaved
+        self.localSaved = localSaved
+    }
+}
+
 public struct GameTile: Identifiable, Equatable, Sendable {
     public var id: String
     public var title: String
     /// One short line under the title, such as the version.
     public var subtitle: String
+    public var version: String
     /// The game's 16:9 key art, such as its eShop banner. Covers, Cover Flow cards and the hero all use it.
     public var banner: Artwork?
-    /// The square NACP icon. Only a fallback without a banner: shown whole inside a 16:9 card, never stretched.
+    /// The square app icon beside metadata. Without a banner, also shown whole inside the 16:9 card.
     public var icon: Artwork?
     public var state: GameState
     /// Already localized, such as "Played today". Nil leaves the game out of Recently played.
     public var recentlyPlayed: String?
+    /// The engine's manifest says it is a Switch 2 game: the detail view marks it and warns about its memory.
+    public var isSwitch2: Bool
+    /// True when the player has saved a custom cropped cover (`custom.jpg`) for this game.
+    public var hasCustomCover: Bool
     public init(id: String, title: String, subtitle: String = "", banner: Artwork? = nil, icon: Artwork? = nil,
-                state: GameState = .playable, recentlyPlayed: String? = nil) {
+                state: GameState = .playable, recentlyPlayed: String? = nil, version: String = "", isSwitch2: Bool = false,
+                hasCustomCover: Bool = false) {
+        self.isSwitch2 = isSwitch2
+        self.hasCustomCover = hasCustomCover
         self.id = id
         self.title = title
         self.subtitle = subtitle
+        self.version = version
         self.banner = banner
         self.icon = icon
         self.state = state
@@ -42,6 +117,7 @@ public struct SettingOption: Identifiable, Equatable, Sendable {
     /// The label is a text of the game's launcher.json: it is shown in the player's language when the catalog has it.
     public init(_ value: String, _ label: String) { self.init(value, label, in: ShellStrings.bundle) }
     init(_ value: String, _ label: String, in bundle: Bundle) { id = value; self.label = ShellStrings.setting(label, bundle: bundle) }
+    init(id: String, verbatimLabel: String) { self.id = id; self.label = verbatimLabel }
 }
 
 public enum SettingKind: Equatable, Sendable {
@@ -60,11 +136,15 @@ public struct SettingRow: Identifiable, Equatable, Sendable {
     public var enabled: Bool
     /// The value is the shell settings' choice, because the game has none of its own.
     public var fromShell: Bool
+    /// The value comes from per-game `Documents/games/<title ID>/env.txt`, because the UI has no explicit choice.
+    public var fromEnvFile: Bool
+    /// The value differs from the game profile's tested default (#453): the row draws a small dot before its label.
+    public var changed = false
     /// Label and note are texts of the game's launcher.json: shown in the player's language when the catalog has them.
-    public init(id: String, label: String, note: String = "", kind: SettingKind, value: String, enabled: Bool = true, fromShell: Bool = false) {
-        self.init(id: id, label: label, note: note, kind: kind, value: value, enabled: enabled, fromShell: fromShell, in: ShellStrings.bundle)
+    public init(id: String, label: String, note: String = "", kind: SettingKind, value: String, enabled: Bool = true, fromShell: Bool = false, fromEnvFile: Bool = false) {
+        self.init(id: id, label: label, note: note, kind: kind, value: value, enabled: enabled, fromShell: fromShell, fromEnvFile: fromEnvFile, in: ShellStrings.bundle)
     }
-    init(id: String, label: String, note: String = "", kind: SettingKind, value: String, enabled: Bool = true, fromShell: Bool = false, in bundle: Bundle) {
+    init(id: String, label: String, note: String = "", kind: SettingKind, value: String, enabled: Bool = true, fromShell: Bool = false, fromEnvFile: Bool = false, in bundle: Bundle) {
         self.id = id
         self.label = ShellStrings.setting(label, bundle: bundle)
         self.note = ShellStrings.setting(note, bundle: bundle)
@@ -72,6 +152,7 @@ public struct SettingRow: Identifiable, Equatable, Sendable {
         self.value = value
         self.enabled = enabled
         self.fromShell = fromShell
+        self.fromEnvFile = fromEnvFile
     }
 }
 
@@ -103,9 +184,16 @@ public struct GameDetail: Identifiable, Equatable, Sendable {
     public var cloudFromShell: Bool
     /// The shell settings have a cloud-saves folder this game does not use now, so the game can follow it.
     public var cloudCanUseShell: Bool
+    /// Readable timestamp label of the newest backup in `<appFolder>/save-backups/`, or nil when none exists.
+    public var latestSaveBackup: String?
+    /// Localized per-game play history summary ("14 hr, 25 min · Played 18 times"), or nil when never played.
+    public var playSummary: String?
+    /// Lightweight summary of this game's cheats for the Game Settings entry row.
+    public var cheatsSummary: GameCheatsSummary?
     public init(game: GameTile, sections: [SettingSection] = [], dataSource: String = "", dataNote: String = "",
                 cloudSaves: String? = nil, cloudNote: String = "", dlc: String = "", hasModifiedSettings: Bool = false,
-                dataFromShell: Bool = false, cloudFromShell: Bool = false, cloudCanUseShell: Bool = false) {
+                dataFromShell: Bool = false, cloudFromShell: Bool = false, cloudCanUseShell: Bool = false,
+                latestSaveBackup: String? = nil, playSummary: String? = nil, cheatsSummary: GameCheatsSummary? = nil) {
         self.game = game
         self.sections = sections
         self.dataSource = dataSource
@@ -117,7 +205,94 @@ public struct GameDetail: Identifiable, Equatable, Sendable {
         self.dataFromShell = dataFromShell
         self.cloudFromShell = cloudFromShell
         self.cloudCanUseShell = cloudCanUseShell
+        self.latestSaveBackup = latestSaveBackup
+        self.playSummary = playSummary
+        self.cheatsSummary = cheatsSummary
     }
+}
+
+/// One day bar in the Activity Log's 14-day play chart (#1161).
+public struct ActivityDayBar: Identifiable, Equatable, Sendable {
+    public var id: String
+    public var label: String
+    public var seconds: Double
+
+    public init(id: String, label: String, seconds: Double) {
+        self.id = id
+        self.label = label
+        self.seconds = seconds
+    }
+}
+
+/// One game row in the Activity Log (#1161).
+public struct ActivityGameEntry: Identifiable, Equatable, Sendable {
+    public var id: String
+    public var title: String
+    public var game: GameTile?
+    public var seconds: Double
+    public var totalTime: String
+    public var sessions: Int
+    public var averageTime: String
+    public var daysPlayed: Int
+    public var firstPlayed: String
+    public var lastPlayed: String
+    public var lastPlayedDate: Date
+    public var isInstalled: Bool
+
+    public init(id: String, title: String, game: GameTile? = nil, seconds: Double, totalTime: String, sessions: Int,
+                averageTime: String, daysPlayed: Int, firstPlayed: String, lastPlayed: String, lastPlayedDate: Date,
+                isInstalled: Bool) {
+        self.id = id
+        self.title = title
+        self.game = game
+        self.seconds = seconds
+        self.totalTime = totalTime
+        self.sessions = sessions
+        self.averageTime = averageTime
+        self.daysPlayed = daysPlayed
+        self.firstPlayed = firstPlayed
+        self.lastPlayed = lastPlayed
+        self.lastPlayedDate = lastPlayedDate
+        self.isInstalled = isInstalled
+    }
+}
+
+/// Presentation-ready Activity Log snapshot supplied by `ShellHost` (#1161).
+public struct ActivityLogSnapshot: Equatable, Sendable {
+    public var totalTime: String
+    public var totalSeconds: Double
+    public var totalSessions: Int
+    public var activeDaysCount: Int
+    public var gamesPlayedCount: Int
+    public var activeDayKeys: Set<String>
+    public var recentDays: [ActivityDayBar]
+    public var entries: [ActivityGameEntry]
+    public var referenceDate: Date
+
+    public init(totalTime: String, totalSeconds: Double, totalSessions: Int, activeDaysCount: Int, gamesPlayedCount: Int,
+                activeDayKeys: Set<String>, recentDays: [ActivityDayBar], entries: [ActivityGameEntry], referenceDate: Date) {
+        self.totalTime = totalTime
+        self.totalSeconds = totalSeconds
+        self.totalSessions = totalSessions
+        self.activeDaysCount = activeDaysCount
+        self.gamesPlayedCount = gamesPlayedCount
+        self.activeDayKeys = activeDayKeys
+        self.recentDays = recentDays
+        self.entries = entries
+        self.referenceDate = referenceDate
+    }
+
+    public static let empty = ActivityLogSnapshot(
+        totalTime: "0m",
+        totalSeconds: 0,
+        totalSessions: 0,
+        activeDaysCount: 0,
+        gamesPlayedCount: 0,
+        activeDayKeys: [],
+        recentDays: [],
+        entries: [],
+        referenceDate: Date(timeIntervalSinceReferenceDate: 0)
+    )
 }
 
 public struct ControllerInfo: Identifiable, Equatable, Sendable {
@@ -158,7 +333,8 @@ public enum InputDevice: Equatable, Sendable {
 
 /// One event from the host's input adapter: a press, or a button or direction let go. `sequence` orders them.
 public struct ShellInput: Equatable, Sendable {
-    public enum Action: Sendable { case up, down, left, right, activate, back, settings, controllers }
+    /// shellSettings: the shell's own settings (the gear), on the controller's Options button (#1129).
+    public enum Action: Sendable { case up, down, left, right, activate, back, settings, controllers, shellSettings }
     public var sequence: Int
     public var action: Action
     public var device: InputDevice
@@ -237,8 +413,77 @@ public struct ShellActions {
     public var onGlobalPadMapReset: () -> Void
     /// The button test opened (true) or closed: the host sends `PadSnapshot`s only in between.
     public var onButtonTest: (Bool) -> Void
+    /// Toggles `DM_PAD_MERGE` so every connected controller and touch controls drive player 1 together.
+    public var onPadMergeChange: (Bool) -> Void
+    /// Restores the newest backup in `<appFolder>/save-backups/` for `gameID` after backing up the current local save.
+    public var onRestoreSaveBackup: (String) -> Void
     /// Deletes the game's data on this device and takes it off the list. `saves`: its saves go too.
     public var onDeleteGame: (_ gameID: String, _ saves: Bool) -> Void
+    /// Opens the system Game Controller settings (or fallback app settings) to configure Home Button Override.
+    public var onOpenHomeButtonSettings: () -> Void
+    /// Copies the game's Apple Shortcuts `nx2apple://launch?id=...` deep-link URL to the clipboard.
+    public var onCopyShortcutURL: ((String) -> Void)?
+    /// Saves a square game icon to Photos, copies the title, and opens Shortcuts to add a Home Screen icon.
+    public var onAddToHomeScreen: (@MainActor (String) async -> Bool)?
+    /// Saves a square game icon to Photos, copies the title, optionally starts the floating PiP step guide, and opens Shortcuts.
+    public var onAddToHomeScreenWithGuide: (@MainActor (String, Bool) async -> Bool)?
+    /// Pre-warms the floating PiP step guide when the Add to Home Screen sheet opens.
+    public var onPrepareHomeScreenGuide: (@MainActor (String) -> Void)?
+    /// Releases a pre-warmed floating PiP step guide if the sheet closes without launching Shortcuts.
+    public var onCancelPreparedHomeScreenGuide: (@MainActor () -> Void)?
+    /// Persists a user-cropped 16:9 JPEG cover for `gameID` and refreshes its artwork.
+    public var onSaveCustomCover: ((_ gameID: String, _ jpegData: Data) -> Void)?
+    /// Removes the user's custom cover for `gameID` and restores the default banner/icon.
+    public var onResetCustomCover: ((_ gameID: String) -> Void)?
+    /// Opens the system file picker for a `.p12` / `.pfx` certificate file and stages it in the host.
+    public var onPickSideloadCertificateFile: (@MainActor () async -> SideloadCertificatePickResult)?
+    /// Validates and saves the staged `.p12` certificate using `password`; returns nil on success or a localized error message.
+    public var onConfirmSideloadCertificatePassword: (@MainActor (_ password: String) async -> String?)?
+    /// Discards any staged `.p12` bytes when the password prompt is dismissed.
+    public var onCancelSideloadCertificateImport: (@MainActor () -> Void)?
+    /// Removes the stored sideload `.p12` certificate from Keychain.
+    public var onRemoveSideloadCertificate: (@MainActor () -> Void)?
+    /// Loads the current cheats snapshot for `gameID` (synchronous fallback for previews/tests).
+    public var onLoadCheats: ((_ gameID: String) -> GameCheatsSnapshot)?
+    /// Loads the current cheats snapshot for `gameID` off the main thread.
+    public var onLoadCheatsAsync: (@MainActor (_ gameID: String) async -> GameCheatsSnapshot)?
+    /// Sets the per-game cheats master switch (`.cheats-off-<TID>`) and returns the refreshed snapshot.
+    public var onToggleCheatMaster: ((_ gameID: String, _ on: Bool) -> GameCheatsSnapshot)?
+    /// Sets the per-game cheats master switch off the main thread and returns the refreshed snapshot.
+    public var onToggleCheatMasterAsync: (@MainActor (_ gameID: String, _ on: Bool) async -> GameCheatsSnapshot)?
+    /// Toggles one switchable cheat entry in `<BID>.enabled` and returns the refreshed snapshot.
+    public var onToggleCheatEntry: ((_ gameID: String, _ key: String, _ on: Bool) -> GameCheatsSnapshot)?
+    /// Toggles one switchable cheat entry off the main thread and returns the refreshed snapshot.
+    public var onToggleCheatEntryAsync: (@MainActor (_ gameID: String, _ key: String, _ on: Bool) async -> GameCheatsSnapshot)?
+    /// Opens the system file picker to import a `.txt` cheat file for `gameID`.
+    public var onImportCheatFile: (@MainActor (_ gameID: String) async -> CheatImportOutcome)?
+    /// Confirms saving a build-mismatched `.txt` file under the game's current build ID.
+    public var onConfirmMismatchCheatImport: ((_ gameID: String, _ token: String) -> CheatImportOutcome)?
+    /// Confirms saving a build-mismatched `.txt` file off the main thread.
+    public var onConfirmMismatchCheatImportAsync: (@MainActor (_ gameID: String, _ token: String) async -> CheatImportOutcome)?
+    /// Discards any staged build-mismatched cheat file import.
+    public var onCancelMismatchCheatImport: ((_ gameID: String) -> Void)?
+    /// Dismisses the 30-second crash guard fuse alert for `gameID` and returns the refreshed snapshot.
+    public var onDismissCheatFuseAlert: ((_ gameID: String) -> GameCheatsSnapshot)?
+    /// Dismisses the 30-second crash guard fuse alert off the main thread and returns the refreshed snapshot.
+    public var onDismissCheatFuseAlertAsync: (@MainActor (_ gameID: String) async -> GameCheatsSnapshot)?
+
+    public var supportsHomeScreen: Bool {
+        onAddToHomeScreenWithGuide != nil || onAddToHomeScreen != nil || onCopyShortcutURL != nil
+    }
+
+    public var supportsCustomCover: Bool {
+        onSaveCustomCover != nil
+    }
+
+    public var supportsSideloadCertificate: Bool {
+        onPickSideloadCertificateFile != nil && onConfirmSideloadCertificatePassword != nil
+    }
+
+    public var supportsCheats: Bool {
+        onLoadCheatsAsync != nil || onLoadCheats != nil
+    }
+
     public init(onSelect: @escaping (String) -> Void = { _ in }, onPlay: @escaping (String) -> Void = { _ in },
                 onChange: @escaping (String, String, String) -> Void = { _, _, _ in },
                 onPickGameData: @escaping (String) -> Void = { _ in }, onUseAppData: @escaping (String) -> Void = { _ in },
@@ -250,7 +495,33 @@ public struct ShellActions {
                 onClearShellCloud: @escaping () -> Void = {},
                 onGlobalPadMapChange: @escaping (String, String) -> Void = { _, _ in },
                 onGlobalPadMapReset: @escaping () -> Void = {}, onButtonTest: @escaping (Bool) -> Void = { _ in },
-                onDeleteGame: @escaping (String, Bool) -> Void = { _, _ in }) {
+                onPadMergeChange: @escaping (Bool) -> Void = { _ in },
+                onRestoreSaveBackup: @escaping (String) -> Void = { _ in },
+                onDeleteGame: @escaping (String, Bool) -> Void = { _, _ in },
+                onOpenHomeButtonSettings: @escaping () -> Void = {},
+                onCopyShortcutURL: ((String) -> Void)? = nil,
+                onAddToHomeScreen: (@MainActor (String) async -> Bool)? = nil,
+                onAddToHomeScreenWithGuide: (@MainActor (String, Bool) async -> Bool)? = nil,
+                onPrepareHomeScreenGuide: (@MainActor (String) -> Void)? = nil,
+                onCancelPreparedHomeScreenGuide: (@MainActor () -> Void)? = nil,
+                onSaveCustomCover: ((_ gameID: String, _ jpegData: Data) -> Void)? = nil,
+                onResetCustomCover: ((_ gameID: String) -> Void)? = nil,
+                onPickSideloadCertificateFile: (@MainActor () async -> SideloadCertificatePickResult)? = nil,
+                onConfirmSideloadCertificatePassword: (@MainActor (_ password: String) async -> String?)? = nil,
+                onCancelSideloadCertificateImport: (@MainActor () -> Void)? = nil,
+                onRemoveSideloadCertificate: (@MainActor () -> Void)? = nil,
+                onLoadCheats: ((_ gameID: String) -> GameCheatsSnapshot)? = nil,
+                onLoadCheatsAsync: (@MainActor (_ gameID: String) async -> GameCheatsSnapshot)? = nil,
+                onToggleCheatMaster: ((_ gameID: String, _ on: Bool) -> GameCheatsSnapshot)? = nil,
+                onToggleCheatMasterAsync: (@MainActor (_ gameID: String, _ on: Bool) async -> GameCheatsSnapshot)? = nil,
+                onToggleCheatEntry: ((_ gameID: String, _ key: String, _ on: Bool) -> GameCheatsSnapshot)? = nil,
+                onToggleCheatEntryAsync: (@MainActor (_ gameID: String, _ key: String, _ on: Bool) async -> GameCheatsSnapshot)? = nil,
+                onImportCheatFile: (@MainActor (_ gameID: String) async -> CheatImportOutcome)? = nil,
+                onConfirmMismatchCheatImport: ((_ gameID: String, _ token: String) -> CheatImportOutcome)? = nil,
+                onConfirmMismatchCheatImportAsync: (@MainActor (_ gameID: String, _ token: String) async -> CheatImportOutcome)? = nil,
+                onCancelMismatchCheatImport: ((_ gameID: String) -> Void)? = nil,
+                onDismissCheatFuseAlert: ((_ gameID: String) -> GameCheatsSnapshot)? = nil,
+                onDismissCheatFuseAlertAsync: (@MainActor (_ gameID: String) async -> GameCheatsSnapshot)? = nil) {
         self.onSelect = onSelect
         self.onPlay = onPlay
         self.onChange = onChange
@@ -270,6 +541,32 @@ public struct ShellActions {
         self.onGlobalPadMapChange = onGlobalPadMapChange
         self.onGlobalPadMapReset = onGlobalPadMapReset
         self.onButtonTest = onButtonTest
+        self.onPadMergeChange = onPadMergeChange
+        self.onRestoreSaveBackup = onRestoreSaveBackup
         self.onDeleteGame = onDeleteGame
+        self.onOpenHomeButtonSettings = onOpenHomeButtonSettings
+        self.onCopyShortcutURL = onCopyShortcutURL
+        self.onAddToHomeScreen = onAddToHomeScreen
+        self.onAddToHomeScreenWithGuide = onAddToHomeScreenWithGuide
+        self.onPrepareHomeScreenGuide = onPrepareHomeScreenGuide
+        self.onCancelPreparedHomeScreenGuide = onCancelPreparedHomeScreenGuide
+        self.onSaveCustomCover = onSaveCustomCover
+        self.onResetCustomCover = onResetCustomCover
+        self.onPickSideloadCertificateFile = onPickSideloadCertificateFile
+        self.onConfirmSideloadCertificatePassword = onConfirmSideloadCertificatePassword
+        self.onCancelSideloadCertificateImport = onCancelSideloadCertificateImport
+        self.onRemoveSideloadCertificate = onRemoveSideloadCertificate
+        self.onLoadCheats = onLoadCheats
+        self.onLoadCheatsAsync = onLoadCheatsAsync
+        self.onToggleCheatMaster = onToggleCheatMaster
+        self.onToggleCheatMasterAsync = onToggleCheatMasterAsync
+        self.onToggleCheatEntry = onToggleCheatEntry
+        self.onToggleCheatEntryAsync = onToggleCheatEntryAsync
+        self.onImportCheatFile = onImportCheatFile
+        self.onConfirmMismatchCheatImport = onConfirmMismatchCheatImport
+        self.onConfirmMismatchCheatImportAsync = onConfirmMismatchCheatImportAsync
+        self.onCancelMismatchCheatImport = onCancelMismatchCheatImport
+        self.onDismissCheatFuseAlert = onDismissCheatFuseAlert
+        self.onDismissCheatFuseAlertAsync = onDismissCheatFuseAlertAsync
     }
 }

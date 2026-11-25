@@ -8,23 +8,35 @@ import XCTest
 final class GermanLocalizationTests: IsolatedDefaultsTestCase {
     /// Keys whose German text is the English text on purpose: names, units and button letters.
     private let sameAsEnglish: Set<String> = [
+        "library.chip.both", "shell.choiceLauncher", "onboarding.xcode.section", "onboarding.step.xcode", "files.optional",
         "onboarding.platform.mac", "onboarding.platform.iphone", "onboarding.setup.metal",
-        "onboarding.background.python", "onboarding.background.dotnet", "onboarding.games.version",
+        "onboarding.background.python", "onboarding.background.dotnet",
         "onboarding.demo.mario", "msg.ipaAt", "console.kind.gamepad", "console.platform.mac",
-        "console.platform.iphone", "console.version", "console.fps30", "console.fps60", "saves.toDevice",
+        "console.platform.iphone", "console.version", "console.builds.more", "console.fps30", "console.fps60", "saves.toDevice",
         "saves.toMac", "cheats.title", "section.app", "app.version", "nav.builds", "library.ok", "build.ios", "data.update", "data.keys", "delete.part.ipa",
         "dep.iossdk", "dep.tool.xcodegen", "dep.tool.zstd", "dep.tool.spirv-cross", "dep.tool.glslangValidator",
         "dep.glslang", "dep.xcode", "dep.metal", "dep.brew", "dep.xcodegen", "dep.zstd", "dep.spirv.win",
-        "dep.zstd.win", "dep.spirv", "dep.dotnet", "dep.phase.download", "dep.python.hint",
+        "dep.zstd.win", "dep.spirv", "dep.dotnet", "dep.vcredist", "dep.phase.download", "dep.python.hint",
         "controls.fn.A", "controls.fn.B", "controls.fn.X", "controls.fn.Y", "controls.fn.L", "controls.fn.R",
         "controls.fn.ZL", "controls.fn.ZR", "controls.fn.Plus", "controls.fn.Minus", "launch.mods", "artwork.screenshot",
-        "update.pill", "launch.opt.DM_OPMODE.0", "launch.opt.DM_PRESENT_UPSCALE.off",
-        "launch.opt.DM_FPS_TARGET.30", "launch.opt.DM_FPS_TARGET.60", "launch.opt.DM_FPS_TARGET.120", "launch.opt.DM_PRESENT_UPSCALE.metalfx", "launch.opt.DM_UPSCALER.metalfx",
-        "launch.opt.DM_SCREEN_ASPECT.0",   // 16:9 (Switch) reads the same in every language
+        "update.pill", "launch.opt.DM_OPMODE.0", "launch.opt.NXKIT_OP_MODE.handheld", "launch.opt.DM_PRESENT_UPSCALE.off",
+        "launch.opt.DM_FPS_TARGET.30", "launch.opt.DM_FPS_TARGET.40", "launch.opt.DM_FPS_TARGET.60", "launch.opt.DM_FPS_TARGET.120", "launch.opt.DM_PRESENT_UPSCALE.metalfx", "launch.opt.DM_UPSCALER.metalfx",
+        "launch.opt.DM_SCREEN_ASPECT.0", "launch.opt.DM_SCREEN_ASPECT.1.6", "launch.opt.DM_NVN_TEX_MIP_SKIP.0",   // 16:9 (Switch), MacBook (16:10) and Original read the same in German
         "switch2.badge",   // the console's name
+        "nxkit.name", "nxkit.version",   // the engine's name and its version number
+        "ios.ui.switch2Badge", "appearance.system", "settings.language.system", "sort.name", "launch.opt.DM_PRESENT_INTERVAL.display", "launch.opt.DM_PRESENT_INTERVAL.game",   // the console's name, System, Name, the frame rates
+        // Steam Controller names and button labels, and Touchscreen, read the same in German.
+        "controls.steam.title", "controls.steam.Guide", "controls.steam.mode.4", "controls.steam.L4", "controls.steam.L5", "controls.steam.R4", "controls.steam.R5",
+        "console.mapping.place.Plus", "console.mapping.place.Minus",   // the Switch's Plus and Minus buttons, as German writes them
         // The iOS shell's words that German writes as English does: OK, the controller, the Switch's Minus and Plus buttons, Version.
         // Every other ios.* key needs a German text that differs (ShellStringsTests in frontend-ios checks all seven languages).
-        "ios.host.ok", "ios.host.padController", "ios.ui.padController", "ios.ui.padMinus", "ios.ui.padPlus", "ios.ui.version",
+        "ios.host.ok", "ios.host.shellName", "ios.host.padController", "ios.ui.padController", "ios.ui.padMinus", "ios.ui.padPlus", "ios.ui.version", "ios.ui.gameVersionLabel", "ios.ui.cheats.title",
+        // Console mode's game page and Builds page (#816): Builds, Build, Cheats, Version and Status read the same in German.
+        "console.builds", "console.tab.build", "console.tab.cheats", "console.gamePage.version", "console.gamePage.status",
+        // Brand and device names on the batch refresh badge and platform tags.
+        "batchRefresh.versionBadge", "batchRefresh.platformIOS", "batchRefresh.platformMac",
+        "library.section.mac", "library.section.mobile",
+        "engine.platform.macOnly", "engine.platform.macIOS", "engine.scope.kws", "engine.scope.noLagKart",
     ]
 
     func testGermanIsNotLeftInEnglish() {

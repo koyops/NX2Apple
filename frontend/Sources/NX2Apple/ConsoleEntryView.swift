@@ -1,25 +1,7 @@
 import SwiftUI
+import AppKit
 import NXCore
 import NXLauncher
-
-/// The desktop integration only reports an intent. The application coordinator will supply it later.
-struct ConsoleEntryButton: View {
-    let lang: Lang
-    var compact = false
-    let enterConsole: () -> Void
-    var body: some View {
-        Button(action: enterConsole) {
-            Group {
-                if compact { Image(systemName: "gamecontroller") }
-                else { Label(L10n.string("console.entry", lang), systemImage: "gamecontroller") }
-            }
-                .font(.manrope(13, .semibold)).padding(.horizontal, 12).padding(.vertical, 8)
-                .background(.white.opacity(0.07), in: Capsule()).contentShape(Capsule())
-        }
-        .buttonStyle(.plain).accessibilityLabel(L10n.string("console.entry", lang)).help(L10n.string("console.entry", lang))
-        .padTarget("top.console", scope: "main", radius: 24, activate: enterConsole)
-    }
-}
 
 /// The cream button of a dialog: the launcher's secondary button's size and radius, filled.
 struct LauncherPrimaryButtonStyle: ButtonStyle {
@@ -27,9 +9,9 @@ struct LauncherPrimaryButtonStyle: ButtonStyle {
         configuration.label
             .font(.manrope(13, .bold)).lineLimit(1)
             .padding(.horizontal, 15).padding(.vertical, 9)
-            .background(LauncherPalette.cream.opacity(configuration.isPressed ? 0.8 : 1), in: RoundedRectangle(cornerRadius: 9))
+            .background(LauncherPalette.cream.opacity(configuration.isPressed ? 0.8 : 1), in: Capsule())
             .foregroundStyle(LauncherPalette.background)
-            .contentShape(RoundedRectangle(cornerRadius: 9))
+            .contentShape(Capsule())
     }
 }
 
@@ -57,7 +39,7 @@ struct ConsoleConnectionPrompt: View {
                 // one row, macOS order: the way out on the left of the main choice, both of the launcher's standard size
                 HStack(spacing: 10) {
                     Toggle(t("console.promptNever"), isOn: Binding(get: { !promptOn }, set: { promptOn = !$0 }))
-                        .toggleStyle(.checkbox).font(.manrope(12)).foregroundStyle(.secondary)
+                        .toggleStyle(.checkbox).font(DS.Font.callout).foregroundStyle(DS.Color.textSecondary)
                         .padTarget("console.entry.never", scope: "console.entry", radius: 6, activate: { promptOn.toggle() })
                     Spacer(minLength: 12)
                     Button(action: dismissPrompt) {
@@ -74,7 +56,7 @@ struct ConsoleConnectionPrompt: View {
                 .padding(.top, 6)
             }
             .padding(26).frame(maxWidth: 560).background(LauncherPalette.surface, in: RoundedRectangle(cornerRadius: 22))
-            .overlay(RoundedRectangle(cornerRadius: 22).strokeBorder(.white.opacity(0.10)))
+            .overlay(RoundedRectangle(cornerRadius: 22).strokeBorder(LauncherPalette.hairline))
             .padding(24)
         }
         .padScope("console.entry", pad)

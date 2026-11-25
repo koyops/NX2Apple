@@ -73,7 +73,8 @@ class Classifier(unittest.TestCase):
 
     def test_unknown_output_keeps_todays_behaviour(self):
         for log in ('', 'something odd happened', '[RED] the RomFS image failed',
-                    '[RED] the NSP is damaged: 3 files written as read (--allow-damaged)'):   # the note of a build that went on
+                    '[RED] the NSP is damaged: 3 files written as read (--allow-damaged)',
+                    '[RED] v131072: 3 file(s) whose bytes do not start as their names promise (a .zs file that is not a zstd stream), so the game files are damaged:\n  Tex/a.bntx.zs (216,015 bytes, starts 00000000)\npacked as they are (--allow-damaged)'):   # the note of a build that went on
             self.assertEqual(bf.classify(log), bf.Failure(bf.UNKNOWN), log)
 
     def test_the_game_of_a_32_bit_program_is_named_when_the_message_names_it(self):
@@ -112,6 +113,8 @@ class Rows(unittest.TestCase):
         self.assertIsNone(bf.classify(fixture('disk.full')['text']).detail)
         log = 'skipping an empty file: a.nsp\n' + fixture('games.noTitleID')['text'] + '\n'
         self.assertEqual(bf.classify(log).detail, fixture('games.noTitleID')['folder'])
+        stale = bf.classify(fixture('profile.stale')['text'])   # #553: a kept profile that lacks the selected update stops the build
+        self.assertEqual((stale.kind, stale.detail), (bf.STALE_PROFILE, fixture('profile.stale')['folder']))
 
     def test_offline_pipelines_explain_low_space_and_keep_the_engine_estimate(self):
         for pid, gb in (('pso.low', '3'), ('pso.merge', '2.5'), ('pso.failed', None)):
@@ -125,6 +128,46 @@ class Rows(unittest.TestCase):
                 self.assertTrue(TABLE[f'fail.psoDiskFull.{suffix}'][code], code)
             self.assertIn('%@', TABLE['fail.psoDiskFull.whatNeeds'][code])
         self.assertEqual(bf.classify('[RED] pso_offline: metal-tt failed for applegpu_g18p (exit 1): compiler error').kind, bf.UNKNOWN)
+
+    def test_apple_error_9120_and_lookalikes_across_all_languages(self):
+        real_9120 = (
+            "/tmp/shell/project/DmShell.xcodeproj: error: Failed to register bundle identifier: "
+            "The app identifier \"org.nxnative.shell\" cannot be registered to your development team "
+            "because it is not available. (9120) (in target 'DmShell' from project 'DmShell')\n"
+            "/tmp/shell/project/DmShell.xcodeproj: error: No profiles for 'org.nxnative.shell' were found\n"
+        )
+        f = bf.classify(real_9120)
+        self.assertEqual(f.kind, bf.APP_ID_LIMIT)
+        self.assertIsNone(f.detail)
+
+        with_reset = (
+            'Error Domain=DVTPortalServiceErrorDomain Code=9120 '
+            '"Your maximum App ID limit has been reached. You may create up to 10 App IDs every 7 days. '
+            'The oldest App ID expires on 2026-11-18."'
+        )
+        f_reset = bf.classify(with_reset)
+        self.assertEqual(f_reset.kind, bf.APP_ID_LIMIT)
+        self.assertEqual(f_reset.detail, '2026-11-18')
+
+        for lookalike in (
+            '[240/9120] Compiling App ID shader pipeline...',
+            'Communication with Apple failed on port 9120: connection reset',
+            'error: clang frontend command failed with exit code 1 (pid 9120)',
+            'error: Failed to register bundle identifier (91200)',
+            'error: Failed to register bundle identifier: The app identifier "org.nxnative.shell" cannot be registered to your development team because it is not available.',
+            "error: No profiles for 'org.nxnative.shell' were found",
+            'ERROR: This device has reached the maximum number of installed apps using a free developer profile (code -36607).',
+        ):
+            self.assertNotEqual(bf.classify(lookalike).kind, bf.APP_ID_LIMIT, lookalike)
+
+        for lang in Lang.all():
+            for key in ('fail.appIDLimit.what', 'fail.appIDLimit.whatUntil', 'fail.appIDLimit.next'):
+                text = TABLE[key][lang.code]
+                self.assertTrue(text, f'{lang.code}:{key}')
+                self.assertNotIn(';', text, f'{lang.code}:{key}')
+                self.assertNotIn('；', text, f'{lang.code}:{key}')
+                self.assertNotIn('nx2apple', text.lower(), f'{lang.code}:{key}')
+            self.assertIn('%@', TABLE['fail.appIDLimit.whatUntil'][lang.code])
         self.assertEqual(bf.classify('pso_offline: applegpu_g18p: batch 1/2: ready (compiled)').kind, bf.UNKNOWN)
 
     def test_a_keys_file_that_cannot_be_read_is_known_from_the_file(self):
@@ -155,9 +198,9 @@ class Rows(unittest.TestCase):
 
     def test_the_python_probe_and_the_venv_install_name_zbic(self):
         pkg = ROOT / 'frontend-qt/nspb_qt'
-        self.assertIn('import lz4, capstone, fontTools, zbic', (pkg / 'platform_util.py').read_text(encoding='utf-8'))
+        self.assertIn('import lz4, capstone, fontTools, zbic, unicorn', (pkg / 'platform_util.py').read_text(encoding='utf-8'))
         model = (pkg / 'model.py').read_text(encoding='utf-8')
-        self.assertIn("pkgs = ['lz4', 'capstone', 'fonttools', 'zbic', 'nsz']", model)
+        self.assertIn("pkgs = ['lz4', 'capstone', 'unicorn', 'fonttools', 'zbic', 'nsz']", model)
         self.assertIn("'zbic', 'backports.zstd', 'nsz'", model)
 
     @unittest.skipIf(importlib.util.find_spec('PySide6') is None, 'PySide6 is not installed')
@@ -175,6 +218,88 @@ class Rows(unittest.TestCase):
         m.base_path = ''
         self.assertEqual(m.failure_folder(bf.Failure(bf.NO_TITLE_ID, detail='/x/y')), '/x/y')
         self.assertIn('40 GB', m.failure_what(bf.Failure(bf.DISK_FULL, detail='40')))
+
+    def test_windows_missing_prereqs_and_no_ios_shaders_across_all_languages(self):
+        vc_log = (
+            "[RED] missing on this PC:\n"
+            "  Visual C++ Redistributable (x64): missing (missing vcruntime140_1.dll, msvcp140.dll in C:\\Windows\\System32 "
+            "— install Microsoft Visual C++ 2015-2022 Redistributable (x64): https://aka.ms/vs/17/release/vc_redist.x64.exe)"
+        )
+        f_vc = bf.classify(vc_log)
+        self.assertEqual(f_vc.kind, bf.WIN_PREREQ)
+        self.assertIn('vcruntime140_1.dll, msvcp140.dll', f_vc.detail or '')
+
+        f_old_metal = bf.classify(
+            "[RED] no iOS shader libraries in D:\\build\\b-0123 — installed Metal Developer Tools for Windows is too old"
+        )
+        self.assertEqual(f_old_metal.kind, bf.WIN_PREREQ)
+        self.assertIn('Metal Developer Tools', f_old_metal.detail or '')
+
+        f_07b = bf.classify('[RED] metal failed: metal.exe exited with 0xC000007B (32-bit/64-bit DLL mismatch)')
+        self.assertEqual(f_07b.kind, bf.WIN_PREREQ)
+        self.assertIn('0xC000007B', f_07b.detail or '')
+
+        f_bare_sh = bf.classify(r'[RED] no iOS shader libraries in D:\build\01006F8002326000_build\shader\ios\b-0123456789ab')
+        self.assertEqual(f_bare_sh.kind, bf.NO_IOS_SHADERS)
+        self.assertIsNone(f_bare_sh.detail)
+
+        f_reason_sh = bf.classify(
+            r'[RED] no iOS shader libraries in D:\build\01006F8002326000_build\shader\ios\b-0123456789ab — all 64 shader compiles failed: unexpected AIR syntax'
+        )
+        self.assertEqual(f_reason_sh.kind, bf.NO_IOS_SHADERS)
+        self.assertIn('all 64 shader compiles failed', f_reason_sh.detail or '')
+
+        for lang in Lang.all():
+            for key in (
+                'dep.vcredist',
+                'dep.vcredist.download',
+                'dep.vcredist.hint',
+                'fail.winPrereq.button',
+                'fail.winPrereq.what',
+                'fail.winPrereq.whatNamed',
+                'fail.winPrereq.next',
+                'fail.noIOSShaders.what',
+                'fail.noIOSShaders.whatDetail',
+                'fail.noIOSShaders.next',
+            ):
+                text = TABLE[key][lang.code]
+                self.assertTrue(text, f'{lang.code}:{key}')
+                self.assertNotIn(';', text, f'{lang.code}:{key}')
+                self.assertNotIn('；', text, f'{lang.code}:{key}')
+                self.assertNotIn('nx2apple', text.lower(), f'{lang.code}:{key}')
+            self.assertIn('%@', TABLE['fail.winPrereq.whatNamed'][lang.code])
+            self.assertIn('%@', TABLE['fail.noIOSShaders.whatDetail'][lang.code])
+
+    def test_split_shader_tables_mismatch_classified_independently_across_all_languages(self):
+        real_log = (
+            "[5/8] shader split\n"
+            "[RED] the split shader tables differ from game profile 01007EF00011E000's:\n"
+            "  shader_facts.tsv: 0 row(s) only in the profile, 2 only in the split\n"
+            "    split: 8e2cc2671cae6020\t{\"fout\":{\"0\":\"uint\"}}\n"
+            "    split: 93aa5e22a8202409\t{\"fout\":{\"0\":\"uint\"}}\n"
+            "Either these game files are not the versions the profile registers, or shader_split.py now reads "
+            "them differently and the profile's tables were not split again "
+            "(the split's tables: D:\\Games\\01007EF00011E000_build\\split\\tables)\n"
+        )
+        f = bf.classify(real_log)
+        self.assertEqual(f.kind, bf.PROFILE_TABLES_MISMATCH)
+        self.assertEqual(f.what_key, 'fail.profileTablesMismatch.what')
+        self.assertEqual(f.next_key, 'fail.profileTablesMismatch.next')
+
+        # Unrelated update-version mismatches must keep classifying as PROFILE_UPDATE_MISMATCH
+        for upd_log in (
+            'FAIL: game profile totk has no build for v131072 (it registers v0 1.0.0, v65536 1.1.0)',
+            '[RED] requested version v720896 is not in the input folder',
+        ):
+            self.assertEqual(bf.classify(upd_log).kind, bf.PROFILE_UPDATE_MISMATCH, upd_log)
+
+        for lang in Lang.all():
+            for key in ('fail.profileTablesMismatch.what', 'fail.profileTablesMismatch.next'):
+                text = TABLE[key][lang.code]
+                self.assertTrue(text, f'{lang.code}:{key}')
+                self.assertNotIn(';', text, f'{lang.code}:{key}')
+                self.assertNotIn('；', text, f'{lang.code}:{key}')
+                self.assertNotIn('nx2apple', text.lower(), f'{lang.code}:{key}')
 
 
 class Override(unittest.TestCase):
@@ -305,6 +430,19 @@ class Window(unittest.TestCase):
             build.assert_called_once()
             self.assertIn('untested', ask.call_args.args[2])
             self.assertEqual(m.override.take(), '--allow-damaged')
+
+    def test_win_prereq_card_shows_named_component_and_opens_settings(self):
+        m, w = self._window(
+            bf.Failure(bf.WIN_PREREQ, detail='Microsoft Visual C++ 2015-2022 Redistributable (x64) (vcruntime140_1.dll)')
+        )
+        self.assertFalse(w.failure_box.isHidden())
+        self.assertFalse(w.failure_fix_btn.isHidden())
+        self.assertEqual(w.failure_fix_btn.text(), m.t('fail.winPrereq.button'))
+        self.assertIn('vcruntime140_1.dll', w.failure_what.text())
+        self.assertTrue(w.failure_anyway_btn.isHidden())
+        with mock.patch.object(w, '_switch_page') as switch:
+            w._fix_failure()
+            switch.assert_called_once_with('settings')
 
 
 if __name__ == '__main__':

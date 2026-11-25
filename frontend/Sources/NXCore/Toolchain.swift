@@ -111,37 +111,125 @@ package enum Toolchain {
         return dir.isEmpty ? NSHomeDirectory() + "/.asdf" : dir
     }()
 
-    package static func importsOK(_ py: String) -> Bool {
-        runOK(py, ["-c", importProbe], env: ProcessInfo.processInfo.environment.merging(BundledTools.environment(for: py)) { $1 })
+    package static let s2armExtraImportProbe = "\nimport numpy, PIL, pathops\n"
+
+    package static func importsOK(_ py: String, includeS2Arm: Bool = false, runner: ProcessRunner = SystemProcessRunner()) -> Bool {
+        let script = includeS2Arm ? (importProbe + s2armExtraImportProbe) : importProbe
+        return runOK(py, ["-c", script], env: ProcessInfo.processInfo.environment.merging(BundledTools.environment(for: py)) { $1 }, runner: runner)
     }
 
     /// backports.zstd declares Python < 3.14, so it is only installed where it is needed.
     /// nsz is always installed: NSZ / XCZ dumps are accepted by the pipeline now, and a player who
     /// downloads one should not have to run pip by hand (it is a few hundred KB).
-    package static func pipPackages(_ version: (Int, Int)) -> [String] {
-        version < (3, 14) ? ["lz4", "capstone", "fonttools", "zbic", "backports.zstd", "nsz"]
-                          : ["lz4", "capstone", "fonttools", "zbic", "nsz"]
+    package static func pipPackages(_ version: (Int, Int), includeS2Arm: Bool = false) -> [String] {
+        var base = version < (3, 14)
+            ? ["lz4", "capstone", "fonttools", "zbic", "backports.zstd", "nsz"]
+            : ["lz4", "capstone", "fonttools", "zbic", "nsz"]
+        if includeS2Arm {
+            for pkg in S2ArmBuilder.pipPackages where !base.contains(where: { $0.caseInsensitiveCompare(pkg) == .orderedSame }) {
+                base.append(pkg)
+            }
+        }
+        return base
+    }
+
+    /// Parses a percentage token such as "45.3%" from a progress line as a 0...1 fraction.
+    package static func parsePercent(in text: String) -> Double? {
+        guard let re = try? NSRegularExpression(pattern: #"(\d{1,3}(?:\.\d+)?)\s*%"#) else { return nil }
+        let ns = text as NSString
+        guard let m = re.matches(in: text, range: NSRange(location: 0, length: ns.length)).last,
+              let n = Double(ns.substring(with: m.range(at: 1))) else { return nil }
+        return min(max(n / 100, 0), 1)
+    }
+
+    /// Maps a line of `pip install` output to a readable fraction and status summary.
+    package static func parsePipProgress(line: String, completed: inout Int, total: Int) -> (fraction: Double?, detail: String)? {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let safeTotal = max(1, total)
+        if trimmed.hasPrefix("Collecting ") || trimmed.hasPrefix("Requirement already satisfied:") {
+            let rest = trimmed.hasPrefix("Collecting ")
+                ? String(trimmed.dropFirst("Collecting ".count))
+                : String(trimmed.dropFirst("Requirement already satisfied:".count)).trimmingCharacters(in: .whitespaces)
+            let pkg = rest.split(whereSeparator: { $0 == " " || $0 == "<" || $0 == ">" || $0 == "=" || $0 == "!" || $0 == "[" }).first.map(String.init) ?? rest
+            completed = min(completed + 1, safeTotal)
+            let frac = 0.1 + 0.65 * (Double(completed) / Double(safeTotal))
+            return (min(frac, 0.8), "Collecting \(pkg) (\(completed)/\(safeTotal))")
+        }
+        if trimmed.hasPrefix("Downloading ") {
+            let rest = String(trimmed.dropFirst("Downloading ".count))
+            let file = rest.split(separator: " ").first.map { ($0 as NSString).lastPathComponent } ?? rest
+            let baseFrac = 0.1 + 0.65 * (Double(max(completed, 1) - 1) / Double(safeTotal))
+            if let sub = parsePercent(in: trimmed) {
+                let frac = baseFrac + (0.65 / Double(safeTotal)) * sub
+                return (min(frac, 0.82), "Downloading \(file)")
+            }
+            return (min(baseFrac + 0.05, 0.82), "Downloading \(file)")
+        }
+        if trimmed.hasPrefix("Building wheel for ") {
+            let rest = String(trimmed.dropFirst("Building wheel for ".count))
+            let pkg = rest.split(separator: " ").first.map(String.init) ?? rest
+            return (0.82, "Building \(pkg)")
+        }
+        if trimmed.hasPrefix("Installing collected packages:") {
+            return (0.88, "Installing packages")
+        }
+        if trimmed.hasPrefix("Successfully installed ") {
+            completed = safeTotal
+            return (1.0, "Installed")
+        }
+        if let pct = parsePercent(in: trimmed) {
+            return (pct, trimmed)
+        }
+        return nil
     }
 
     /// Create the venv (reusing an existing one) and install the packages into it. Returns the
     /// combined output so a failure can be shown instead of swallowed — the pip output used to go
     /// to a pipe nobody read, and `externally-managed-environment` never reached the user.
-    package static func makeVenv(base: String, runner: ProcessRunner = SystemProcessRunner()) -> (ok: Bool, log: String) {
+    package static func makeVenv(
+        base: String,
+        includeS2Arm: Bool = false,
+        runner: ProcessRunner = SystemProcessRunner(),
+        onProgress: (@Sendable (Double?, String) -> Void)? = nil
+    ) -> (ok: Bool, log: String) {
         var log = ""
-        func run(_ exe: String, _ args: [String]) -> Bool {
-            let env = ["PATH": BundledTools.path("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", python: base), "HOME": NSHomeDirectory()].merging(BundledTools.environment(for: base)) { $1 }
-            let r = runner.capture(ProcessLaunch(executable: exe, arguments: args, environment: env))
-            if !r.started { log += "could not start \(exe): \(r.out)\n"; return false }
-            log += r.out
-            log += r.err
-            return r.ok
+        func makeEnv() -> [String: String] {
+            let baseEnv = ["PATH": BundledTools.path("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", python: base), "HOME": NSHomeDirectory()]
+                .merging(BundledTools.environment(for: base)) { $1 }
+            return ProxyEnvironment.merged(into: baseEnv)
+        }
+        func runCapturedOrStreamed(_ exe: String, _ args: [String], lineHandler: ((String) -> Void)? = nil) -> Bool {
+            let env = makeEnv()
+            guard onProgress != nil else {
+                let r = runner.capture(ProcessLaunch(executable: exe, arguments: args, environment: env))
+                if !r.started {
+                    log += "could not start \(exe): \(r.out)\n"
+                    return false
+                }
+                log += r.out
+                log += r.err
+                return r.ok
+            }
+            final class LogBuffer: @unchecked Sendable {
+                private let lock = NSLock()
+                var text = ""
+                func append(_ s: String) {
+                    lock.lock()
+                    text += s + "\n"
+                    lock.unlock()
+                }
+            }
+            let buf = LogBuffer()
+            let ok = runner.stream(ProcessLaunch(executable: exe, arguments: args, environment: env)) { line in
+                buf.append(line)
+                lineHandler?(line)
+            }
+            log += buf.text
+            return ok
         }
         let vpy = venvPython()
-        // An existing venv below minPython (built from Apple's 3.9 by an older app, issue #75) is
-        // moved aside and rebuilt: pip into it would "succeed" and the build would still fail.
-        // Moved, never deleted, because the folder is the user's. Only when a usable base exists,
-        // so a Mac with no new Python keeps its old venv instead of losing it for nothing.
-        if FileManager.default.isExecutableFile(atPath: vpy), pythonVersion(vpy).map({ $0 < minPython }) ?? true {
+        if FileManager.default.isExecutableFile(atPath: vpy), pythonVersion(vpy, runner: runner).map({ $0 < minPython }) ?? true {
             guard let interp = venvBase(preferred: base), interp != vpy else {
                 return (false, log + "\(venvDir) is older than Python \(minPython.0).\(minPython.1) and no newer Python was found to rebuild it from\n")
             }
@@ -153,21 +241,43 @@ package enum Toolchain {
             log += "moved the old venv (Python below \(minPython.0).\(minPython.1)) to \(aside)\n"
         }
         if !FileManager.default.isExecutableFile(atPath: vpy) {
-            // findPython() returns the venv path it hopes to create when no interpreter was
-            // found, and the panel hands that to this function. It cannot be a base: `-m venv`
-            // failed with "could not start …" and the Python row never recovered.
             guard let interp = venvBase(preferred: base) else {
                 return (false, log + "no Python \(minPython.0).\(minPython.1) or newer to create \(venvDir) from\n")
             }
-            if interp != base { log += "\(base) is not a usable interpreter; using \(interp)\n" }
+            if interp != base { log += "\(base) is not a usable interpreter, using \(interp)\n" }
             log += "$ \(interp) -m venv \(venvDir)\n"
+            onProgress?(0.05, "venv")
             try? FileManager.default.createDirectory(atPath: (venvDir as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
-            guard run(interp, ["-m", "venv", venvDir]) else { return (false, log + "venv creation failed\n") }
+            guard runCapturedOrStreamed(interp, ["-m", "venv", venvDir]) else { return (false, log + "venv creation failed\n") }
         }
-        let pkgs = pipPackages(pythonVersion(vpy) ?? minPython).joined(separator: " ")
+        let packageList = pipPackages(pythonVersion(vpy, runner: runner) ?? minPython, includeS2Arm: includeS2Arm)
+        let pkgs = packageList.joined(separator: " ")
         log += "$ \(vpy) -m pip install \(pkgs)\n"
-        let ok = run(vpy, ["-m", "pip", "install"] + pipPackages(pythonVersion(vpy) ?? minPython))
-        return (ok && importsOK(vpy), log)
+        onProgress?(0.1, "pip install")
+        final class PipState: @unchecked Sendable {
+            private let lock = NSLock()
+            var completed = 0
+            var peak = 0.1
+            func step(_ line: String, total: Int) -> (Double?, String)? {
+                lock.lock()
+                defer { lock.unlock() }
+                guard let parsed = Toolchain.parsePipProgress(line: line, completed: &completed, total: total) else { return nil }
+                if let frac = parsed.fraction {
+                    peak = max(peak, frac)
+                    return (peak, parsed.detail)
+                }
+                return parsed
+            }
+        }
+        let pipState = PipState()
+        let ok = runCapturedOrStreamed(vpy, ["-m", "pip", "install"] + packageList) { line in
+            if let update = pipState.step(line, total: packageList.count) {
+                onProgress?(update.0, update.1)
+            }
+        }
+        let ready = ok && importsOK(vpy, includeS2Arm: includeS2Arm, runner: runner)
+        if ready { onProgress?(1.0, "Installed") }
+        return (ready, log)
     }
 
     /// "3.12.4" → (3, 12). nil when the interpreter cannot be run.
@@ -260,19 +370,22 @@ package enum Toolchain {
 
     /// Every python3 on this Mac, newest-looking first, each tried for a usable version and the
     /// packages. Returns the one to build with, plus why the others were rejected for the message.
-    package static func findPython(resources: URL? = BundledTools.resources) -> (path: String, ok: Bool) {
+    package static func findPython(resources: URL? = BundledTools.resources, includeS2Arm: Bool = false) -> (path: String, ok: Bool) {
         // The release app's own Python (BundledTools.swift) has every package and is the one the build is tested with: it wins over
         // any Python on this Mac and needs no venv. One that does not run (a damaged copy) falls through to the search below
         // (uv's Pythons, the other candidates, then the venv).
-        if let bundled = BundledTools.python(in: resources), pythonVersion(bundled).map({ $0 >= minPython }) == true, importsOK(bundled) {
+        if let bundled = BundledTools.python(in: resources),
+           pythonVersion(bundled).map({ $0 >= minPython }) == true,
+           importsOK(bundled, includeS2Arm: includeS2Arm) {
             return (bundled, true)
         }
         var seen = Set<String>()
         var fallback: (String, (Int, Int))? = nil   // newest with an acceptable version but no packages
         for c in pythonCandidates() where !c.isEmpty && seen.insert(c).inserted {
+            if MacNativeGamesBuilder.isManagedUVPython(c) { continue }
             guard FileManager.default.isExecutableFile(atPath: c), let v = pythonVersion(c) else { continue }
             guard v >= minPython else { continue }
-            if importsOK(c) { return (c, true) }
+            if importsOK(c, includeS2Arm: includeS2Arm) { return (c, true) }
             if fallback == nil || v > fallback!.1 { fallback = (c, v) }
         }
         // No system interpreter has the packages: the venv (existing, or created by 安装) is next.
@@ -281,7 +394,7 @@ package enum Toolchain {
         // version made it from Apple's 3.9, and the build script refuses that (issue #75). It
         // falls through to the candidates above, or to the row saying the Python is too old.
         if FileManager.default.isExecutableFile(atPath: vpy), let v = pythonVersion(vpy), v >= minPython {
-            if importsOK(vpy) { return (vpy, true) }
+            if importsOK(vpy, includeS2Arm: includeS2Arm) { return (vpy, true) }
             return (vpy, false)   // exists but incomplete: 安装 finishes it
         }
         return (fallback?.0 ?? vpy, false)
@@ -357,7 +470,8 @@ package enum Toolchain {
     /// An Xcode.app that is installed but not selected: an App Store download arrives as
     /// /Applications/Xcode.app and stays unused until someone opens it or points xcode-select at
     /// it, so `xcode-select -p` keeps saying CommandLineTools and xcodebuild fails later.
-    package static func installedXcode() -> String? {
+    package static func installedXcode(customApp: String? = nil) -> String? {
+        if let customApp { return XcodeSelection.isXcode(customApp) ? customApp : nil }
         for app in ["/Applications/Xcode.app", "/Applications/Xcode-beta.app"]
         where FileManager.default.isExecutableFile(atPath: app + "/Contents/Developer/usr/bin/xcodebuild") {
             return app

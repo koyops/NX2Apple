@@ -14,22 +14,30 @@ import NXLauncher
 /// ReleaseNotes turns them into blocks with links, and this file only styles those.
 package struct UpdateSheet: View {
     @ObservedObject var updates: AppUpdateStore
+    /// The store of the running build: the open sheet follows it, so the button is back when the build ends.
+    @ObservedObject private var build: BuildStore
+    @EnvironmentObject private var pad: PadFocus
+    @StateObject private var scroll = LauncherScrollPosition()
     @EnvironmentObject var loc: Localizer
     @Environment(\.dismiss) private var dismiss
 
-    package init(updates: AppUpdateStore) { self.updates = updates }
+    package init(updates: AppUpdateStore, build: BuildStore) {
+        self.updates = updates
+        self.build = build
+    }
+
+    /// The orange line above the buttons: a refusal the store reported, or else the reason the main button is off
+    /// while a build runs.
+    static func note(blocked: String?, buildRunning: Bool, waitForBuild: String) -> String? {
+        blocked ?? (buildRunning ? waitForBuild : nil)
+    }
 
     private var update: AppUpdate.Release? { updates.update }
 
     package var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 6) {
-                Text(loc.t("update.title"))
-                    .font(.manrope(24, .heavy)).tracking(-0.5)
-                Text(String(format: loc.t("update.fromTo"), updates.version, update?.tag ?? ""))
-                    .font(.manrope(13)).foregroundStyle(.secondary)
-            }
-            .padding(.horizontal, 28).padding(.top, 26).padding(.bottom, 18)
+            DSSheetHeader(title: loc.t("update.title"), message: String(format: loc.t("update.fromTo"), updates.version, update?.tag ?? ""))
+                .padding(.horizontal, DSSheetInsets.horizontal).padding(.top, DSSheetInsets.vertical).padding(.bottom, DSSheetInsets.gap)
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 6) {
@@ -39,83 +47,102 @@ package struct UpdateSheet: View {
                             blockView(block, first: index == 0)
                         }
                     } else {
-                        Text(loc.t("update.noNotes")).font(.manrope(13)).foregroundStyle(.secondary)
+                        Text(loc.t("update.noNotes")).font(DS.Font.body).foregroundStyle(DS.Color.textSecondary)
                     }
                 }
-                .padding(.horizontal, 28).padding(.bottom, 20)
+                .padding(.horizontal, DSSheetInsets.horizontal).padding(.bottom, DSSheetInsets.gap)
+                .background(LauncherScrollProbe(scroll: scroll))
             }
             .frame(maxHeight: 340)
+            .focusable()
+            .padTarget("update.notes", scope: "update", radius: 0, vertical: scroll.move)
 
-            if let blocked = updates.blocked {
-                Text(blocked).font(.manrope(12.5)).foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.horizontal, 28).padding(.bottom, 12)
+            if let blocked = Self.note(blocked: updates.blocked, buildRunning: build.running, waitForBuild: loc.t("app.waitForBuild")) {
+                Group {
+                    if updates.blocked != nil { DSInlineWarning(blocked) }
+                    else { Text(blocked).font(DS.Font.callout).foregroundStyle(DS.Color.textSecondary).fixedSize(horizontal: false, vertical: true) }
+                }
+                .padding(.horizontal, DSSheetInsets.horizontal).padding(.bottom, DS.Space.xs)
             }
-            Divider().opacity(0.3)
-            HStack(spacing: 12) {
+            HStack(spacing: DS.Space.s) {
                 if let u = update {
                     Link(loc.t("update.openPage"), destination: URL(string: "https://github.com/LNPANDY/NX2Apple/releases/tag/\(u.tag)")!)
-                        .font(.manrope(12.5))
+                        .font(DS.Font.callout)
+                        .padTarget("update.page", scope: "update", radius: 0) {
+                            if let url = URL(string: "https://github.com/LNPANDY/NX2Apple/releases/tag/\(u.tag)") { NSWorkspace.shared.open(url) }
+                        }
                 }
-                Spacer(minLength: 8)
+                Spacer(minLength: DS.Space.xs)
                 Button(loc.t("update.later")) { dismiss() }
-                    .buttonStyle(LauncherSecondaryButtonStyle())
+                    .buttonStyle(DSSecondaryButtonStyle())
                     .keyboardShortcut(.cancelAction)
+                    .padTarget("update.cancel", scope: "update") { dismiss() }
                 Button {
-                    guard !updates.busy else { return }
-                    // Automatic mode has already downloaded and staged the release, so the action is
-                    // to swap it in now; otherwise this downloads, verifies and installs as before.
-                    // The sheet stays up while it downloads, so a refusal (a macOS too old for the release) is seen here.
-                    if updates.staged != nil { updates.install(relaunch: true); dismiss() } else { updates.performUpdate() }
+                    install()
                 } label: {
                     updateButtonLabel
                 }
                 .buttonStyle(.plain)
-                .disabled(updates.busy && updates.downloadProgress == nil)
-                .allowsHitTesting(!updates.busy)
+                .disabled((updates.busy && updates.downloadProgress == nil) || build.running)
+                .allowsHitTesting(!updates.busy && !build.running)
                 .accessibilityValue(updates.downloadProgress.map { "\(Int((min(max($0, 0), 1) * 100).rounded()))%" } ?? "")
                 .keyboardShortcut(.defaultAction)
+                .padTarget("update.install", scope: "update", focusColor: DS.Color.accentOn, enabled: !updates.busy && !build.running, activate: install)
             }
-            .padding(.horizontal, 28).padding(.vertical, 16)
+            .padding(.horizontal, DSSheetInsets.horizontal).padding(.top, DSSheetInsets.gap).padding(.bottom, DSSheetInsets.vertical)
         }
+        .padScope("update", pad)
         .frame(width: 560)
-        .background(LauncherPalette.background)
-        .preferredColorScheme(.dark)
-        .tint(LauncherPalette.cream)
+        .dsSheetSurface()
+    }
+
+    private func install() {
+        guard !updates.busy, !build.running else { return }
+        if updates.staged != nil { if updates.install(relaunch: true) { dismiss() } } else { updates.performUpdate() }
     }
 
     @ViewBuilder private var updateButtonLabel: some View {
         let baseTitle = loc.t(updates.staged != nil ? "app.restartNow" : "update.now")
         if let progress = updates.downloadProgress {
             let clamped = min(max(progress, 0), 1)
-            let pct = Int((clamped * 100).rounded())
-            ZStack {
-                Text(baseTitle)
-                    .font(.manrope(13.5, .bold))
-                    .opacity(0)
-                Text("\(pct)%")
-                    .font(.manrope(13.5, .bold)).monospacedDigit()
-                    .foregroundStyle(.white)
+            let pct = "\(Int((clamped * 100).rounded()))%"
+            let sizing = ZStack {
+                Text(baseTitle).font(.manrope(13.5, .bold))
+                Text("100%").font(.manrope(13.5, .bold)).monospacedDigit()
             }
+            .opacity(0)
             .padding(.horizontal, 20).padding(.vertical, 9)
-            .background {
-                Canvas { canvas, size in
-                    let rect = CGRect(origin: .zero, size: size)
-                    let capsule = Capsule().path(in: rect)
-                    canvas.fill(capsule, with: .color(Color.white.opacity(0.10)))
-                    if clamped > 0 {
-                        var inner = canvas
-                        inner.clip(to: capsule)
-                        let fillRect = CGRect(x: 0, y: 0, width: size.width * clamped, height: size.height)
-                        inner.fill(Path(fillRect), with: .color(LauncherPalette.building.opacity(0.85)))
+
+            sizing
+                .overlay {
+                    GeometryReader { geo in
+                        let filledWidth = geo.size.width * clamped
+                        ZStack {
+                            Capsule().fill(LauncherPalette.ink(0.08))
+                            Text(pct)
+                                .font(.manrope(13.5, .bold)).monospacedDigit()
+                                .foregroundStyle(LauncherPalette.text)
+                            ZStack {
+                                Capsule().fill(LauncherPalette.cream)
+                                Text(pct)
+                                    .font(.manrope(13.5, .bold)).monospacedDigit()
+                                    .foregroundStyle(LauncherPalette.onCream)
+                            }
+                            .frame(width: geo.size.width, height: geo.size.height)
+                            .mask {
+                                HStack(spacing: 0) {
+                                    Rectangle().frame(width: filledWidth)
+                                    Spacer(minLength: 0)
+                                }
+                                .frame(width: geo.size.width, height: geo.size.height)
+                            }
+                        }
+                        .clipShape(Capsule())
                     }
-                    let inset = rect.insetBy(dx: 0.5, dy: 0.5)
-                    canvas.stroke(Capsule().path(in: inset), with: .color(LauncherPalette.building.opacity(0.65)), lineWidth: 1)
                 }
-            }
         } else {
             Text(baseTitle)
-                .font(.manrope(13.5, .bold)).foregroundStyle(.black)
+                .font(.manrope(13.5, .bold)).foregroundStyle(LauncherPalette.onCream)
                 .padding(.horizontal, 20).padding(.vertical, 9)
                 .background(LauncherPalette.cream, in: Capsule())
         }
@@ -125,14 +152,14 @@ package struct UpdateSheet: View {
         switch block {
         case .heading(let text):
             Text(Self.styled(text, size: 12.5, weight: .bold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(LauncherPalette.secondaryText)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.top, first ? 0 : 14)
         case .bullet(let text):
             // A hanging indent: the bullet is its own column, so wrapped lines align with the text.
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text("\u{2022}").font(.manrope(13)).foregroundStyle(.secondary).frame(width: 10, alignment: .center)
+                Text("\u{2022}").font(DS.Font.body).foregroundStyle(DS.Color.textSecondary).frame(width: 10, alignment: .center)
                 Text(Self.styled(text, size: 13))
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -156,11 +183,11 @@ package struct UpdateSheet: View {
             if intent.contains(.emphasized) { font = font.italic() }
             if intent.contains(.code) {
                 font = .mono(size - 1, intent.contains(.stronglyEmphasized) ? .bold : .regular)
-                out[run.range].backgroundColor = Color.white.opacity(0.10)
+                out[run.range].backgroundColor = LauncherPalette.ink(0.10)
             }
             out[run.range].font = font
             if run.link != nil {
-                out[run.range].foregroundColor = LauncherPalette.cream
+                out[run.range].foregroundColor = LauncherPalette.accent
                 out[run.range].underlineStyle = .single
             }
         }

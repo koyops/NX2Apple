@@ -7,7 +7,7 @@ import XCTest
 
 /// The artwork panel drawn in the launcher, for visual QA. Opt-in (`NX_LAUNCHER_CAPTURE_DIR`), like testRenderLauncherForVisualQA:
 /// the images are generated, the library and the artwork folder are temporary, and nothing reaches the network.
-final class ArtworkPanelTests: XCTestCase {
+final class ArtworkPanelTests: IsolatedDefaultsTestCase {
     private var fixture: ArtworkFixture!
 
     override func tearDown() async throws { await MainActor.run { fixture?.cleanup() } }
@@ -31,7 +31,7 @@ final class ArtworkPanelTests: XCTestCase {
         try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
         NSApplication.shared.setActivationPolicy(.accessory)
         let lang = CaptureLanguage.current(.en)
-        let stores = LauncherStores()
+        let stores = LauncherStores(defaults: testDefaults)
         stores.localizer.lang = lang
 
         fixture = try ArtworkFixture(others: [("01007EF00011E000", "The Legend of Zelda: Breath of the Wild"), ("0100000000010000", "Super Mario Odyssey"),
@@ -128,5 +128,67 @@ final class ArtworkPanelTests: XCTestCase {
         var shown = fixture.game
         shown.artwork = editor.draft
         return shown
+    }
+
+    @MainActor private func bitmap<V: View>(size: NSSize, dark: Bool = false, _ view: V) throws -> NSBitmapImageRep {
+        NSApplication.shared.setActivationPolicy(.accessory)
+        let host = NSHostingView(rootView: view)
+        if dark { host.appearance = NSAppearance(named: .darkAqua) }   // the launcher follows the system: a test of the dark page must not depend on the Mac's setting
+        let window = OffscreenWindow(size: size)
+        window.contentView = host
+        window.orderFront(nil)
+        defer {
+            window.contentView = nil
+            window.orderOut(nil)
+            window.close()
+        }
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        host.layoutSubtreeIfNeeded()
+        let rep = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+        host.cacheDisplay(in: host.bounds, to: rep)
+        return rep
+    }
+
+    @MainActor func testHeroBottomEdgeFadesCleanlyWithoutBrightSeam() async throws {
+        fixture = try ArtworkFixture()
+        let banner = fixture.artwork.appendingPathComponent(fixture.titleID + ".jpg")
+        let white = try XCTUnwrap(NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 1920, pixelsHigh: 1080, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                                   isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0))
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: white)
+        NSColor.white.setFill()
+        NSRect(x: 0, y: 0, width: 1920, height: 1080).fill()
+        NSGraphicsContext.restoreGraphicsState()
+        try XCTUnwrap(white.representation(using: .jpeg, properties: [:])).write(to: banner)
+
+        let stores = LauncherStores(defaults: TestDefaults.make("nxnative-hero-seam"))
+        stores.build.outDir = fixture.temporary.path
+        fixture.library.selectedID = fixture.gameID
+        let store = ArtworkStore(directory: fixture.artwork, titleList: fixture.temporary.appendingPathComponent("none.json"), allowsFileURLs: true)
+        let editor = fixture.editor()
+        await editor.load()
+
+        let size = NSSize(width: 1280, height: 667)
+        let rep = try bitmap(size: size, dark: true, LauncherView(stores: stores, library: fixture.library, performStartupChecks: false, artworkEditor: editor, artworkStore: store))
+
+        let scaleY = CGFloat(rep.pixelsHigh) / size.height
+        // Sample the full-bleed gutter so collection controls cannot be mistaken for an artwork seam.
+        let sampleX = Int(16 * CGFloat(rep.pixelsWide) / size.width)
+        var reachedBackground = false
+        var previous = 0
+        for y in Int(240 * scaleY)..<Int(375 * scaleY) {
+            guard let color = rep.colorAt(x: sampleX, y: y)?.usingColorSpace(.deviceRGB) else { continue }
+            let peak = Int(round(max(color.redComponent, color.greenComponent, color.blueComponent) * 255))
+            if peak <= 16 { reachedBackground = true }
+            if reachedBackground {
+                // A seam is a row that jumps up from the one before it (the art leaking over the fade). Rendering differs by a level or
+                // two between macOS versions (one row at 21 on macOS 27.2, #1030), so the ceiling is a fixed small margin over the
+                // background and the jump between neighbouring rows above the background floor must stay flat.
+                XCTAssertLessThanOrEqual(peak, 32, "Bright 1px seam leaked at hero bottom edge y=\(y): peak=\(peak)")
+                XCTAssertLessThanOrEqual(peak, max(previous, 16) + 4, "A row jumps up from its neighbour at hero bottom edge y=\(y): \(previous) to \(peak)")
+            }
+            previous = peak
+        }
+        XCTAssertTrue(reachedBackground, "Hero gradient should fade to background before collection header")
     }
 }

@@ -116,26 +116,8 @@ import XCTest
         XCTAssertEqual(args.dropFirst(2).first, game, "the folder is the script's input, not a staging folder")
         XCTAssertFalse(args.contains("-k"))
         XCTAssertEqual(args.firstIndex(of: "--work-dir").map { args[$0 + 1] }, game + "/040074A01BF12000_build")
-        XCTAssertEqual(args.firstIndex(of: "-o").map { args[$0 + 1] }, game + "/040074A01BF12000.app")
+        XCTAssertEqual(args.firstIndex(of: "-o").map { args[$0 + 1] }, game + "/040074A01BF12000_build/040074A01BF12000.app")
         XCTAssertTrue(args.contains("mac-app"))
-    }
-
-    /// #749: with nxb on, the same arguments go to `nxb build` and the script is not run.
-    func testTheExperimentalBuilderGivesTheScriptsArgumentsToNxbBuildAndIsNamedInTheLog() {
-        let (store, game) = makeStore()
-        store.scan(folder: game)
-        store.experimentalBuilder = false
-        store.startBuild()
-        let standard = store.lastBuildCommand
-        XCTAssertFalse(store.log.text.contains("nxb"))
-        let nxb = root + "/nxbuild/nxb"
-        write(nxb)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: nxb)
-        runner.answer = { _ in ProcessResult(status: 0, out: "nxb 0.6.3\n") }
-        store.experimentalBuilder = true; store.experimentalBuilderPath = nxb
-        store.startBuild()
-        XCTAssertEqual(store.lastBuildCommand, [nxb, "build"] + standard.dropFirst(2), "nxb build in place of the interpreter and the script, the same options after")
-        XCTAssertTrue(store.log.text.contains(String(format: store.t("msg.builderOn"), nxb)))
     }
 
     func testWithoutAProfileTheFolderIsRefusedWithTheTitleID() {
@@ -213,6 +195,18 @@ import XCTest
         XCTAssertEqual(store.slot("base").problem, store.t("folder.engineOldNUP"))
     }
 
+    func testADamagedNUPIsRefusedWithReplacementMessage() {
+        let (store, _) = makeStore()
+        var d = [UInt8](nupData())
+        d.replaceSubrange(0x18..<0x38, with: [UInt8](repeating: 0xAA, count: 32))
+        let nup = root + "/Damaged.nup"
+        write(nup, Data(d))
+        store.scan(folder: nup)
+        XCTAssertNil(store.gameFolder)
+        XCTAssertEqual(store.slot("base").problem, String(format: store.t("folder.problem.nupDamaged"), "Damaged.nup"))
+        XCTAssertFalse(store.canBuild)
+    }
+
     /// An old engine (no survey in the script) refuses a NUP of a game it has no profile for, one with the survey builds it.
     func testANUPOfAGameWithoutAProfileNeedsTheSurveyInTheEngine() throws {
         let (store, _) = makeStore(profile: false)
@@ -242,11 +236,36 @@ import XCTest
         func put(_ d: inout [UInt8], _ o: Int, _ v: UInt64, _ n: Int) { for i in 0..<n { d[o + i] = UInt8(v >> (8 * UInt64(i)) & 0xFF) } }
         var d = [UInt8](repeating: 0, count: 0x80 + 0x30 + 2 * 0x40)
         d.replaceSubrange(0..<4, with: [0x4E, 0x55, 0x50, 0x01])
-        put(&d, 0x08, 0x80, 8); put(&d, 0x40, UInt64(d.count), 8); put(&d, 0x48, 2, 4)
+        put(&d, 0x08, 0x80, 8); put(&d, 0x10, UInt64(0x30 + 2 * 0x40), 8); put(&d, 0x40, UInt64(d.count), 8); put(&d, 0x48, 2, 4)
         d.replaceSubrange(0x80..<0x84, with: [0x54, 0x4F, 0x43, 0x01])
         put(&d, 0xB0, 0x040074A01BF12000, 8)
         put(&d, 0xF0, 0x040074A01BF12800, 8); put(&d, 0xF0 + 20, 458752, 4); d[0xF0 + 24] = 1
         return Data(d)
+    }
+
+    /// #996: the keys saved in Settings never reach a game folder (it needs none), and a package build takes them for its empty row.
+    func testAGameFolderNeverTakesTheSavedKeysAndAPackageBuildDoes() {
+        let (store, game) = makeStore()
+        let keys = root + "/keys/prod.keys"
+        write(keys)
+        store.saveKeys(keys)
+        store.scan(folder: game)
+        XCTAssertFalse(store.keysFromSettings)
+        XCTAssertTrue(store.keysPath.isEmpty, "a Switch 2 folder never shows the saved keys")
+        XCTAssertEqual(store.gameFolderRowText("keys"), store.t("folder.keys"))
+        store.startBuild()
+        XCTAssertFalse(store.lastBuildCommand.contains("-k"))
+        XCTAssertFalse(store.lastBuildCommand.contains(keys))
+
+        let folder = root + "/Mario"
+        write(folder + "/Mario [010015100B514000][v0].nsp")
+        store.scan(folder: folder)
+        XCTAssertTrue(store.keysRowPath.isEmpty, "the folder holds no prod.keys")
+        XCTAssertEqual(store.keysPath, keys)
+        XCTAssertTrue(store.canBuild)
+        store.startBuild()
+        let args = store.lastBuildCommand
+        XCTAssertEqual(args.firstIndex(of: "-k").map { args[$0 + 1] }, keys)
     }
 
     func testAFolderOfPackagesIsScannedAsBefore() {

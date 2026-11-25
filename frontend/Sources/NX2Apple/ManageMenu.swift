@@ -7,13 +7,16 @@ import NXLauncher
 struct ManageActions {
     var rebuild: () -> Void = {}
     var openOnDevice: () -> Void = {}
+    var launchWithEngine: (EngineUpstreamKind) -> Void = { _ in }
+    var setDefaultEngine: (EngineUpstreamKind) -> Void = { _ in }
     var options: () -> Void = {}
     var saves: () -> Void = {}
     var cheats: () -> Void = {}
     var changeArtwork: () -> Void = {}
+    var rename: () -> Void = {}
     var reveal: () -> Void = {}
     var showLog: () -> Void = {}
-    var freeSpace: () -> Void = {}
+    var removeBuildFiles: () -> Void = {}
     var remove: () -> Void = {}
     var delete: () -> Void = {}
 }
@@ -32,25 +35,48 @@ struct ManageItem: Identifiable {
     /// The menu's rows, in order, built in one place: a new item is one line here. The rules are the ones the system menu had:
     /// Build again is off while a build runs or with no recorded inputs, Remove while this game is the one building.
     static func list(game: LibraryGame, labels t: (String) -> String, running: Bool, olderTools: Bool, activeBuildID: UUID?,
-                     hasBuildFolder: Bool, hasLog: Bool = false, deviceName: String, launching: Bool = false, actions a: ManageActions) -> [ManageItem] {
+                     hasBuildFolder: Bool, buildFilesTitle: String? = nil, hasLog: Bool = false, deviceName: String, launching: Bool = false,
+                     activeUpstream: EngineUpstreamKind? = nil, builtUpstreams: [EngineUpstreamKind] = [],
+                     actions a: ManageActions) -> [ManageItem] {
         var items = [ManageItem(id: "rebuild", symbol: "arrow.clockwise", title: t(olderTools ? "library.rebuild" : "library.buildAgain"),
                                 enabled: !running && !game.inputs["base", default: []].isEmpty, run: a.rebuild)]
+        if builtUpstreams.count > 1 {
+            let current = activeUpstream ?? builtUpstreams.first
+            for upstream in builtUpstreams where upstream != current {
+                items.append(.init(id: "launch." + upstream.rawValue, symbol: "play.circle",
+                                   title: String(format: t("library.launchWithEngine"), upstream.displayName),
+                                   enabled: !launching, run: { a.launchWithEngine(upstream) }))
+            }
+            for upstream in builtUpstreams where upstream != current {
+                items.append(.init(id: "default." + upstream.rawValue, symbol: "checkmark.circle",
+                                   title: String(format: t("library.setDefaultEngine"), upstream.displayName),
+                                   run: { a.setDefaultEngine(upstream) }))
+            }
+        }
         if game.isReady {
             if game.onDevice {
                 items.append(.init(id: "device", symbol: "iphone", title: String(format: t("dev.open"), deviceName),
                                    enabled: !launching, run: a.openOnDevice))
             }
-            items.append(.init(id: "options", symbol: "slider.horizontal.3", title: t("launch.title"), run: a.options))
         }
+        // Launch options for every game: a game with an iPhone build or none gets the part of the sheet that applies, or the way to build it
+        items.append(.init(id: "options", symbol: "slider.horizontal.3", title: t("launch.title"), run: a.options))
         items.append(.init(id: "saves", symbol: "tray.and.arrow.down", title: t("saves.menu"), run: a.saves))
         items.append(.init(id: "cheats", symbol: "wand.and.stars", title: t("cheats.menu"), run: a.cheats))
         items.append(.init(id: "artwork", symbol: "photo", title: t("library.changeArtwork"), run: a.changeArtwork))
+        items.append(.init(id: "rename", symbol: "pencil", title: t("library.rename"), run: a.rename))
         if game.revealTarget != nil { items.append(.init(id: "reveal", symbol: "folder", title: t("install.reveal"), run: a.reveal)) }
         if game.isReady {
             items.append(.init(id: "log", symbol: "doc.text.magnifyingglass", title: t("library.showLog"), enabled: hasLog,
                                hint: hasLog ? nil : t("library.showLog.none"), run: a.showLog))
         }
-        if hasBuildFolder { items.append(.init(id: "freeSpace", symbol: "externaldrive", title: t("free.menu"), run: a.freeSpace)) }
+        // Remove build files (#232): the whole build folder's removable files, with their size. Never while this game builds. The per-part
+        // Free space sheet is Details… on the game's row of Settings > Tools > Build files.
+        if hasBuildFolder, let title = buildFilesTitle {
+            let building = running && game.id == activeBuildID
+            items.append(.init(id: "buildFiles", symbol: "externaldrive.badge.minus", title: title, enabled: !building,
+                               hint: building ? t("buildfiles.building") : nil, run: a.removeBuildFiles))
+        }
         items.append(.init(id: "remove", symbol: "rectangle.stack.badge.minus", title: t("library.remove"), enabled: game.id != activeBuildID,
                            destructive: true, separatorBefore: true, run: a.remove))
         // Delete moves the game's files to the Trash (GameDeletion). Off while any build runs: it may write into the build folder
@@ -123,9 +149,9 @@ struct ManageButtonLabel: View {
     var body: some View {
         HStack(spacing: 9) {
             Image(systemName: "ellipsis.circle").font(.system(size: 27, weight: .ultraLight))
-            Text(title).font(.manrope(13))
+            Text(title).font(DS.Font.body)
         }
-        .foregroundStyle(.white).contentShape(Rectangle())
+        .foregroundStyle(LauncherPalette.textStrong).contentShape(Rectangle())
     }
 }
 
@@ -157,8 +183,8 @@ struct ManageMenuPanel: View {
         .padding(6)
         .frame(width: Self.width)
         .background(LauncherPalette.surface, in: RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.white.opacity(0.10)))
-        .shadow(color: .black.opacity(0.5), radius: 18, y: 6)
+        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(LauncherPalette.ink(0.10)))
+        .shadow(color: LauncherPalette.dropdownShadow, radius: 18, y: 6)
         .padScope("manage", pad)
         .accessibilityElement(children: .contain)
         .accessibilityLabel(label)
@@ -166,17 +192,17 @@ struct ManageMenuPanel: View {
         .onDisappear(perform: stopKeys)
     }
 
-    private func row(_ item: ManageItem, index: Int) -> some View {
-        let tint = item.destructive ? LauncherPalette.danger : Color.white.opacity(0.92)
-        return Button { activate(item) } label: {
+    @ViewBuilder private func row(_ item: ManageItem, index: Int) -> some View {
+        let tint = item.destructive ? LauncherPalette.danger : LauncherPalette.text
+        let button = Button { activate(item) } label: {
             HStack(spacing: 11) {
                 Image(systemName: item.symbol).font(.system(size: 13, weight: .medium)).frame(width: 18)
-                Text(item.title).font(.manrope(13, .medium)).lineLimit(1)
+                Text(item.title).font(DS.Font.body).lineLimit(1)
                 Spacer(minLength: 0)
             }
             .foregroundStyle(tint).opacity(item.enabled ? 1 : 0.4)
             .padding(.horizontal, 10).frame(height: Self.rowHeight)
-            .background(highlighted == index && item.enabled ? Color.white.opacity(0.08) : .clear, in: RoundedRectangle(cornerRadius: 8))
+            .background(highlighted == index && item.enabled ? LauncherPalette.ink(0.08) : .clear, in: RoundedRectangle(cornerRadius: 8))
             .contentShape(RoundedRectangle(cornerRadius: 8))
         }
         .buttonStyle(.plain)
@@ -184,7 +210,8 @@ struct ManageMenuPanel: View {
         .help(item.hint ?? "")
         .onHover { inside in if inside && item.enabled { highlighted = index } else if !inside && highlighted == index { highlighted = nil } }
         .accessibilityLabel(item.title)
-        .padTarget(item.padID, scope: "manage", radius: 8) { activate(item) }
+        if item.enabled { button.padTarget(item.padID, scope: "manage", radius: 8) { activate(item) } }
+        else { button }
     }
 
     private func activate(_ item: ManageItem) {
@@ -206,11 +233,14 @@ struct ManageMenuPanel: View {
     private func startKeys() {
         stopKeys()
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            if event.modifierFlags.contains(.command) { close(); return event }
             switch event.keyCode {
+            case 123, 124: break
             case 125: step(1)
             case 126: step(-1)
-            case 36, 76: if let i = highlighted, items.indices.contains(i) { activate(items[i]) }
+            case 36, 76, 49: if let i = highlighted, items.indices.contains(i) { activate(items[i]) }
             case 53: close()
+            case 48: close(); return event
             default: return event
             }
             return nil

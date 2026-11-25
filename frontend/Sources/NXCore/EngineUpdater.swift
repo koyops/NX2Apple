@@ -56,6 +56,48 @@ package enum EngineChannel: String, CaseIterable {
     }
 }
 
+/// Whether the experimental engine is built on newer upstream code than the stable one (LNPANDY/NX2Apple#1095). The nightly bump can
+/// stop at a conflicting patch while the stable engine moves on through a manual bump, and Experimental would then be the older one.
+package enum ExperimentalStanding: Equatable {
+    case unknown        // a manifest is missing or has no upstream date: offered as before
+    case ahead
+    case notAhead       // the same engine as Stable, or one built on an older upstream commit
+
+    /// The same engine is not ahead. Otherwise the upstream pin dates decide: an older experimental pin is not ahead, an equal date
+    /// with another engine id is (the patch series differs), and a missing date on either side is unknown.
+    package static func compare(experimental: EngineManifest.Manifest, stable: EngineManifest.Manifest) -> ExperimentalStanding {
+        compare(experimental: experimental, baselineID: stable.engineID, baselineDate: stable.upstreamDate)
+    }
+
+    package static func compare(experimental: EngineManifest.Manifest, baselineID: String, baselineDate: String?) -> ExperimentalStanding {
+        if !experimental.engineID.isEmpty, experimental.engineID == baselineID { return .notAhead }
+        guard let e = EngineManifest.date(experimental.upstreamDate), let s = EngineManifest.date(baselineDate) else { return .unknown }
+        return e < s ? .notAhead : .ahead
+    }
+}
+
+/// What the engine row of Settings offers, from the channel the launcher is on and how Experimental stands.
+package struct EngineChannelChoice: Equatable {
+    /// The channels the picker lists. Stable alone while Experimental is not ahead of it, so the switch is not offered.
+    package let options: [EngineChannel]
+    /// The localization key of the secondary text that replaces the usual note, nil: the usual note.
+    package let noteKey: String?
+    /// A "Back to Stable" button: the launcher is on an Experimental engine that is not ahead of Stable.
+    package let offersBackToStable: Bool
+
+    package init(selected: EngineChannel, standing: ExperimentalStanding) {
+        let behind = standing == .notAhead
+        options = behind && selected == .stable ? [.stable] : EngineChannel.allCases
+        noteKey = behind ? "engine.experimentalBehind" : nil
+        offersBackToStable = behind && selected == .experimental
+    }
+
+    /// Whether a switch to `channel` may be asked for.
+    package static func allowsSwitch(to channel: EngineChannel, from selected: EngineChannel, standing: ExperimentalStanding) -> Bool {
+        !(channel == .experimental && selected == .stable && standing == .notAhead)
+    }
+}
+
 /// The engine tree the release app carries in `Contents/Resources/engine` (the release workflow puts it there).
 /// A launcher built from the repository has none, and keeps working on its checkout with git.
 package enum EngineBundle {
@@ -204,26 +246,143 @@ package enum EngineFetch<Value> {
 /// The network, as the updater sees it. Tests replace it with files in memory.
 package protocol EngineTransport {
     func data(from url: URL) -> EngineFetch<Data>
+    func data(from url: URL, timeout: TimeInterval) -> EngineFetch<Data>
     /// Download to `destination` (which does not exist yet). true when the whole file arrived.
     func download(from url: URL, to destination: URL) -> Bool
+    /// Download to `destination`, reporting `(writtenBytes, expectedBytes)` as chunks arrive.
+    func download(from url: URL, to destination: URL, progress: (@Sendable (Int64, Int64?) -> Void)?) -> Bool
+    /// Download to `destination` with optional progress reporting and cooperative cancellation.
+    func download(
+        from url: URL,
+        to destination: URL,
+        progress: (@Sendable (Int64, Int64?) -> Void)?,
+        shouldCancel: (@Sendable () -> Bool)?
+    ) -> Bool
+}
+
+extension EngineTransport {
+    package func data(from url: URL, timeout: TimeInterval) -> EngineFetch<Data> {
+        data(from: url)
+    }
+
+    package func download(from url: URL, to destination: URL, progress: (@Sendable (Int64, Int64?) -> Void)?) -> Bool {
+        download(from: url, to: destination)
+    }
+
+    package func download(
+        from url: URL,
+        to destination: URL,
+        progress: (@Sendable (Int64, Int64?) -> Void)?,
+        shouldCancel: (@Sendable () -> Bool)?
+    ) -> Bool {
+        if shouldCancel?() == true { return false }
+        let ok = download(from: url, to: destination, progress: { written, expected in
+            guard shouldCancel?() != true else { return }
+            progress?(written, expected)
+        })
+        if shouldCancel?() == true {
+            try? FileManager.default.removeItem(at: destination)
+            return false
+        }
+        return ok
+    }
+}
+
+private final class EngineDownloadDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+    private let destination: URL
+    private let progress: (@Sendable (Int64, Int64?) -> Void)?
+    private let shouldCancel: (@Sendable () -> Bool)?
+    private let done: @Sendable (Bool) -> Void
+    private let lock = NSLock()
+    private var movedOK = false
+    private var finished = false
+
+    init(
+        destination: URL,
+        progress: (@Sendable (Int64, Int64?) -> Void)?,
+        shouldCancel: (@Sendable () -> Bool)? = nil,
+        done: @escaping @Sendable (Bool) -> Void
+    ) {
+        self.destination = destination
+        self.progress = progress
+        self.shouldCancel = shouldCancel
+        self.done = done
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didWriteData bytesWritten: Int64,
+        totalBytesWritten: Int64,
+        totalBytesExpectedToWrite: Int64
+    ) {
+        if shouldCancel?() == true {
+            downloadTask.cancel()
+            return
+        }
+        let expected = totalBytesExpectedToWrite > 0 ? totalBytesExpectedToWrite : nil
+        progress?(totalBytesWritten, expected)
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+        if shouldCancel?() == true {
+            lock.lock()
+            movedOK = false
+            lock.unlock()
+            return
+        }
+        let ok: Bool
+        if (downloadTask.response as? HTTPURLResponse)?.statusCode == 200 {
+            ok = (try? FileManager.default.moveItem(at: location, to: destination)) != nil
+        } else {
+            ok = false
+        }
+        lock.lock()
+        movedOK = ok
+        lock.unlock()
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        lock.lock()
+        if finished {
+            lock.unlock()
+            return
+        }
+        finished = true
+        let ok = error == nil && movedOK && (shouldCancel?() != true)
+        lock.unlock()
+        done(ok)
+    }
 }
 
 /// URLSession, waited on from a background queue as the app update does (AppUpdateStore).
 /// Nothing is cached: the experimental release replaces its files under the same names.
 package struct URLSessionEngineTransport: EngineTransport {
-    private let session: URLSession = {
+    private static func makeSessionConfiguration() -> URLSessionConfiguration {
         let c = URLSessionConfiguration.ephemeral
         c.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         c.timeoutIntervalForRequest = 60
-        return URLSession(configuration: c)
-    }()
+        c.httpAdditionalHeaders = ["User-Agent": "NX2Apple"]
+        if let proxyDict = ProxyEnvironment.urlSessionProxyDictionary() {
+            c.connectionProxyDictionary = proxyDict
+        }
+        return c
+    }
+
+    private let session: URLSession = URLSession(configuration: URLSessionEngineTransport.makeSessionConfiguration())
 
     package init() {}
 
     package func data(from url: URL) -> EngineFetch<Data> {
+        data(from: url, timeout: 60)
+    }
+
+    package func data(from url: URL, timeout: TimeInterval) -> EngineFetch<Data> {
         var result: EngineFetch<Data> = .failed
         let sem = DispatchSemaphore(value: 0)
-        session.dataTask(with: url) { data, response, _ in
+        var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: timeout)
+        req.setValue("NX2Apple", forHTTPHeaderField: "User-Agent")
+        session.dataTask(with: req) { data, response, _ in
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             if status == 200, let data { result = .ok(data) } else if status == 404 { result = .missing }
             sem.signal()
@@ -233,16 +392,68 @@ package struct URLSessionEngineTransport: EngineTransport {
     }
 
     package func download(from url: URL, to destination: URL) -> Bool {
-        var ok = false
-        let sem = DispatchSemaphore(value: 0)
-        session.downloadTask(with: url) { local, response, _ in
-            if let local, (response as? HTTPURLResponse)?.statusCode == 200 {
-                ok = (try? FileManager.default.moveItem(at: local, to: destination)) != nil
+        download(from: url, to: destination, progress: nil, shouldCancel: nil)
+    }
+
+    package func download(from url: URL, to destination: URL, progress: (@Sendable (Int64, Int64?) -> Void)?) -> Bool {
+        download(from: url, to: destination, progress: progress, shouldCancel: nil)
+    }
+
+    package func download(
+        from url: URL,
+        to destination: URL,
+        progress: (@Sendable (Int64, Int64?) -> Void)?,
+        shouldCancel: (@Sendable () -> Bool)?
+    ) -> Bool {
+        if shouldCancel?() == true { return false }
+        guard progress != nil || shouldCancel != nil else {
+            var ok = false
+            let sem = DispatchSemaphore(value: 0)
+            session.downloadTask(with: url) { local, response, _ in
+                if let local, (response as? HTTPURLResponse)?.statusCode == 200 {
+                    ok = (try? FileManager.default.moveItem(at: local, to: destination)) != nil
+                }
+                sem.signal()
+            }.resume()
+            sem.wait()
+            return ok
+        }
+        final class OutcomeBox: @unchecked Sendable {
+            private let lock = NSLock()
+            var ok = false
+            func set(_ v: Bool) {
+                lock.lock()
+                ok = v
+                lock.unlock()
             }
+        }
+        let box = OutcomeBox()
+        let sem = DispatchSemaphore(value: 0)
+        let delegate = EngineDownloadDelegate(destination: destination, progress: progress, shouldCancel: shouldCancel) { succeeded in
+            box.set(succeeded)
             sem.signal()
-        }.resume()
-        sem.wait()
-        return ok
+        }
+        let c = Self.makeSessionConfiguration()
+        let streamSession = URLSession(configuration: c, delegate: delegate, delegateQueue: nil)
+        defer { streamSession.finishTasksAndInvalidate() }
+        let task = streamSession.downloadTask(with: url)
+        task.resume()
+        if let shouldCancel {
+            while sem.wait(timeout: .now() + .milliseconds(40)) == .timedOut {
+                if shouldCancel() {
+                    task.cancel()
+                    sem.wait()
+                    break
+                }
+            }
+        } else {
+            sem.wait()
+        }
+        if shouldCancel?() == true {
+            try? FileManager.default.removeItem(at: destination)
+            return false
+        }
+        return box.ok
     }
 }
 
@@ -283,8 +494,31 @@ package enum EngineUpdate {
 
     package static let assetPrefix = ".download-"
 
-    package static func run(channel: EngineChannel, appVersion: String, current: String, store: EngineStore, bundled: URL?,
-                    publicKey: String = EngineManifest.publicKey, install: Bool, transport: EngineTransport) -> Outcome {
+    /// Formats downloaded bytes into an optional 0...1 fraction and a readable MB summary.
+    package static func formatDownloadProgress(written: Int64, expected: Int64?) -> (fraction: Double?, text: String) {
+        let safeWritten = max(0, written)
+        let mbWritten = Double(safeWritten) / 1_048_576.0
+        if let expected, expected > 0 {
+            let frac = min(max(Double(safeWritten) / Double(expected), 0), 1)
+            let mbExpected = Double(expected) / 1_048_576.0
+            let pct = Int((frac * 100).rounded())
+            return (frac, String(format: "%.1f / %.1f MB (%d%%)", mbWritten, mbExpected, pct))
+        }
+        return (nil, String(format: "%.1f MB", mbWritten))
+    }
+
+    package static func run(
+        channel: EngineChannel,
+        appVersion: String,
+        current: String,
+        currentVersion: String? = nil,
+        store: EngineStore,
+        bundled: URL?,
+        publicKey: String = EngineManifest.publicKey,
+        install: Bool,
+        transport: EngineTransport,
+        onProgress: (@Sendable (Int64, Int64?) -> Void)? = nil
+    ) -> Outcome {
         guard let manifestURL = channel.manifestURL(version: appVersion) else { return .failed(.noManifest) }
         let bundledID = bundled.flatMap { EngineStore.identity(of: $0) }
 
@@ -311,9 +545,62 @@ package enum EngineUpdate {
         catch { return .failed(.badManifest(error as? EngineManifest.Problem ?? .notJSON)) }
         if let c = m.channel, c != channel.rawValue { return .failed(.wrongChannel(c)) }
 
+        if channel == .experimental {
+            let bundledDate = bundled.flatMap { EngineStore.upstreamDate(of: $0) }
+            // Keep a usable current tree when it is at least as new as bundled (or bundled has no date)
+            // and the experimental manifest is not ahead of it.
+            if let currentDir = store.isUsable(current) ? store.directory(for: current) : nil,
+               let currentDate = EngineStore.upstreamDate(of: currentDir),
+               let cDate = EngineManifest.date(currentDate),
+               (bundledDate.flatMap(EngineManifest.date).map { cDate >= $0 } ?? true),
+               ExperimentalStanding.compare(experimental: m, baselineID: current, baselineDate: currentDate) == .notAhead {
+                let version = (currentVersion?.isEmpty == false ? currentVersion : nil) ?? appVersion
+                return .current(Engine(id: current, version: version))
+            }
+            // Do not downgrade or overwrite an equivalent or newer bundled engine with an older experimental build.
+            if let bundled, let bundledID,
+               ExperimentalStanding.compare(experimental: m, baselineID: bundledID, baselineDate: bundledDate) == .notAhead {
+                return place(Engine(id: bundledID, version: appVersion), current: current, store: store, bundled: bundled, bundledID: bundledID,
+                             install: install) { .failed(.noManifest) }
+            }
+        }
+
         return place(Engine(id: m.engineID, version: m.version), current: current, store: store, bundled: bundled, bundledID: bundledID,
                      install: install) {
-            downloadAndInstall(m, channel: channel, appVersion: appVersion, store: store, transport: transport)
+            downloadAndInstall(m, channel: channel, appVersion: appVersion, store: store, transport: transport, onProgress: onProgress)
+        }
+    }
+
+    /// How Experimental stands against Stable: both manifests are read, checked like an update's and compared. When the
+    /// stable manifest is missing (404 during release-candidate testing), the bundled tree acts as the stable baseline.
+    package static func standing(appVersion: String, bundled: URL? = nil, publicKey: String = EngineManifest.publicKey,
+                                 transport: EngineTransport) -> ExperimentalStanding {
+        enum Read { case ok(EngineManifest.Manifest), missing, failed }
+        func manifest(_ channel: EngineChannel) -> Read {
+            guard let url = channel.manifestURL(version: appVersion) else { return .missing }
+            let data: Data
+            switch transport.data(from: url) {
+            case .ok(let d): data = d
+            case .missing: return .missing
+            case .failed: return .failed
+            }
+            var signature: String?
+            if let sigURL = channel.signatureURL(version: appVersion), case .ok(let s) = transport.data(from: sigURL) {
+                signature = String(decoding: s, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            guard EngineManifest.allowsInstall(EngineManifest.verify(manifest: data, signature: signature, publicKey: publicKey)),
+                  let decoded = try? EngineManifest.decode(data) else { return .failed }
+            return .ok(decoded)
+        }
+        guard case .ok(let experimental) = manifest(.experimental) else { return .unknown }
+        switch manifest(.stable) {
+        case .ok(let stable):
+            return ExperimentalStanding.compare(experimental: experimental, stable: stable)
+        case .missing:
+            guard let bundled, let bundledID = EngineStore.identity(of: bundled) else { return .unknown }
+            return ExperimentalStanding.compare(experimental: experimental, baselineID: bundledID, baselineDate: EngineStore.upstreamDate(of: bundled))
+        case .failed:
+            return .unknown
         }
     }
 
@@ -331,15 +618,25 @@ package enum EngineUpdate {
         return download()
     }
 
-    private static func downloadAndInstall(_ m: EngineManifest.Manifest, channel: EngineChannel, appVersion: String,
-                                           store: EngineStore, transport: EngineTransport) -> Outcome {
+    private static func downloadAndInstall(
+        _ m: EngineManifest.Manifest,
+        channel: EngineChannel,
+        appVersion: String,
+        store: EngineStore,
+        transport: EngineTransport,
+        onProgress: (@Sendable (Int64, Int64?) -> Void)?
+    ) -> Outcome {
         let fm = FileManager.default
         try? fm.createDirectory(at: store.root, withIntermediateDirectories: true)
         var failure = Failure.download
+        let manifestExpected = m.engine.size.flatMap { $0 > 0 ? Int64($0) : nil }
         for url in channel.assetURLs(m.engine.asset, version: appVersion, sources: m.sources) {
             let file = store.root.appendingPathComponent(assetPrefix + UUID().uuidString + ".zip")
             defer { try? fm.removeItem(at: file) }
-            guard transport.download(from: url, to: file) else { continue }
+            let downloaded = transport.download(from: url, to: file) { written, expected in
+                onProgress?(written, expected ?? manifestExpected)
+            }
+            guard downloaded else { continue }
             let size = (try? fm.attributesOfItem(atPath: file.path)[.size] as? NSNumber)?.intValue
             guard m.engine.size == nil || size == m.engine.size, AppUpdate.sha256(of: file) == m.engine.sha256 else {
                 failure = .digest   // a mirror that serves other bytes: the next source may have the right ones

@@ -16,6 +16,7 @@ extension LauncherView {
 
     func refreshArtwork() {
         previewGeneration += 1
+        heroIcon = nil
         artwork = Dictionary(uniqueKeysWithValues: library.games.compactMap { game in
             GameLibrary.artwork(for: displayed(game), slot: .thumbnail, repo: stores.repo.path, banners: library.artworkDirectory, maxPixel: ArtworkImages.cardPixels).map { (game.id, $0) }
         })
@@ -29,12 +30,49 @@ extension LauncherView {
         }
     }
 
-    /// The eShop key art of the games that have none yet; the cards and the hero redraw as it arrives.
+    /// What the hero draws: its own decode at the hero's size, never the card's 640 pixel thumbnail (stretched over a 2880 pixel
+    /// wide hero it was blurred). Until `refreshHeroArtwork` has run for this game it decodes here (ArtworkImages keeps it).
+    func heroImage(for game: LibraryGame) -> NSImage? {
+        GameLibrary.heroImage(for: game.id, decoded: heroArtwork) {
+            GameLibrary.artwork(for: displayed(game), repo: stores.repo.path, banners: library.artworkDirectory)
+        }
+    }
+
+    /// The eShop key art of the games that have none yet, in the launcher's language: the cards and the hero redraw as it arrives.
+    /// A change of language picks every banner again (ArtworkStore.fetchMissing). Also warms offline Control NCA icons in the
+    /// background for local unbuilt ROMs that lack a dedicated square icon. Every fetch that added files redraws, even when a
+    /// later call started meanwhile: a scan calls this several times, the later calls find the store busy and add nothing, so
+    /// only the first one can redraw the cards.
     func fetchArtwork() {
-        let ids = library.games.map(\.titleID)
-        Task {
-            let added = await ArtworkStore.shared.fetchMissing(ids)
-            if !added.isEmpty { await MainActor.run { refreshArtwork() } }
+        let games = library.games
+        let ids = games.map(\.titleID), language = loc.lang.code, store = artworkStore
+        let banners = library.artworkDirectory, fallbackKeys = library.keysFile()
+        let allowRemote = performStartupChecks || artworkStore !== ArtworkStore.shared
+        if allowRemote {
+            Task {
+                let added = await store.fetchMissing(ids, language: language)
+                guard !added.isEmpty else { return }
+                await MainActor.run {
+                    guard loc.lang.code == language else { return }
+                    refreshArtwork()
+                }
+            }
+        }
+        Task.detached(priority: .utility) {
+            var extractedAny = false
+            for game in games where !GameLibrary.hasDedicatedIcon(for: game, banners: banners) {
+                if let url = PackageControl.extractControlIcon(
+                    from: game,
+                    preferredLanguage: language,
+                    fallbackKeys: fallbackKeys,
+                    artworkDirectory: banners
+                ) {
+                    ArtworkImages.shared.invalidate(at: url)
+                    extractedAny = true
+                }
+            }
+            guard extractedAny else { return }
+            await MainActor.run { refreshArtwork() }
         }
     }
 

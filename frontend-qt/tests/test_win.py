@@ -158,6 +158,25 @@ class Ld64Test(unittest.TestCase):
         self.assertEqual(again, got)
         self.assertEqual(note2, '')
 
+    def test_a_path_folder_that_refuses_stat_is_skipped(self) -> None:
+        """Windows answers stat in some PATH folders with an error that is not "no such file"."""
+        llvm = make_fake_llvm(self.root, with_lld64=False, with_macho=True)
+        os.environ['NSPB_LLVM_DIR'] = str(llvm)
+        closed = self.root / 'closed'
+        closed.mkdir()
+        os.environ['PATH'] = str(closed) + os.pathsep + os.environ.get('PATH', '')
+        real_stat = os.stat
+
+        def stat(path, *args, **kwargs):
+            if Path(os.fspath(path)).parent == closed:
+                raise OSError(22, 'The path cannot be traversed because it contains an untrusted mount point')
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch('os.stat', stat):
+            self.assertIsNone(tc.ld64_lld())
+            got, _note = tc.ensure_ld64_lld()
+        self.assertEqual(got, llvm / 'bin/ld64.lld.exe')
+
     def test_existing_ld64_lld_wins(self) -> None:
         llvm = make_fake_llvm(self.root, with_lld64=True)
         os.environ['NSPB_LLVM_DIR'] = str(llvm)
@@ -342,9 +361,47 @@ class MetalArgsTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn('linker unavailable', detail)
 
-    def test_metal_tt_has_no_windows_tool(self) -> None:
-        # the pipeline archive is disabled here, and the caller relies on this being None
-        self.assertIsNone(tc.metal_tool('metal-tt'))
+    def test_metal_tt_none_when_absent(self) -> None:
+        # The caller relies on None when the tool is absent. Some Windows Metal builds do ship
+        # metal-tt.exe (32023.850), so this must not assert it is never there.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / 'bin').mkdir()
+            (root / 'bin/metal.exe').write_bytes(b'x')
+            with mock.patch.object(tc, 'metal_dir', return_value=root):
+                self.assertIsNone(tc.metal_tool('metal-tt'))
+
+    def test_metal_tt_found_when_shipped(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / 'bin').mkdir()
+            (root / 'bin/metal-tt.exe').write_bytes(b'x')
+            with mock.patch.object(tc, 'metal_dir', return_value=root):
+                self.assertEqual(tc.metal_tool('metal-tt'), root / 'bin/metal-tt.exe')
+
+    def test_xcrun_metal_tt_resolves_to_the_shipped_tool(self) -> None:
+        # find() returned None for metal-tt unconditionally, so `xcrun -sdk iphoneos metal-tt`
+        # exited 127 on a Metal build that ships it and the offline pipeline archive was skipped
+        # on a machine that can run it. It must resolve to the tool metal_tool finds.
+        from nspb_qt.win import xcrun_shim
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / 'bin').mkdir()
+            exe = root / 'bin/metal-tt.exe'
+            exe.write_bytes(b'x')
+            with mock.patch.object(tc, 'metal_dir', return_value=root):
+                self.assertEqual(xcrun_shim.find('iphoneos', 'metal-tt'), exe)
+
+    def test_xcrun_metal_tt_is_none_when_the_build_does_not_ship_it(self) -> None:
+        # The other half: absent still means None, which is what exits 127 naming the tool and
+        # what switches the pipeline archive off, rather than a half-written archive.
+        from nspb_qt.win import xcrun_shim
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / 'bin').mkdir()
+            (root / 'bin/metal.exe').write_bytes(b'x')
+            with mock.patch.object(tc, 'metal_dir', return_value=root):
+                self.assertIsNone(xcrun_shim.find('iphoneos', 'metal-tt'))
 
     def test_metal_tool_takes_name_then_sdk(self) -> None:
         """The signature is (name, sdk). Both call sites once had it backwards, which made
@@ -684,6 +741,121 @@ class ShimTest(unittest.TestCase):
                                capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
+    def _map_in_child(self, td: Path, script: str) -> subprocess.CompletedProcess:
+        """Run `script` against the generated sitecustomize, as a build's child interpreter does."""
+        shim.install(td / 'shim', python_exe=sys.executable)
+        env = dict(os.environ, PYTHONPATH=str(td / 'shim'), NSPB_SHIM_OFF='')
+        return subprocess.run([sys.executable, '-c', script], env=env,
+                              capture_output=True, text=True)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows subprocess shim')
+    def test_extractor_mapping_runs_the_dll_through_dotnet(self) -> None:
+        # What driver.build_nx_extract / find_nx_extract return is a .NET apphost, and on a
+        # Windows build with incomplete user-mode CET every such apphost fails fast ("Your
+        # Windows doesn't fully support CET"). The dll beside it is the same program through
+        # the unmarked host. Both spellings the driver returns must map: `nx_extract.exe`
+        # (find_nx_extract, and the bundled path) and `nx_extract` (build_nx_extract's
+        # work/tools/nx_extract/nx_extract).
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            out = root / 'nx_extract-abc123'
+            out.mkdir()
+            (out / 'nx_extract.exe').write_bytes(b'MZ-apphost')
+            (out / 'nx_extract.dll').write_bytes(b'MZ-dll')
+            script = ("import sitecustomize as s, toolchain\n"
+                      "from pathlib import Path\n"
+                      "toolchain.dotnet_dir = lambda: Path('portable-dotnet')\n"
+                      f"out = Path({str(out)!r})\n"
+                      "host = str(Path('portable-dotnet') / 'dotnet.exe')\n"
+                      "for name in ('nx_extract.exe', 'nx_extract', 'nx_extract.EXE'):\n"
+                      "    got = s._map([str(out / name), '--source-sha'])\n"
+                      "    assert got == [host, str(out / 'nx_extract.dll'), '--source-sha'], (name, got)\n")
+            r = self._map_in_child(root, script)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows subprocess shim')
+    def test_extractor_mapping_leaves_a_binary_without_a_dll_alone(self) -> None:
+        # The committed dm/tools/nx_extract_bin/nx_extract is a Mach-O universal binary
+        # (cafebabe): no dll beside it and nothing to run through dotnet. The mapping must not
+        # invent a command for it -- on Windows the driver builds from source instead, and a
+        # wrong rewrite here would hide that behind a confusing .NET error.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            bundled = root / 'dm/tools/nx_extract_bin'
+            bundled.mkdir(parents=True)
+            (bundled / 'nx_extract').write_bytes(b'\xca\xfe\xba\xbe\x00\x00\x00\x02')
+            script = ("import sitecustomize as s\n"
+                      f"p = {str(bundled / 'nx_extract')!r}\n"
+                      "got = s._map([p, '--source-sha'])\n"
+                      "assert got == [p, '--source-sha'], got\n")
+            r = self._map_in_child(root, script)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows subprocess shim')
+    def test_extractor_mapping_keeps_every_argument(self) -> None:
+        # nsp.run() hands the extractor its whole command line; the rewrite replaces argv[0]
+        # and must leave the rest in order, including paths with spaces and `--opt=value`.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            out = root / 'nx_extract-abc123'
+            out.mkdir()
+            (out / 'nx_extract.dll').write_bytes(b'MZ-dll')
+            argv = ['--list', '--program=0100AAAA00000000',
+                    'C:\\some folder\\package.nsp', 'C:\\out\\dir', '--allow-damaged']
+            script = ("import sitecustomize as s, toolchain\n"
+                      "from pathlib import Path\n"
+                      "toolchain.dotnet_dir = lambda: Path('portable-dotnet')\n"
+                      f"got = s._map([{str(out / 'nx_extract.exe')!r}] + {argv!r})\n"
+                      f"assert got[2:] == {argv!r}, got\n"
+                      "assert got[1].endswith('nx_extract.dll'), got\n")
+            r = self._map_in_child(root, script)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows signal adapter')
+    def test_sighup_stand_in_lets_the_nsp_script_register_its_stop_signals(self) -> None:
+        # scripts/build_ipa_from_nsp.py builds STOPS = (signal.SIGTERM, signal.SIGHUP) at
+        # module level and cli() registers a handler for each, restoring them in its finally.
+        # Windows has neither the constant nor the ability to catch 1 (CTRL_BREAK_EVENT
+        # there), so without the stand-in the import of the whole NSP script fails.
+        with tempfile.TemporaryDirectory() as td:
+            script = ("import signal\n"
+                      "assert hasattr(signal, 'SIGHUP'), 'no SIGHUP stand-in'\n"
+                      "h = lambda s, f: None\n"
+                      "saved = {s: signal.signal(s, h) for s in (signal.SIGTERM, signal.SIGHUP)}\n"
+                      "assert saved[signal.SIGHUP] is None, saved\n"
+                      "assert signal.getsignal(signal.SIGTERM) is h, 'a real signal must pass through'\n"
+                      "for s, old in saved.items():\n"
+                      "    signal.signal(s, signal.SIG_DFL if old is None else old)\n")
+            r = self._map_in_child(Path(td), script)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows signal adapter')
+    def test_load_upstream_stands_in_sighup_without_the_shim(self) -> None:
+        # load_upstream is also called with no shim on PYTHONPATH (the tests do it, and so
+        # does any caller that imports the driver directly). Its own fallback must cover the
+        # same import, and must be idempotent: a second call must not wrap signal.signal again.
+        with tempfile.TemporaryDirectory() as td:
+            env = {k: v for k, v in os.environ.items() if k != 'PYTHONPATH'}
+            env['NSPB_SHIM_OFF'] = '1'
+            script = ("import sys\n"
+                      f"sys.path.insert(0, {str(QT)!r})\n"
+                      "import signal\n"
+                      "assert not hasattr(signal, 'SIGHUP'), 'the shim must not be loaded here'\n"
+                      "from nspb_qt.win import driver\n"
+                      "driver._install_sighup_stub()\n"
+                      "once = signal.signal\n"
+                      "driver._install_sighup_stub()\n"
+                      "assert signal.signal is once, 'wrapped twice'\n"
+                      "assert signal.SIGHUP == 1, signal.SIGHUP\n"
+                      "assert signal.signal(signal.SIGHUP, lambda s, f: None) is None\n"
+                      "h = lambda s, f: None\n"
+                      "prev = signal.signal(signal.SIGTERM, h)\n"
+                      "assert signal.getsignal(signal.SIGTERM) is h\n"
+                      "signal.signal(signal.SIGTERM, prev)\n")
+            r = subprocess.run([sys.executable, '-c', script], env=env,
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
 
 class DriverCliTest(unittest.TestCase):
     """Mac-only options are refused before any work starts."""
@@ -727,7 +899,7 @@ class DriverPatchTest(unittest.TestCase):
             raise unittest.SkipTest('engine/ is missing: run python3 tools/engine.py sync')
         # `pwd` is installed by the stub inside load_upstream, so this works on any OS
         cls.saved = {k: os.environ.get(k) for k in
-                     ('NSPB_ALLOW_NON_WINDOWS', 'GAME', 'W')}
+                     ('NSPB_ALLOW_NON_WINDOWS', 'GAME', 'W', 'DMSH_PROCS')}
         cls.mod = driver.load_upstream(cls.repo)
         driver.patch(cls.mod, cls.repo)
 
@@ -759,12 +931,24 @@ class DriverPatchTest(unittest.TestCase):
         self.assertTrue(self.mod.apple_silicon())
 
     def test_check_prereqs_raises_with_a_report(self) -> None:
-        with self.assertRaises(self.mod.BuildError) as ctx:
-            self.mod.check_prereqs({}, Path('missing/dmsh_xlate'), mac=False)
+        # The report is about the PC's tools, so the test has to establish that one is missing.
+        # On a fully provisioned machine check_all() finds nothing required-and-bad and
+        # check_prereqs falls through to the repository check -- a different message, which is
+        # what this test used to hit on any PC that had everything installed.
+        missing = tc.Probe(id='llvm', name='LLVM (clang)', state='missing',
+                           hint='Install all missing in the Dependencies panel')
+        with mock.patch.object(tc, 'check_all', return_value=[missing]):
+            with self.assertRaises(self.mod.BuildError) as ctx:
+                self.mod.check_prereqs({}, Path('missing/dmsh_xlate'), mac=False)
         msg = str(ctx.exception)
         self.assertIn('missing on this PC', msg)
         # the message must name what to do, not just what is wrong
         self.assertTrue('LLVM' in msg or 'clang' in msg.lower())
+        # with every tool present the repository check is what fires, on any machine
+        with mock.patch.object(tc, 'check_all', return_value=[]):
+            with self.assertRaises(self.mod.BuildError) as ctx:
+                self.mod.check_prereqs({}, Path('missing/dmsh_xlate'), mac=False)
+        self.assertIn('missing from the repository', str(ctx.exception))
 
     def test_check_prereqs_refuses_mac(self) -> None:
         with self.assertRaises(self.mod.BuildError) as ctx:
@@ -1648,6 +1832,95 @@ class DotnetTest(unittest.TestCase):
             self.assertTrue((out / 'sdk/10.0.403/dotnet.dll').is_file())
 
 
+    def _fake_sdk(self, td: str) -> tuple[Path, Path]:
+        """A .NET root with the SDK's Roslyn apphost and dll, as csc_tool_args finds them."""
+        root = Path(td) / 'dotnet'
+        bincore = root / 'sdk' / '10.0.403' / 'Roslyn' / 'bincore'
+        bincore.mkdir(parents=True)
+        (root / 'dotnet.exe').write_bytes(b'MZ')
+        (bincore / 'csc.exe').write_bytes(b'MZ')
+        (bincore / 'csc.dll').write_bytes(b'MZ')
+        return root, bincore
+
+    def test_csc_args_empty_when_the_apphost_works(self) -> None:
+        """A healthy machine keeps the SDK's own compiler: no wrapper, no MSBuild overrides."""
+        with tempfile.TemporaryDirectory() as td:
+            root, _ = self._fake_sdk(td)
+            ok = subprocess.CompletedProcess([], 0, 'Microsoft (R) Visual C#', '')
+            with mock.patch.object(tc, 'dotnet_dir', return_value=root), \
+                    mock.patch.object(tc, 'dotnet_sdks', return_value=['10.0.403']), \
+                    mock.patch.object(tc, 'tools_dir', return_value=Path(td) / 'tools'), \
+                    mock.patch.object(tc.subprocess, 'run', return_value=ok) as run:
+                self.assertEqual(tc.csc_tool_args(), [])
+            self.assertEqual(run.call_count, 1)
+            self.assertFalse((Path(td) / 'tools' / 'csc-wrap').exists())
+
+    def test_csc_args_route_through_dotnet_when_cet_blocks_the_apphost(self) -> None:
+        """Windows 11 build 22000: csc.exe exits 0x80131506 with the CET message, so publish died in
+        Microsoft.CSharp.Core.targets and tool_lock reported "the translator does not run"."""
+        with tempfile.TemporaryDirectory() as td:
+            root, bincore = self._fake_sdk(td)
+            tools = Path(td) / 'tools'
+            cet = subprocess.CompletedProcess(
+                [], 0x80131506, '', "Fatal error.\nYour Windows doesn't fully support CET.")
+            with mock.patch.object(tc, 'dotnet_dir', return_value=root), \
+                    mock.patch.object(tc, 'dotnet_sdks', return_value=['10.0.403']), \
+                    mock.patch.object(tc, 'tools_dir', return_value=tools), \
+                    mock.patch.object(tc.subprocess, 'run', return_value=cet):
+                args = tc.csc_tool_args()
+            self.assertIn('-p:UseSharedCompilation=false', args)
+            self.assertIn('-p:CscToolExe=csc.cmd', args)
+            wrap = tools / 'csc-wrap'
+            self.assertIn(f'-p:CscToolPath={wrap}', args)
+            body = (wrap / 'csc.cmd').read_text(encoding='utf-8')
+            self.assertIn(str(root / 'dotnet.exe'), body)
+            self.assertIn(str(bincore / 'csc.dll'), body)
+            self.assertIn('%*', body)
+
+    def test_csc_args_do_not_mask_another_apphost_failure(self) -> None:
+        """"You must install or update .NET" is a different problem: leave it to fail visibly."""
+        with tempfile.TemporaryDirectory() as td:
+            root, _ = self._fake_sdk(td)
+            other = subprocess.CompletedProcess(
+                [], 2147516566, '', 'You must install or update .NET to run this application.')
+            with mock.patch.object(tc, 'dotnet_dir', return_value=root), \
+                    mock.patch.object(tc, 'dotnet_sdks', return_value=['10.0.403']), \
+                    mock.patch.object(tc, 'tools_dir', return_value=Path(td) / 'tools'), \
+                    mock.patch.object(tc.subprocess, 'run', return_value=other):
+                self.assertEqual(tc.csc_tool_args(), [])
+            self.assertFalse((Path(td) / 'tools' / 'csc-wrap').exists())
+
+    def test_csc_probe_sets_dotnet_root(self) -> None:
+        """Without DOTNET_ROOT the apphost looks in C:\\Program Files\\dotnet and fails with a
+        different message, which hid the CET one this probe exists to find."""
+        with tempfile.TemporaryDirectory() as td:
+            root, _ = self._fake_sdk(td)
+            ok = subprocess.CompletedProcess([], 0, '', '')
+            with mock.patch.object(tc, 'dotnet_dir', return_value=root), \
+                    mock.patch.object(tc, 'dotnet_sdks', return_value=['10.0.403']), \
+                    mock.patch.object(tc, 'tools_dir', return_value=Path(td) / 'tools'), \
+                    mock.patch.object(tc.subprocess, 'run', return_value=ok) as run:
+                tc.csc_tool_args()
+            env = run.call_args.kwargs['env']
+            self.assertEqual(env['DOTNET_ROOT'], str(root))
+            self.assertEqual(env['DOTNET_ROOT_X64'], str(root))
+
+    def test_csc_probe_answer_is_cached(self) -> None:
+        """One `csc.exe -?` per compiler, not one per publish: the answer is keyed on its stamp."""
+        with tempfile.TemporaryDirectory() as td:
+            root, _ = self._fake_sdk(td)
+            cet = subprocess.CompletedProcess([], 0x80131506, '', "Your Windows doesn't fully support CET.")
+            with mock.patch.object(tc, 'dotnet_dir', return_value=root), \
+                    mock.patch.object(tc, 'dotnet_sdks', return_value=['10.0.403']), \
+                    mock.patch.object(tc, 'tools_dir', return_value=Path(td) / 'tools'), \
+                    mock.patch.object(tc.subprocess, 'run', return_value=cet) as run:
+                first = tc.csc_tool_args()
+                second = tc.csc_tool_args()
+            self.assertEqual(first, second)
+            self.assertEqual(run.call_count, 1)
+            self.assertTrue(first)
+
+
 class ConsoleWindowTest(unittest.TestCase):
     """No child of this app may open its own console window on Windows.
 
@@ -1762,7 +2035,8 @@ class PlatformIsolationTest(unittest.TestCase):
             code = (
                 'import sys; sys.path.insert(0, %r)\n'
                 'from nspb_qt.win import toolchain, sdk_fetch, shim, fix_ipa_modes, fetch, '
-                'doctor, build_app, driver, xcrun_shim, macho_sign, sdk_auto_cuts\n'
+                'doctor, build_app, driver, xcrun_shim, macho_sign, sdk_auto_cuts, '
+                'love_shaders, arm64_emu, oodle_emu, gm_shaders, nro_emu, glslc_emu\n'
                 'print("ok")\n'
             ) % str(QT)
             r = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True,
@@ -2300,6 +2574,110 @@ class WindowsBuildFixesTest(unittest.TestCase):
                 driver.patch(mod, bundled)
                 with mock.patch.object(mod, 'run', side_effect=AssertionError('attempted a source build')):
                     self.assertEqual(mod.build_nx_extract(bundled, work, work / 'logs', {}), exe)
+                    self.assertEqual(mod.find_nx_extract(bundled, {}), exe)
+
+    def test_find_nx_extract_and_dmsh_xlate_build_from_source_without_aot_and_cache(self) -> None:
+        from nspb_qt.win import driver
+        repo = QT.parent / 'engine'
+        if not (repo / 'scripts/build_ipa_from_nsp.py').is_file():
+            self.skipTest('engine/ is missing')
+        mod = driver.load_upstream(repo)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            src_repo = root / 'engine'
+            proj = src_repo / 'dm/tools/nx_extract'
+            proj.mkdir(parents=True)
+            (proj / 'nx_extract.csproj').write_text('<Project><PropertyGroup><PublishAot>true</PublishAot></PropertyGroup></Project>', encoding='utf-8')
+            (proj / 'Program.cs').write_text('// stub', encoding='utf-8')
+            expected_sha = mod.nx_extract_source_sha(src_repo)
+            tools_root = root / 'tools_cache'
+            seen_cmds: list[list[str]] = []
+
+            def write_stub_exe(exe_path: Path, sha_out: str) -> None:
+                exe_path.write_text(f'#!/bin/sh\necho {sha_out}\n', encoding='utf-8')
+                exe_path.chmod(0o755)
+
+            real_subproc_run = subprocess.run
+
+            def win_compat_subproc_run(cmd, *a, **kw):
+                if os.name == 'nt' and cmd and str(cmd[0]).endswith('nx_extract.exe'):
+                    lines = Path(cmd[0]).read_text(encoding='utf-8').splitlines()
+                    out = lines[1].removeprefix('echo ').strip() if len(lines) > 1 else ''
+                    return subprocess.CompletedProcess(cmd, 0, stdout=out + '\n', stderr='')
+                return real_subproc_run(cmd, *a, **kw)
+
+            def fake_mod_run(cmd, log, env=None):
+                s_cmd = [str(c) for c in cmd]
+                seen_cmds.append(s_cmd)
+                out_dir = Path(s_cmd[s_cmd.index('-o') + 1])
+                write_stub_exe(out_dir / 'nx_extract.exe', expected_sha)
+
+            with mock.patch.object(driver, '_UPSTREAM_RUN', None), \
+                 mock.patch.object(tc, 'tools_dir', return_value=tools_root), \
+                 mock.patch.object(tc, 'dotnet_dir', return_value=Path('C:/dotnet')), \
+                 mock.patch.object(subprocess, 'run', side_effect=win_compat_subproc_run):
+                driver.patch(mod, src_repo)
+                with mock.patch.object(mod, 'run', side_effect=fake_mod_run):
+                    first = mod.find_nx_extract(src_repo, {})
+                    second = mod.find_nx_extract(src_repo, {})
+                self.assertEqual(first, second)
+                self.assertEqual(first.parent.name, f'nx_extract-{expected_sha}')
+                self.assertTrue(first.is_file())
+                self.assertEqual(len(seen_cmds), 1, 'second call must reuse the cached binary')
+                self.assertIn('-p:PublishAot=false', seen_cmds[0])
+                self.assertIn('--artifacts-path', seen_cmds[0])
+
+                # A stale/mismatched binary must be rejected by --source-sha verification.
+                write_stub_exe(first, '0000000000000000')
+                with self.assertRaises(mod.BuildError) as ctx:
+                    mod.find_nx_extract(src_repo, {})
+                self.assertIn('was not built from the in-repo source', str(ctx.exception))
+
+            # Test shim's _dmsh_xlate_dll helper on both bundled and source-checkout layouts.
+            # Only provide globals actually imported at top level in _SITECUSTOMIZE_SRC (never inject Path).
+            import ast
+            tree = ast.parse(shim._SITECUSTOMIZE_SRC)
+            fn_node = next(
+                n for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef) and n.name == '_dmsh_xlate_dll'
+            )
+            mod_ast = ast.Module(body=[fn_node], type_ignores=[])
+            publish_cmds: list[list[str]] = []
+
+            def fake_publish(cmd, **kw):
+                s_cmd = [str(c) for c in cmd]
+                publish_cmds.append(s_cmd)
+                out_dir = Path(s_cmd[s_cmd.index('-o') + 1])
+                (out_dir / 'dmsh_xlate.dll').write_bytes(b'DLL')
+
+            ns = {'os': os, 'sys': sys, 'shutil': shutil, 'subprocess': subprocess, '_run': fake_publish}
+            exec(compile(mod_ast, '<shim>', 'exec'), ns)
+            _dmsh_xlate_dll = ns['_dmsh_xlate_dll']
+
+            xlate_bin = src_repo / 'dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate'
+            xlate_bin.parent.mkdir(parents=True)
+            xlate_bin.write_bytes(b'\xcf\xfa\xed\xfe')
+            xlate_proj = src_repo / 'dm/gfx/tools/dmsh_xlate'
+            xlate_proj.mkdir(parents=True)
+            (xlate_proj / 'dmsh_xlate.csproj').write_text('<Project/>', encoding='utf-8')
+            (xlate_proj / 'Program.cs').write_text('// xlate', encoding='utf-8')
+
+            with mock.patch.object(tc, 'tools_dir', return_value=tools_root):
+                dll1 = _dmsh_xlate_dll(str(xlate_bin), 'dotnet', tc)
+                dll2 = _dmsh_xlate_dll(str(xlate_bin), 'dotnet', tc)
+            self.assertEqual(dll1, dll2)
+            self.assertTrue(Path(dll1).is_file())
+            self.assertEqual(len(publish_cmds), 1)
+            self.assertIn('-p:PublishAot=false', publish_cmds[0])
+            self.assertIn('-p:SatelliteResourceLanguages=en', publish_cmds[0])
+            self.assertIn('--artifacts-path', publish_cmds[0])
+
+            # When dmsh_xlate.dll is bundled beside dmsh_xlate, no publish runs.
+            bundled_dll = Path(str(xlate_bin) + '.dll')
+            bundled_dll.write_bytes(b'BUNDLED')
+            publish_cmds.clear()
+            self.assertEqual(_dmsh_xlate_dll(str(xlate_bin), 'dotnet', tc), str(bundled_dll))
+            self.assertEqual(publish_cmds, [])
 
     def test_driver_region_skip_stamps_rewrite_id_and_capture_jit_reuses_image(self) -> None:
         from nspb_qt.win import driver
@@ -3418,6 +3796,4835 @@ class WindowsBuildFixesTest(unittest.TestCase):
                 self.assertEqual(cenv_frozen.get('PYTHONPATH'), '/custom/user/lib')
                 self.assertNotIn('PYTHONHOME', cenv_frozen)
                 self.assertNotIn('_MEIPASS', cenv_frozen)
+
+    def test_onboarding_step2_install_all_progress_and_button_lock(self) -> None:
+        """Verify OnboardingDialog step 2 renders sub-stage percentages, progress bars, queue positions,
+        lld linked status, in-place updates, and disables Continue/Back while installing.
+        """
+        import ast
+        from nspb_qt import i18n, l10n, style
+
+        sheets_src = (QT / 'nspb_qt' / 'sheets.py').read_text(encoding='utf-8')
+        sheets_tree = ast.parse(sheets_src)
+        ob_cls = next(n for n in ast.walk(sheets_tree)
+                      if isinstance(n, ast.ClassDef) and n.name == 'OnboardingDialog')
+        fn_map = {n.name: n for n in ob_cls.body if isinstance(n, ast.FunctionDef)}
+        for req in ('_clear_body', '_step1_row_meta', '_render_step', 'done'):
+            self.assertIn(req, fn_map)
+
+        class FakeWidget:
+            def __init__(self, text=''):
+                self.text = str(text)
+                self.visible = True
+                self.enabled = True
+                self.style_sheet = ''
+                self.obj_name = ''
+                self.value = 0
+                self.range = (0, 100)
+                self.clicked_cbs = []
+                self.deleted = False
+
+            def setText(self, s):
+                self.text = str(s)
+
+            def setVisible(self, v):
+                self.visible = bool(v)
+
+            def show(self):
+                self.visible = True
+
+            def hide(self):
+                self.visible = False
+
+            def setEnabled(self, e):
+                self.enabled = bool(e)
+
+            def setStyleSheet(self, s):
+                self.style_sheet = s
+
+            def setObjectName(self, s):
+                self.obj_name = s
+
+            def setWordWrap(self, _w):
+                pass
+
+            def setContentsMargins(self, *_a):
+                pass
+
+            def setRange(self, lo, hi):
+                self.range = (lo, hi)
+
+            def setValue(self, v):
+                self.value = int(v)
+
+            def setTextVisible(self, _v):
+                pass
+
+            def setParent(self, _p):
+                pass
+
+            def deleteLater(self):
+                self.deleted = True
+
+            @property
+            def clicked(self):
+                cbs = self.clicked_cbs
+
+                class _Sig:
+                    @staticmethod
+                    def connect(cb):
+                        cbs.append(cb)
+                return _Sig()
+
+        class FakeLayout:
+            def __init__(self, _parent=None):
+                self.items = []
+
+            def setContentsMargins(self, *_a):
+                pass
+
+            def setSpacing(self, *_a):
+                pass
+
+            def addWidget(self, w, *_a):
+                self.items.append(w)
+
+            def addLayout(self, l, *_a):
+                self.items.append(l)
+
+            def addStretch(self, *_a):
+                self.items.append(None)
+
+            def count(self):
+                return len(self.items)
+
+            def takeAt(self, idx):
+                w = self.items.pop(idx)
+
+                class _Item:
+                    @staticmethod
+                    def widget():
+                        return w if isinstance(w, FakeWidget) else None
+                return _Item()
+
+        class FakeCardGroup(FakeWidget):
+            def __init__(self, footer=''):
+                super().__init__(footer)
+                self.rows = []
+                self.dividers = 0
+
+            def add_row(self, r):
+                self.rows.append(r)
+
+            def add_divider(self):
+                self.dividers += 1
+
+        ns: dict = {
+            'Path': Path,
+            'shutil': shutil,
+            'style': style,
+            'QWidget': FakeWidget,
+            'QLabel': FakeWidget,
+            'QPushButton': FakeWidget,
+            'QProgressBar': FakeWidget,
+            'QHBoxLayout': FakeLayout,
+            'QVBoxLayout': FakeLayout,
+            'CardGroup': FakeCardGroup,
+            'StatusDot': FakeWidget,
+        }
+        for name in ('_clear_body', '_step1_row_meta', '_render_step'):
+            fn = fn_map[name]
+            for n in ast.walk(fn):
+                ast.fix_missing_locations(n)
+            exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])),
+                         '<sheets>', 'exec'), ns)
+
+        class FakeDep:
+            def __init__(self, dep_id, title_key, ok=False, install=None, required=True):
+                self.id = dep_id
+                self.title_key = title_key
+                self.ok = ok
+                self.install = list(install or [])
+                self.required = required
+                self.installing = False
+                self.install_stage = ''
+                self.install_detail = ''
+                self.install_pct = None
+                self.queue_index = 0
+                self.last_error = ''
+                self.fix_hint = ''
+
+        class FakeModel:
+            def __init__(self):
+                self.lang = i18n.Lang('zh')
+                self.deps = [
+                    FakeDep('python', 'dep.python', False, ['__win__:python']),
+                    FakeDep('dotnet', 'dep.dotnet', False, ['__win__:dotnet']),
+                    FakeDep('llvm', 'dep.llvm', False, ['__win__:llvm']),
+                    FakeDep('lld', 'dep.lld', False, []),
+                    FakeDep('ios_sdk', 'dep.iossdk', False, ['__win__:ios_sdk']),
+                ]
+                self._install_all_running = False
+                self.install_all_step = 0
+                self.install_all_total = 0
+                self.install_all_pct = 0
+
+            def t(self, key, *args):
+                return l10n.t(key, self.lang, *args)
+
+            def install_all_missing(self):
+                self._install_all_running = True
+
+        class FakeOnboarding:
+            _clear_body = ns['_clear_body']
+            _step1_row_meta = ns['_step1_row_meta']
+            _render_step = ns['_render_step']
+            _fit_dialog_height = lambda self: None
+
+            def __init__(self, model):
+                self.m = model
+                self.step = 1
+                self._step1_sig = None
+                self._step1_widgets = {}
+                self.step_badge = FakeWidget()
+                self.task_pill = FakeWidget()
+                self.task_pill.hide()
+                self.head_title = FakeWidget()
+                self.head_note = FakeWidget()
+                self.overall_pct_lbl = FakeWidget()
+                self.overall_pct_lbl.hide()
+                self.body_layout = FakeLayout()
+                self.later_btn = FakeWidget('Later')
+                self.back_btn = FakeWidget('Back')
+                self.next_btn = FakeWidget('Continue')
+
+        m = FakeModel()
+        dlg = FakeOnboarding(m)
+
+        # Before clicking Install all: Continue & Back enabled, task_pill hidden, ibtn enabled
+        dlg._render_step()
+        self.assertFalse(dlg.task_pill.visible)
+        self.assertFalse(dlg.overall_pct_lbl.visible)
+        self.assertTrue(dlg.next_btn.enabled)
+        self.assertTrue(dlg.back_btn.enabled)
+        ibtn = dlg._step1_widgets['ibtn']
+        self.assertIsNotNone(ibtn)
+        self.assertTrue(ibtn.enabled)
+        self.assertEqual(ibtn.text, m.t('dep.installAll'))
+
+        # Simulate clicking Install all -> step 1/4: Python downloading at 45%, others queued
+        m._install_all_running = True
+        m.install_all_step = 1
+        m.install_all_total = 4
+        m.install_all_pct = 18
+        m.deps[0].installing = True
+        m.deps[0].install_stage = m.t('dep.stage.pyDownload', 45)
+        m.deps[0].install_detail = m.t('dep.detail.pyDownload', '3.12.8', 12, 26, 45)
+        m.deps[0].install_pct = 45
+        m.deps[1].queue_index = 2
+        m.deps[2].queue_index = 3
+        m.deps[4].queue_index = 4
+
+        dlg._render_step()
+        self.assertTrue(dlg.task_pill.visible)
+        self.assertIn('1 / 4', dlg.task_pill.text)
+        self.assertTrue(dlg.overall_pct_lbl.visible)
+        self.assertIn('18%', dlg.overall_pct_lbl.text)
+        self.assertFalse(dlg.next_btn.enabled, 'Continue must be disabled during installation')
+        self.assertFalse(dlg.back_btn.enabled, 'Back must be disabled during installation')
+        self.assertTrue(dlg.later_btn.enabled, 'Set up later must remain enabled')
+
+        rows = dlg._step1_widgets['rows']
+        py_bar = rows['python']['bar']
+        self.assertIsNotNone(py_bar)
+        self.assertEqual(py_bar.value, 45)
+        self.assertIn('45%', rows['python']['status'].text)
+        self.assertIn('3.12.8', rows['python']['detail'].text)
+        self.assertEqual(rows['dotnet']['status'].text, m.t('onboarding.progress.queuePos', 2))
+        self.assertEqual(rows['lld']['status'].text, m.t('onboarding.progress.withLlvm'))
+        self.assertFalse(dlg._step1_widgets['ibtn'].enabled)
+
+        # In-place update when Python advances to Step 3/3 (installing packages 67%): same widget instance!
+        m.deps[0].install_stage = m.t('dep.stage.pyPkgs', 67)
+        m.deps[0].install_detail = m.t('dep.detail.pyPkgs', 4, 6, 'fonttools')
+        m.deps[0].install_pct = 67
+        m.install_all_pct = 24
+        dlg._render_step()
+        self.assertIs(dlg._step1_widgets['rows']['python']['bar'], py_bar, 'must update progress bar in-place without rebuilding widgets')
+        self.assertEqual(py_bar.value, 67)
+        self.assertIn('67%', rows['python']['status'].text)
+        self.assertIn('fonttools', rows['python']['detail'].text)
+        self.assertIn('24%', dlg.overall_pct_lbl.text)
+
+        # When LLVM is installing, lld row says waiting for LLVM unpack
+        m.deps[0].installing = False
+        m.deps[0].ok = True
+        m.deps[1].ok = True
+        m.deps[1].queue_index = 0
+        m.deps[2].installing = True
+        m.deps[2].queue_index = 0
+        m.deps[2].install_stage = m.t('dep.stage.download', 64)
+        m.deps[2].install_detail = m.t('dep.detail.download', 'llvm.zip', 160, 250, 64)
+        m.deps[2].install_pct = 64
+        m.install_all_step = 3
+        m.install_all_pct = 64
+        dlg._render_step()
+        self.assertEqual(dlg._step1_widgets['rows']['lld']['status'].text, m.t('onboarding.progress.waitingLlvm'))
+        self.assertEqual(dlg._step1_widgets['rows']['llvm']['bar'].value, 64)
+
+        # All finished: Continue re-enabled, pills hidden
+        for d in m.deps:
+            d.installing = False
+            d.ok = True
+            d.queue_index = 0
+        m._install_all_running = False
+        dlg._render_step()
+        self.assertFalse(dlg.task_pill.visible)
+        self.assertFalse(dlg.overall_pct_lbl.visible)
+        self.assertTrue(dlg.next_btn.enabled)
+        self.assertTrue(dlg.back_btn.enabled)
+
+    @staticmethod
+    def _load_model_with_qt_fallback():
+        """Import nspb_qt.model, installing a lightweight PySide6.QtCore stub if PySide6 is absent in CI."""
+        try:
+            from nspb_qt import model as model_mod
+            return model_mod, lambda: None
+        except ImportError:
+            pass
+        import types
+        saved = {k: sys.modules.get(k) for k in ('PySide6', 'PySide6.QtCore', 'nspb_qt.model')}
+
+        class _FakeSignalInstance:
+            def __init__(self) -> None:
+                self._slots: list = []
+
+            def connect(self, fn) -> None:
+                self._slots.append(fn)
+
+            def disconnect(self, fn=None) -> None:
+                if fn is None:
+                    self._slots.clear()
+                elif fn in self._slots:
+                    self._slots.remove(fn)
+
+            def emit(self, *args) -> None:
+                for fn in list(self._slots):
+                    fn(*args)
+
+        class _FakeSignal:
+            def __init__(self, *_a) -> None:
+                self._name = ''
+
+            def __set_name__(self, _owner, name: str) -> None:
+                self._name = f'_sig_{name}'
+
+            def __get__(self, obj, _owner=None):
+                if obj is None:
+                    return self
+                inst = getattr(obj, self._name, None)
+                if inst is None:
+                    inst = _FakeSignalInstance()
+                    setattr(obj, self._name, inst)
+                return inst
+
+        class _FakeQObject:
+            def __init__(self, *_a, **_kw) -> None:
+                pass
+
+            def thread(self):
+                return None
+
+            @staticmethod
+            def currentThread():
+                return None
+
+        class _FakeQSettings:
+            def __init__(self, *_a, **_kw) -> None:
+                self._d: dict[str, object] = {}
+
+            def value(self, k: str, default: object = '', *, defaultValue: object = None, type: object = None) -> object:
+                fallback = defaultValue if defaultValue is not None else default
+                val = self._d.get(k, fallback)
+                if type is str and val is not None:
+                    return str(val)
+                return val
+
+            def setValue(self, k: str, v: object) -> None:
+                self._d[k] = v
+
+            def remove(self, k: str) -> None:
+                self._d.pop(k, None)
+
+        class _FakeQt:
+            class ConnectionType:
+                QueuedConnection = 0
+
+        class _FakeQMetaObject:
+            @staticmethod
+            def invokeMethod(obj, name: str, *args) -> None:
+                fn = getattr(obj, name, None)
+                if callable(fn):
+                    call_args = args[1:] if args and args[0] == 0 else args
+                    fn(*call_args)
+
+        qt_pkg = types.ModuleType('PySide6')
+        qt_core = types.ModuleType('PySide6.QtCore')
+        qt_core.QObject = _FakeQObject
+        qt_core.QThread = _FakeQObject
+        qt_core.QSettings = _FakeQSettings
+        qt_core.Signal = _FakeSignal
+        qt_core.Slot = lambda *_a, **_kw: (lambda f: f)
+        qt_core.Qt = _FakeQt
+        qt_core.QMetaObject = _FakeQMetaObject
+        qt_core.Q_ARG = lambda _t, v: v
+        qt_pkg.QtCore = qt_core
+        sys.modules['PySide6'] = qt_pkg
+        sys.modules['PySide6.QtCore'] = qt_core
+        from nspb_qt import model as model_mod
+
+        def _cleanup() -> None:
+            for k, old in saved.items():
+                if old is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = old
+
+        return model_mod, _cleanup
+
+    @staticmethod
+    def _make_dmromfs1_image(mask: str | None = None, mals: list[str] | None = None) -> bytes:
+        """Build a valid DMROMFS1 image with System/RegionLangMask.txt or Mals/<tag>.Product.sarc."""
+        import struct
+        ent_struct = struct.Struct('<QQIHBB')
+        head_struct = struct.Struct('<8sQQQ')
+        if mask is not None:
+            payload = mask.encode('utf-8')
+            data_off = 32
+            idx_off = data_off + len(payload)
+            names = b'SystemRegionLangMask.txt'
+            entries = (
+                ent_struct.pack(1, 1, 0, 0, 0, 0)
+                + ent_struct.pack(2, 1, 0, 6, 0, 0)
+                + ent_struct.pack(data_off, len(payload), 6, 18, 1, 0)
+            )
+            idx = entries + names
+            head = head_struct.pack(b'DMROMFS1', idx_off, len(idx), 3)
+            return head + payload + idx
+        mals_list = sorted(mals or [])
+        pool = bytearray(b'Mals')
+        entries_ba = bytearray()
+        entries_ba += ent_struct.pack(1, 1, 0, 0, 0, 0)
+        entries_ba += ent_struct.pack(2, len(mals_list), 0, 4, 0, 0)
+        for name in mals_list:
+            nb = name.encode('utf-8')
+            entries_ba += ent_struct.pack(32, 0, len(pool), len(nb), 1, 0)
+            pool += nb
+        idx = bytes(entries_ba + pool)
+        head = head_struct.pack(b'DMROMFS1', 32, len(idx), 2 + len(mals_list))
+        return head + idx
+
+    def test_library_scan_directory_sorts_updates_by_integer_version(self) -> None:
+        from nspb_qt import library as lib
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            base_f = root / 'Game [010015100B514000][v0].nsp'
+            upd_old = root / 'Game [010015100B514800][v65536].nsp'
+            upd_new = root / 'Game [010015100B514800][v131072].nsp'
+            for f in (base_f, upd_old, upd_new):
+                f.write_bytes(b'x')
+            games = lib.GameLibrary.discover_in_folder(str(root), repo_path='')
+            self.assertEqual(len(games), 1)
+            self.assertEqual(games[0].inputs.get('update'), [str(upd_new)])
+
+    def test_pack_archive_sorts_extract_versions_numerically_copies_identity_and_narrows_launcher_json(self) -> None:
+        from nspb_qt import library as lib
+        from nspb_qt import romfs_languages as rl
+        model_mod, cleanup = self._load_model_with_qt_fallback()
+        self.addCleanup(cleanup)
+        Model = model_mod.Model
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            work = root / 'work'
+            v0 = work / 'extract' / 'v0'
+            v65536 = work / 'extract' / 'v65536'
+            v131072 = work / 'extract' / 'v131072'
+            for vd in (v0, v65536, v131072):
+                vd.mkdir(parents=True)
+            (v0 / 'RomFS.img').write_bytes(self._make_dmromfs1_image(mask='USen JPja\n'))
+            (v65536 / 'RomFS.img').write_bytes(self._make_dmromfs1_image(mask='USen JPja\n'))
+            img_new = self._make_dmromfs1_image(mask='JPja USen CNzh TWzh EUfr\n01111\n')
+            (v131072 / 'RomFS.img').write_bytes(img_new)
+            id_bytes = b'010015100B514000\t1.2.0\t131072\tabcdef0123456789\n'
+            (v131072 / 'RomFS.img.id').write_bytes(id_bytes)
+
+            tid = '010015100B514000'
+            fw_dm = work / 'shell-framework' / f'DmGame{tid}.framework' / 'dm'
+            fw_dm.mkdir(parents=True)
+            (fw_dm.parent / f'DmGame{tid}').write_bytes(b'dylib')
+            fallback_options = [[code, label] for code, label in rl.TABLE] + [['th', 'Thai']]
+            launcher_data = {
+                'schema': 1,
+                'game': tid,
+                'settings': [
+                    {
+                        'env': 'DM_LANG',
+                        'kind': 'choice',
+                        'section': 'Game',
+                        'label': 'Game language',
+                        'note': "This game's files do not list its languages.",
+                        'default': 'en-US',
+                        'level': 'basic',
+                        'options': fallback_options,
+                    }
+                ],
+            }
+            (fw_dm / 'launcher.json').write_text(json.dumps(launcher_data), encoding='utf-8')
+
+            out = root / 'out'
+            out.mkdir()
+            with (
+                mock.patch.object(Model, 'check_deps', lambda self: None),
+                mock.patch.object(lib, 'default_state_dir', lambda: root / 'state'),
+            ):
+                m = Model()
+                m.effective_work_dir = str(work)
+                m.out_dir = str(out)
+                m.base_path = str(root / f'Game [{tid}][v0].nsp')
+                self.assertEqual(m.pack_archive(title_id=tid), (True, ''))
+
+                dest = out / 'games' / 'Super Mario Bros. Wonder'
+                self.assertEqual(Path(m.archive_path), dest)
+                self.assertEqual((dest / 'Super Mario Bros. Wonder.img').read_bytes(), img_new)
+                self.assertEqual((dest / 'Super Mario Bros. Wonder.img.id').read_bytes(), id_bytes)
+                self.assertFalse((v0 / 'RomFS.img').exists())
+                self.assertFalse((v65536 / 'RomFS.img').exists())
+                self.assertFalse((v131072 / 'RomFS.img').exists())
+                self.assertFalse((v131072 / 'RomFS.img.id').exists())
+
+                updated_launcher = json.loads((fw_dm / 'launcher.json').read_text(encoding='utf-8'))
+                lang_row = updated_launcher['settings'][0]
+                self.assertEqual(
+                    [o[0] for o in lang_row['options']],
+                    ['en-US', 'ja', 'fr', 'zh-Hant', 'zh-Hans', 'th'],
+                )
+                self.assertEqual(lang_row['note'], '')
+
+                # When the extracted image has no .id file on a subsequent archive, any stale .img.id is removed
+                (v131072 / 'RomFS.img').write_bytes(img_new)
+                self.assertEqual(m.pack_archive(title_id=tid), (True, ''))
+                self.assertFalse((dest / 'Super Mario Bros. Wonder.img.id').exists())
+
+    def test_romfs_languages_handles_mals_corrupted_headers_and_cache_invalidation(self) -> None:
+        import struct
+        from nspb_qt import romfs_languages as rl
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            # 1. Mals in DMROMFS1 image and directory
+            mals_img = root / 'mals.img'
+            mals_img.write_bytes(self._make_dmromfs1_image(mals=['USen.Product.100.sarc', 'CNzh.Product.100.sarc']))
+            self.assertEqual([o[0] for o in rl.options_in(mals_img)], ['en-US', 'zh-Hans'])
+
+            mals_dir = root / 'romfs_dir' / 'Mals'
+            mals_dir.mkdir(parents=True)
+            (mals_dir / 'JPja.Product.100.sarc').write_bytes(b'x')
+            (mals_dir / 'EUde.Product.100.sarc').write_bytes(b'x')
+            self.assertEqual([o[0] for o in rl.options_in(mals_dir.parent)], ['ja', 'de'])
+
+            # 2. Corrupted / overflow headers return [] without raising
+            good = bytearray(self._make_dmromfs1_image(mask='USen JPja\n'))
+            for i, bad_bytes in enumerate([
+                b'',
+                bytes(good[:20]),
+                bytes(good[:-10]),
+                b'X' + bytes(good[1:]),
+                bytes(good[:8]) + struct.pack('<Q', (1 << 64) - 1) + bytes(good[16:]),
+                bytes(good[:16]) + struct.pack('<Q', (1 << 64) - 1) + bytes(good[24:]),
+                bytes(good[:24]) + struct.pack('<Q', (1 << 64) - 1),
+                bytes(good[:24]) + struct.pack('<Q', ((1 << 64) - 1) // 24 + 1),
+            ]):
+                p = root / f'bad_{i}.img'
+                p.write_bytes(bad_bytes)
+                self.assertEqual(rl.options_in(p), [])
+
+            # Overflow in mask entry offset / size
+            idx_off = struct.unpack_from('<Q', good, 8)[0]
+            bad_mask_size = bytearray(good)
+            struct.pack_into('<Q', bad_mask_size, idx_off + 48 + 8, 0x7FFFFFFFFFFFFFFF)
+            p_ms = root / 'bad_mask_size.img'
+            p_ms.write_bytes(bad_mask_size)
+            self.assertEqual(rl.options_in(p_ms), [])
+
+            bad_mask_off = bytearray(good)
+            struct.pack_into('<Q', bad_mask_off, idx_off + 48, (1 << 64) - 1)
+            p_mo = root / 'bad_mask_off.img'
+            p_mo.write_bytes(bad_mask_off)
+            self.assertEqual(rl.options_in(p_mo), [])
+
+            # 3. Cache invalidation when a cut-off file finishes copying or is replaced
+            changing = root / 'changing.img'
+            two = self._make_dmromfs1_image(mask='USen JPja\n')
+            changing.write_bytes(two[:-10])
+            self.assertEqual(rl.options_in(changing), [])
+            changing.write_bytes(two)
+            self.assertEqual([o[0] for o in rl.options_in(changing)], ['en-US', 'ja'])
+            three = self._make_dmromfs1_image(mask='USen JPja EUfr\n')
+            changing.write_bytes(three)
+            self.assertEqual([o[0] for o in rl.options_in(changing)], ['en-US', 'ja', 'fr'])
+
+            # 4. Inserting DM_LANG when absent vs keeping exact row untouched
+            no_lang_json = root / 'launcher.json'
+            no_lang_json.write_text(json.dumps({
+                'schema': 1,
+                'game': '040074A01BF12000',
+                'settings': [{'env': 'DM_OPMODE', 'kind': 'choice', 'section': 'Game'}],
+            }), encoding='utf-8')
+            self.assertTrue(rl.apply_to_launcher_json(no_lang_json, changing))
+            parsed = json.loads(no_lang_json.read_text(encoding='utf-8'))
+            self.assertEqual(parsed['settings'][1]['env'], 'DM_LANG')
+            self.assertEqual([o[0] for o in parsed['settings'][1]['options']], ['en-US', 'ja', 'fr'])
+            # Second call is a no-op because note is now empty
+            self.assertFalse(rl.apply_to_launcher_json(no_lang_json, changing))
+
+    def test_start_build_stages_shared_folder_and_auto_picks_matching_update_and_dlc(self) -> None:
+        from nspb_qt import library as lib
+        from nspb_qt.win import shim
+        model_mod, cleanup = self._load_model_with_qt_fallback()
+        self.addCleanup(cleanup)
+        Model = model_mod.Model
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            eng = root / 'engine'
+            (eng / 'scripts').mkdir(parents=True)
+            (eng / 'scripts' / 'build_ipa_from_nsp.py').write_text("p.add_argument('--work-dir')\n", encoding='utf-8')
+            (eng / 'dm' / 'tools' / 'nx_extract').mkdir(parents=True)
+            (eng / 'dm' / 'tools' / 'nx_extract' / 'Program.cs').write_text('', encoding='utf-8')
+
+            roms = root / 'roms'
+            roms.mkdir()
+            base_nsp = roms / 'Super Mario [010015100B514000][v0].nsp'
+            dup_base = roms / 'Super Mario Copy [010015100B514000][v0].nsp'
+            upd_old = roms / 'Super Mario [010015100B514800][v65536].nsp'
+            upd_new = roms / 'Super Mario [010015100B514800][v131072].nsp'
+            dlc_nsp = roms / 'Super Mario DLC [010015100B515001][v0].nsp'
+            other_base = roms / 'Zelda [01007EF00011E000][v0].nsp'
+            other_upd = roms / 'Zelda [01007EF00011E800][v65536].nsp'
+            for f in (base_nsp, dup_base, upd_old, upd_new, dlc_nsp, other_base, other_upd):
+                f.write_bytes(b'pkg')
+
+            keys_f = root / 'prod.keys'
+            keys_f.write_bytes(b'keys')
+            out_dir = root / 'out'
+            out_dir.mkdir()
+
+            seen_cmds: list[list[str]] = []
+
+            def fake_spawn(cmd, **_kw):
+                seen_cmds.append([str(c) for c in cmd])
+                return mock.Mock(stdout=[], returncode=1)
+
+            with (
+                mock.patch.object(Model, 'check_deps', lambda self: None),
+                mock.patch.object(lib, 'default_state_dir', lambda: root / 'state'),
+                mock.patch.object(model_mod.pu, 'find_python', return_value=(sys.executable, True, '3.12')),
+                mock.patch.object(model_mod.pu, 'IS_WIN', True),
+                mock.patch.object(model_mod.pu, 'no_window_kwargs', return_value={}),
+                mock.patch.object(shim, 'build_env', side_effect=lambda env, **_kw: env),
+                mock.patch.object(shim, 'verify_shim', return_value=(True, '')),
+                mock.patch.object(model_mod.threading, 'Thread', side_effect=lambda *, target, daemon: mock.Mock(start=target)),
+                mock.patch.object(model_mod.subprocess, 'Popen', side_effect=fake_spawn),
+            ):
+                m = Model()
+                logged: list[str] = []
+                m.logAppended.connect(logged.append)
+                m.repo_path = str(eng)
+                m.base_path = str(base_nsp)
+                m.keys_path = str(keys_f)
+                m.out_dir = str(out_dir)
+                m.target = 'ios'
+                m.ipa_kind = 'oneGame'
+                m.start_build()
+
+                build_cmds = [c for c in seen_cmds if '--progress' in c]
+                self.assertEqual(len(build_cmds), 1)
+                cmd = build_cmds[0]
+                expected_stage = out_dir / '010015100B514000_build' / 'staging'
+                self.assertIn(str(expected_stage), cmd)
+                staged_names = {p.name for p in expected_stage.iterdir()}
+                self.assertEqual(
+                    staged_names,
+                    {
+                        base_nsp.name,
+                        upd_new.name,
+                        dlc_nsp.name,
+                    },
+                )
+                self.assertIn(m.t('msg.stagedFromSharedFolder', base_nsp.name), ''.join(logged))
+
+    def test_build_app_one_game_ipa_packs_pso_and_gates_aoc_on_dm_full_romfs(self) -> None:
+        import types
+        from nspb_qt.win import build_app, toolchain as tc
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = root / 'engine'
+            tid = '010015100B514000'
+            gd = repo / 'dm' / 'games' / tid
+            gd.mkdir(parents=True)
+            (gd / 'game.tsv').write_text('modules\tmain\n', encoding='utf-8')
+            for tsv in ('shader_map.tsv', 'pso_manifest.tsv', 'c1_full.tsv', 'cb_extent.tsv'):
+                (gd / tsv).write_text('', encoding='utf-8')
+            (repo / 'dm' / 'gfx' / 'nvn').mkdir(parents=True)
+            (repo / 'dm' / 'gfx' / 'nvn' / 'dmsh_chain.h').write_text('#define DMSH_CHAIN "v0"\n', encoding='utf-8')
+            (repo / 'dm' / 'ios' / 'Sources').mkdir(parents=True)
+            (repo / 'dm' / 'ios' / 'tools').mkdir(parents=True)
+            (repo / 'dm' / 'host').mkdir(parents=True)
+            (repo / 'dm' / 'host' / 'main.c').write_text('int main(){return 0;}\n', encoding='utf-8')
+
+            w = root / 'work'
+            patched = w / 'patched'
+            patched.mkdir(parents=True)
+            (patched / 'main.patched.bin').write_bytes(b'x')
+            (patched / 'main.fixups.tsv').write_text('', encoding='utf-8')
+            romfs = w / 'extract' / 'v0' / 'RomFS.img'
+            romfs.parent.mkdir(parents=True)
+            romfs.write_bytes(self._make_dmromfs1_image(mask='USen JPja\n'))
+            msl_ios = w / 'msl_ios'
+            (msl_ios / 'b-v0').mkdir(parents=True)
+            aoc = w / 'aoc'
+            aoc.mkdir(parents=True)
+            (aoc / '0.img').write_bytes(b'dlc0')
+            pso_dir = w / 'pso_out'
+            pso_dir.mkdir(parents=True)
+            (pso_dir / 'archive.bin').write_bytes(b'pso')
+
+            sdk = root / 'sdk'
+            sdk.mkdir()
+            clang = root / 'clang'
+            clang.write_bytes(b'x')
+            lld = root / 'lld' / 'ld64.lld'
+            lld.parent.mkdir()
+            lld.write_bytes(b'x')
+            std_font = root / 'std.ttf'
+            std_font.write_bytes(b'ttf')
+            letter_font = root / 'letter.ttf'
+            letter_font.write_bytes(b'ttf')
+
+            fake_gm = types.ModuleType('game')
+            fake_gm._nspb_patched = True
+
+            class _FakeProf:
+                dir = str(gd)
+
+                @staticmethod
+                def get(k: str, default: str = '') -> str:
+                    return {
+                        'package': 'v0',
+                        'modules': 'main',
+                        'romfs_marker': 'System/RegionLangMask.txt',
+                        'ipa': 'out.ipa',
+                        'zip_store': '',
+                    }.get(k, default)
+
+                @staticmethod
+                def modules_in(_p: Path) -> list[str]:
+                    return ['main']
+
+            fake_gm.load = lambda _g: _FakeProf()
+
+            def fake_py(script, *args, **_kw):
+                sname = Path(script).name
+                if sname == 'game.py' and len(args) >= 3 and args[0] == 'header':
+                    Path(args[2]).write_text('#define DM_GAME_PSO_MTL4 0\n', encoding='utf-8')
+                    return ''
+                if sname == 'gen_embed.py':
+                    Path(args[1]).write_text('.text\n', encoding='utf-8')
+                    return ''
+                if sname == 'settings.py':
+                    Path(args[3]).write_text('{"schema":1,"settings":[]}', encoding='utf-8')
+                    return 'launcher.json'
+                return ''
+
+            font_calls: list[tuple[Path, Path, Path, Path]] = []
+
+            def fake_shared_fonts(repo_arg: Path, out_dir: Path, font_arg: Path, letter_arg: Path) -> None:
+                font_calls.append((repo_arg, out_dir, font_arg, letter_arg))
+                for fname in ('standard.ttf', 'chinese_simplified.ttf', 'chinese_simplified_ext.ttf',
+                              'chinese_traditional.ttf', 'korean.ttf', 'nintendo_ext.ttf'):
+                    (out_dir / fname).write_bytes(b'ttf')
+
+            pack_calls: list[list[str]] = []
+            identity_line = (b'DMROMFSID1 title=010015100B514000 version=1.0 '
+                             b'build=v0 size=123 index=0123456789abcdef')
+
+            def fake_subproc_run(cmd, *_a, **_kw):
+                cmd_list = [str(c) for c in cmd]
+                if any(c.endswith('romfs_image.py') for c in cmd_list):
+                    return subprocess.CompletedProcess(cmd_list, 0, identity_line + identity_eol, b'')
+                if any(c.endswith('pack_ipa.py') for c in cmd_list):
+                    pack_calls.append(cmd_list)
+                    Path(cmd_list[2]).write_bytes(b'ipa')
+                    return subprocess.CompletedProcess(cmd_list, 0, 'ok', '')
+                return subprocess.CompletedProcess(cmd_list, 0, '', '')
+
+            out_ipa = root / 'out.ipa'
+            base_env = {
+                'NSPB_REPO': str(repo),
+                'GAME': tid,
+                'W': str(w),
+                'PATCHED': str(patched),
+                'ROMFS': str(romfs),
+                'DM_DISPLAY_NAME': 'Super Mario',
+                'MSL_IOS': str(msl_ios),
+                'AOC': str(aoc),
+                'DM_FULL_ROMFS': '',
+                'DM_FRAMEWORK_ONLY': '',
+            }
+
+            for full_val, identity_eol in (('', b'\r\n'), ('', b'\n'), ('1', b'\r\n')):
+                pack_calls.clear()
+                env_cur = dict(base_env, DM_FULL_ROMFS=full_val)
+                with (
+                    mock.patch.dict(os.environ, env_cur, clear=False),
+                    mock.patch.dict(sys.modules, {'game': fake_gm}),
+                    mock.patch.object(tc, 'llvm_tool', return_value=clang),
+                    mock.patch.object(tc, 'ensure_ld64_lld', return_value=(lld, '')),
+                    mock.patch.object(tc, 'ios_sdk', return_value=sdk),
+                    mock.patch.object(tc, 'sdk_version', return_value=('26.0', '23A344')),
+                    mock.patch.object(tc, 'std_font', return_value=std_font),
+                    mock.patch.object(tc, 'letter_font', return_value=letter_font),
+                    mock.patch.multiple(
+                        build_app,
+                        py=fake_py,
+                        _build_shared_fonts=fake_shared_fonts,
+                        romfs_has=lambda *_a, **_kw: True,
+                        shader_lib_has=lambda *_a, **_kw: True,
+                        host_sources=lambda *_a, **_kw: ([], []),
+                        framework_list=lambda *_a, **_kw: ['Foundation'],
+                        compat_rt_needed=lambda *_a, **_kw: False,
+                        compile_all=lambda *_a, **_kw: [],
+                        link=lambda *_a, **_kw: None,
+                    ),
+                    mock.patch.object(build_app, 'build_pso_archive', return_value=pso_dir) as spy_pso,
+                    mock.patch.object(build_app.fix_ipa_modes, 'fix', return_value='ok'),
+                    mock.patch.object(build_app.subprocess, 'run', side_effect=fake_subproc_run),
+                ):
+                    rc = build_app.main([str(out_ipa)])
+                self.assertEqual(rc, 0)
+                spy_pso.assert_called_once()
+                self.assertEqual(len(pack_calls), 1)
+                pack_cmd = pack_calls[0]
+                self.assertIn(f'Payload/DmIOS.app/pso={pso_dir}', pack_cmd)
+                self.assertNotIn('_bp.metallib', pack_cmd)
+                if full_val:
+                    self.assertIn(f'Payload/DmIOS.app/aoc={aoc}', pack_cmd)
+                else:
+                    self.assertFalse(any(arg.startswith('Payload/DmIOS.app/aoc=') for arg in pack_cmd))
+                    identity_map = next(arg for arg in pack_cmd
+                                        if arg.startswith('Payload/DmIOS.app/romfs.id='))
+                    identity_file = Path(identity_map.split('=', 1)[1])
+                    # iOS's romfs_id_parse stops at LF, so a trailing CR makes
+                    # strtoull reject the index and reports ROMFS_ID_BAD (2).
+                    self.assertEqual(identity_file.read_bytes(), identity_line + b'\n')
+                self.assertTrue(font_calls)
+                self.assertEqual(font_calls[-1][2], std_font)
+                self.assertEqual(font_calls[-1][3], letter_font)
+                font_calls.clear()
+
+    def test_build_shared_fonts_passes_explicit_std_and_letter_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            tools = root / 'dm/tools'
+            tools.mkdir(parents=True)
+            calls: list[tuple[str, str, str]] = []
+            (tools / 'make_shared_fonts.py').write_text(
+                'def build(out_dir, src, letters):\n'
+                '    import os\n'
+                '    os.makedirs(out_dir, exist_ok=True)\n'
+                '    _RECORD.append((out_dir, src, letters))\n',
+                encoding='utf-8',
+            )
+            out_dir = root / 'out_fonts'
+            std_font = root / 'win_std.ttf'
+            letter_font = root / 'win_letter.ttf'
+            saved = sys.modules.pop('make_shared_fonts', None)
+            try:
+                import importlib
+                sys.path.insert(0, str(tools))
+                mod = importlib.import_module('make_shared_fonts')
+                mod._RECORD = calls
+                build_app._build_shared_fonts(root, out_dir, std_font, letter_font)
+                self.assertEqual(calls, [(str(out_dir), str(std_font), str(letter_font))])
+            finally:
+                sys.modules.pop('make_shared_fonts', None)
+                if saved is not None:
+                    sys.modules['make_shared_fonts'] = saved
+                if str(tools) in sys.path:
+                    sys.path.remove(str(tools))
+
+
+class UnrealInlineShadersWinTest(unittest.TestCase):
+    """Issue #831: Unreal inline-shader games (OCTOPATH TRAVELER I & II, Yoshi's Crafted World)
+    must not fail upfront on `build_mac_host` or abort on false-positive `oodle_supposed` probes."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from nspb_qt.win import driver as _drv
+        cls.driver = _drv
+        cls.repo = QT.parent / 'engine'
+        cls.mod = _drv.load_upstream(cls.repo)
+        _drv.patch(cls.mod, cls.repo)
+
+    def test_split_shaders_defers_oodle_for_ue_legacy_and_keeps_for_oodle_packs(self) -> None:
+        recorded: list[tuple] = []
+        orig_under = self.mod._nspb_orig_split_shaders
+
+        def fake_orig(py_, repo_, roms, mains, pkg, env, logs, g,
+                      provisional=False, oodle=None, *a, **kw):
+            recorded.append((oodle, dict(env), provisional))
+            if oodle is not None:
+                oodle()
+            return 'pkg-key'
+
+        self.mod._nspb_orig_split_shaders = fake_orig
+        self.driver.patch(self.mod, self.repo)
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                romfs = root / 'romfs'
+                romfs.mkdir(parents=True)
+                import struct
+                exefs = root / 'ExeFS'
+                exefs.mkdir(parents=True)
+                main_nso = exefs / 'main'
+                nso_buf = bytearray(0x140)
+                nso_buf[:4] = b'NSO0'
+                struct.pack_into('<III', nso_buf, 0x30, 0x100, 0, 0x40)
+                struct.pack_into('<I4siqQqQqQ', nso_buf, 0x104, 8, b'MOD0', 8, 6, 0x40, 5, 0x40, 0, 0)
+                main_nso.write_bytes(bytes(nso_buf))
+
+                # 1) ue_legacy game (no non-Unreal Oodle containers in romfs): oodle callback
+                #    must be dropped so build_mac_host is not called upfront, and
+                #    DM_EXPERIMENTAL_BUILDER is cleared.
+                called = False
+
+                def boom_oodle():
+                    nonlocal called
+                    called = True
+                    return {'DM_OODLE_HOST': str(self.mod.build_mac_host(
+                        self.repo, Path('out'), {}, Path('logs'), None))}
+
+                res = self.mod.split_shaders(
+                    Path(sys.executable), self.repo, [romfs], [main_nso],
+                    Path('pkg'), {'DM_EXPERIMENTAL_BUILDER': '1'}, Path('logs'), None,
+                    provisional=False, oodle=boom_oodle)
+                self.assertEqual(res, 'pkg-key')
+                self.assertFalse(called, 'ue_legacy must not call oodle() before shader_split.py runs')
+                self.assertIsNone(recorded[-1][0])
+                self.assertNotIn('DM_EXPERIMENTAL_BUILDER', recorded[-1][1])
+
+                # Verify against the real `dm/games/profile_guess.py` module (`self.mod.pg`),
+                # which has `build_sources` (returning a dict with `'oodle_packs'`) and no
+                # standalone `oodle_packs` function (regression for issue #989).
+                self.assertFalse(hasattr(self.mod.pg, 'oodle_packs'))
+
+                # 2) Same check when `pg.build_sources` ran right before `split_shaders`
+                #    with the matching RomFS path (as in `scripts/build_ipa_from_nsp.py:main`).
+                orig_bs = self.mod.pg._nspb_orig_build_sources
+                self.mod.pg._nspb_orig_build_sources = lambda *_a, **_kw: {
+                    'oodle_packs': (False, ''),
+                    'ue_legacy': (True, '2 Unreal pak(s)'),
+                }
+                self.driver.patch(self.mod, self.repo)
+                try:
+                    src = self.mod.pg.build_sources(exefs, romfs, ['main'])
+                    self.assertTrue(src['ue_legacy'][0])
+                    res2 = self.mod.split_shaders(
+                        Path(sys.executable), self.repo, [romfs], [main_nso],
+                        Path('pkg'), {'DM_EXPERIMENTAL_BUILDER': '1'}, Path('logs'), None,
+                        provisional=False, oodle=boom_oodle)
+                    self.assertEqual(res2, 'pkg-key')
+                    self.assertFalse(called)
+                    self.assertIsNone(recorded[-1][0])
+                finally:
+                    self.mod.pg._nspb_orig_build_sources = orig_bs
+                    self.driver.patch(self.mod, self.repo)
+
+                # 3) Cache key mismatch across games: if an earlier game recorded
+                #    `oodle_packs=True` under `other_romfs`, building a `ue_legacy` game at
+                #    `romfs` must not pick up the other game's cached `True` value.
+                other_romfs = root / 'other_game' / 'romfs'
+                orig_bs = self.mod.pg._nspb_orig_build_sources
+                self.mod.pg._nspb_orig_build_sources = lambda _exe, r, *_a, **_kw: {
+                    'oodle_packs': (Path(r) == other_romfs, ''),
+                    'ue_legacy': (True, '2 Unreal pak(s)'),
+                }
+                self.driver.patch(self.mod, self.repo)
+                try:
+                    other_src = self.mod.pg.build_sources(exefs, other_romfs, ['main'])
+                    self.assertTrue(other_src['oodle_packs'][0])
+                    res_mismatch = self.mod.split_shaders(
+                        Path(sys.executable), self.repo, [romfs], [main_nso],
+                        Path('pkg'), {'DM_EXPERIMENTAL_BUILDER': '1'}, Path('logs'), None,
+                        provisional=False, oodle=boom_oodle)
+                    self.assertEqual(res_mismatch, 'pkg-key')
+                    self.assertFalse(
+                        called,
+                        'A mismatched cache key from another game must not force oodle()',
+                    )
+                    self.assertIsNone(recorded[-1][0])
+                finally:
+                    self.mod._nspb_build_sources_oodle = {}
+                    self.mod.pg._nspb_orig_build_sources = orig_bs
+                    self.driver.patch(self.mod, self.repo)
+
+                # 4) Non-Unreal Oodle archive game (e.g. Trinity `ONEPACK\0` `.trpfs` in romfs):
+                #    `pg.build_sources` reports `oodle_packs=True`, keeping `oodle` and resolving
+                #    `build_mac_host` to `oodle_emu.py` inside the `oodle` callback context.
+                trpfs = romfs / 'arc' / 'data.trpfs'
+                trpfs.parent.mkdir(parents=True, exist_ok=True)
+                trpfs.write_bytes(b'ONEPACK\x00' + b'\x00' * 32)
+                res_oodle = self.mod.split_shaders(
+                    Path(sys.executable), self.repo, [romfs], [main_nso],
+                    Path('pkg'), {}, Path('logs'), None,
+                    provisional=False, oodle=boom_oodle)
+                self.assertEqual(res_oodle, 'pkg-key')
+                self.assertTrue(called)
+                self.assertIsNotNone(recorded[-1][0])
+                self.assertTrue(recorded[-1][0]()['DM_OODLE_HOST'].endswith('oodle_emu.py'))
+        finally:
+            self.mod._nspb_orig_split_shaders = orig_under
+            self.driver.patch(self.mod, self.repo)
+
+    def test_run_ipa_aborts_on_oodle_log_even_when_provisional_and_cleans_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            partial = root / 'pkg.partial'
+            (partial / 'pkg').mkdir(parents=True)
+            (partial / 'tables').mkdir(parents=True)
+            log = root / 'shader_split.log'
+            script = root / 'fake_split.py'
+            script.write_text(
+                'import sys\n'
+                'print("[RED] /pakchunk0-Switch.pak#a.uexp: Oodle- or LZ5-compressed game files: '
+                'set DM_OODLE_HOST (the Mac host) and DM_OODLE_MODULES (its shaders are left out)", '
+                'flush=True)\n'
+                'print("[RED] 1 file(s) could not be read, their shaders are left out", flush=True)\n'
+                'print("shaders: 12 (vertex 6, pixel 6); sources main 12; compute shader answers 0 rows", '
+                'flush=True)\n',
+                encoding='utf-8')
+
+            orig_up = self.driver._UPSTREAM_RUN
+
+            def fake_upstream_run(cmd, log_path, *a, **kw):
+                # Run the stand-in script while keeping `dm/gfx/tools/shader_split.py` in cmd[1]
+                return orig_up([sys.executable, str(script), *cmd[2:]], log_path, *a, **kw)
+
+            self.driver._UPSTREAM_RUN = fake_upstream_run
+            try:
+                with self.assertRaises(self.mod.BuildError) as ctx:
+                    self.mod.run(
+                        [sys.executable, str(self.repo / 'dm/gfx/tools/shader_split.py'),
+                         'romfs', 'main', str(partial / 'pkg'), str(partial / 'tables/shader_map.tsv')],
+                        log)
+                self.assertIn('Oodle or LZ5 compression', str(ctx.exception))
+                self.assertIn('Mac host', str(ctx.exception))
+                self.assertFalse(partial.exists(), 'pkg.partial must be cleaned up on Oodle failure')
+            finally:
+                self.driver._UPSTREAM_RUN = orig_up
+
+    def test_octopath2_inline_shaders_ignore_false_positive_oodle_probe_without_host(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            old_local = os.environ.get('LOCALAPPDATA')
+            os.environ['LOCALAPPDATA'] = td
+            try:
+                env = shim.build_env(python_exe=sys.executable)
+                sd = shim.shim_dir()
+                sc = (sd / 'sitecustomize.py').read_text(encoding='utf-8').replace(
+                    "if os.name == 'nt'", "if True", 1)
+                (sd / 'sitecustomize.py').write_text(sc, encoding='utf-8')
+                env.pop('DM_OODLE_HOST', None)
+                env.pop('DM_OODLE_MODULES', None)
+                env['DM_GAME'] = '0100A3501946E000'
+                probe = (
+                    'import os, runpy, struct, sys, types, zlib\n'
+                    'try:\n'
+                    '    import lz4.block\n'
+                    'except ModuleNotFoundError:\n'
+                    '    _m = types.ModuleType("lz4"); _b = types.ModuleType("lz4.block")\n'
+                    '    _b.decompress = lambda *a, **kw: b""; _m.block = _b\n'
+                    '    sys.modules["lz4"] = _m; sys.modules["lz4.block"] = _b\n'
+                    f'repo = {str(self.repo)!r}\n'
+                    'sys.path.insert(0, os.path.join(repo, "dm/gfx/tools"))\n'
+                    'import uepak\n'
+                    # Build a valid NVN graphics vertex shader + LSLG record
+                    'code = bytes.fromhex("78563412") + bytes(0x2c) + struct.pack("<I", 1 << 10) + bytes(0x4c)\n'
+                    'ctl = bytearray(0x880)\n'
+                    'ctl[:4] = bytes.fromhex("34127698")\n'
+                    'struct.pack_into("<I", ctl, 0x20, 0x880)\n'
+                    'struct.pack_into("<I", ctl, 0x704, len(code))\n'
+                    'lslg = (b"LSLGSV" + bytes(10) + struct.pack("<I", len(code)) + code '
+                    '+ struct.pack("<I", len(ctl)) + bytes(ctl) + bytes(24))\n'
+                    'z = zlib.compress(lslg)\n'
+                    # OCTOPATH TRAVELER II export-list false positive for uepak.shader_map_entries:
+                    # count=1, 20-byte hash, count=1, length=8, Oodle Selkie header 0x8c 0x0b, raw=30650, freq=0
+                    'fp = (struct.pack("<I", 1) + b"\\x11" * 20 + struct.pack("<I", 1) '
+                    '+ struct.pack("<I", 8) + b"\\x8c\\x0b\\x00\\x00\\x01\\x02\\x03\\x04" '
+                    '+ struct.pack("<IB", 30650, 0))\n'
+                    'uexp = b"\\x00" * 16 + struct.pack("<I", len(z)) + z + b"\\x00" * 16 + fp\n'
+                    'assert len(uepak.shader_map_entries(uexp)) == 1\n'
+                    # 1) Test via runpy.run_path (where shader_split.py is not imported by module name)
+                    'ns = runpy.run_path(os.path.join(repo, "dm/gfx/tools/shader_split.py"), run_name="not_main")\n'
+                    'out_ns = []\n'
+                    'ns["ue_inline_shaders"](uexp, "/Majesty-Switch.pak#Test.uexp", out_ns)\n'
+                    'assert len(out_ns) == 1 and out_ns[0][1] == "vs", out_ns\n'
+                    # 2) Test via regular import shader_split
+                    'import shader_split\n'
+                    'out = []\n'
+                    'shader_split.ue_inline_shaders(uexp, "/Majesty-Switch.pak#Test.uexp", out)\n'
+                    'assert len(out) == 1 and out[0][1] == "vs", out\n'
+                    'print("OK", len(out_ns), len(out))\n'
+                )
+                r = subprocess.run([sys.executable, '-c', probe],
+                                   env=env, capture_output=True, text=True, timeout=60)
+                self.assertEqual(r.returncode, 0, f'stdout={r.stdout}\nstderr={r.stderr}')
+                self.assertIn('OK 1 1', r.stdout)
+            finally:
+                if old_local is None:
+                    os.environ.pop('LOCALAPPDATA', None)
+                else:
+                    os.environ['LOCALAPPDATA'] = old_local
+
+
+class WinToolchainInstallWiringTest(unittest.TestCase):
+    """End-to-end wiring of Model._install_win against nspb_qt.win.toolchain and fetch.
+
+    Regression for the LLVM-MinGW onboarding crash where Model._install_win referenced
+    `wtc.LLVM_ASSETS` instead of `wtc.LLVM_MINGW_ASSETS`, raising AttributeError before
+    `fetch.install_llvm` could start. Runs with or without PySide6 installed in CI.
+    """
+
+    def test_every_wtc_attribute_in_model_exists_on_win_toolchain(self) -> None:
+        import ast
+        src = (QT / 'nspb_qt' / 'model.py').read_text(encoding='utf-8')
+        tree = ast.parse(src)
+        attrs = {
+            node.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == 'wtc'
+        }
+        self.assertIn('LLVM_MINGW_ASSETS', attrs)
+        self.assertNotIn('LLVM_ASSETS', attrs)
+        for attr in sorted(attrs):
+            self.assertTrue(
+                hasattr(tc, attr),
+                f'model.py accesses wtc.{attr}, which does not exist in nspb_qt.win.toolchain',
+            )
+
+    def test_install_win_llvm_and_siblings_run_without_attribute_error(self) -> None:
+        import ast
+        from nspb_qt.i18n import Lang
+        from nspb_qt.l10n import t as l10n_t
+        from nspb_qt.win import fetch as wf, sdk_fetch as sf
+
+        src = (QT / 'nspb_qt' / 'model.py').read_text(encoding='utf-8')
+        tree = ast.parse(src)
+        cls_node = next(
+            n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'Model'
+        )
+        wanted = {
+            '_install_win',
+            '_stage_progress_logger',
+            '_progress_logger',
+            '_set_dep_progress',
+            '_clear_installing',
+            '_record_install_failure',
+            '_classify_install_failure',
+        }
+        methods = [
+            n for n in cls_node.body
+            if isinstance(n, ast.FunctionDef) and n.name in wanted
+        ]
+        mod_node = ast.fix_missing_locations(ast.Module(body=methods, type_ignores=[]))
+
+        class _SyncThread:
+            def __init__(self, target=None, daemon=None):
+                self._target = target
+
+            def start(self):
+                if self._target:
+                    self._target()
+
+        class _Sig:
+            def emit(self):
+                pass
+
+        ns: dict = {
+            'Path': Path,
+            'shutil': shutil,
+            'threading': type('T', (), {'Thread': _SyncThread}),
+            '__package__': 'nspb_qt',
+        }
+        exec(compile(mod_node, str(QT / 'nspb_qt' / 'model.py'), 'exec'), ns)
+
+        class _Harness:
+            _install_win = ns['_install_win']
+            _stage_progress_logger = ns['_stage_progress_logger']
+            _progress_logger = ns['_progress_logger']
+            _set_dep_progress = ns['_set_dep_progress']
+            _clear_installing = ns['_clear_installing']
+            _record_install_failure = ns['_record_install_failure']
+            _classify_install_failure = ns['_classify_install_failure']
+
+            def __init__(self):
+                self.lang = Lang('en')
+                self.logs: list[str] = []
+                self.deps: list = []
+                self.depsChanged = _Sig()
+                self.python_path = ''
+
+            def log(self, msg: str) -> None:
+                self.logs.append(str(msg))
+
+            def t(self, key: str, *args: object) -> str:
+                return l10n_t(key, self.lang, *args)
+
+            def check_deps(self) -> None:
+                pass
+
+            def _make_venv(self, py: str, dep=None) -> bool:
+                return True
+
+        class _Dep:
+            def __init__(self, dep_id: str, title_key: str):
+                self.id = dep_id
+                self.title_key = title_key
+                self.installing = False
+                self.install_stage = ''
+                self.install_detail = ''
+                self.install_pct = None
+                self.queue_index = 0
+                self.last_error = ''
+                self.fix_hint = ''
+
+        h = _Harness()
+        llvm_dep = _Dep('llvm', 'dep.llvm')
+        dotnet_dep = _Dep('dotnet', 'dep.dotnet')
+        py_dep = _Dep('python', 'dep.python')
+        zstd_dep = _Dep('zstd', 'dep.zstd')
+        sdk_dep = _Dep('ios_sdk', 'dep.iossdk')
+        h.deps = [llvm_dep, dotnet_dep, py_dep, zstd_dep, sdk_dep]
+
+        seen_llvm_details: list[str] = []
+
+        def fake_install_llvm(log=None, progress=None, unpack_progress=None, **_kw):
+            if progress:
+                progress(50 * 1048576, 181 * 1048576)
+                seen_llvm_details.append(llvm_dep.install_detail)
+            if unpack_progress:
+                unpack_progress(500 * 1048576, 1000 * 1048576)
+                seen_llvm_details.append(llvm_dep.install_detail)
+            return Path('C:/tools/llvm-mingw-20261020')
+
+        with (
+            mock.patch.object(wf, 'install_llvm', side_effect=fake_install_llvm) as spy_llvm,
+            mock.patch.object(wf, 'install_dotnet', return_value=Path('C:/tools/dotnet')),
+            mock.patch.object(wf, 'install_python', return_value=Path('C:/tools/python')),
+            mock.patch.object(wf, 'install_zstd', return_value=Path('C:/tools/zstd/zstd.exe')),
+            mock.patch.object(sf, 'install_sdk', return_value=Path('C:/sdks/iPhoneOS27.2.sdk')),
+        ):
+            for dep, target in (
+                (llvm_dep, 'llvm'),
+                (dotnet_dep, 'dotnet'),
+                (py_dep, 'python'),
+                (zstd_dep, 'zstd'),
+                (sdk_dep, 'ios_sdk'),
+            ):
+                h._install_win(dep, target)
+                self.assertEqual(dep.last_error, '', f'{target} failed with {dep.last_error}')
+                self.assertFalse(dep.installing)
+
+        spy_llvm.assert_called_once()
+        expected_zip = tc.LLVM_MINGW_ASSETS['AMD64']['name']
+        self.assertEqual(len(seen_llvm_details), 2)
+        self.assertTrue(all(expected_zip in d for d in seen_llvm_details), seen_llvm_details)
+
+        # Verify 0% and 100% are throttled across thousands of small zip entries (no signal storm)
+        emit_count = [0]
+        orig_emit = h.depsChanged.emit
+        h.depsChanged.emit = lambda: (emit_count.__setitem__(0, emit_count[0] + 1), orig_emit())
+        h.logs.clear()
+        up_cb = h._stage_progress_logger(llvm_dep, 'Unpack', expected_zip, phase='unpack')
+        grand = 1000 * 1048576
+        for i in range(500):
+            up_cb(i * 1024, grand)  # all 500 calls are 0%
+        self.assertEqual(emit_count[0], 1, 'repeated 0% callbacks must emit only once')
+        for i in range(50):
+            up_cb(grand, grand)     # all 50 calls are 100%
+        self.assertEqual(emit_count[0], 2, 'repeated 100% callbacks must emit only once')
+        pct100_logs = [ln for ln in h.logs if 'Unpack 100%' in ln]
+        self.assertEqual(len(pct100_logs), 1, pct100_logs)
+
+    def test_install_python_repairs_or_unpacks_nupkg_when_msi_already_registered(self) -> None:
+        """When Python 3.12 is already registered on Windows, `install_python` must try `/repair`
+        first, and if `TargetDir` was registered elsewhere (or MSI exits 1603/1638), unpack the
+        standalone NuGet archive into `target` without running `/uninstall` on the user's Python.
+        """
+        from nspb_qt.win import fetch as wf
+
+        nupkg_asset = tc.PYTHON_NUPKG_ASSET
+        self.assertEqual(len(nupkg_asset['sha256']), 64)
+        self.assertIn(tc.PYTHON_VERSION, nupkg_asset['url'])
+        self.assertGreater(nupkg_asset['size'], 10_000_000)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            exe = root / 'downloads' / tc.PYTHON_ASSET['name']
+            exe.parent.mkdir(parents=True)
+            exe.write_bytes(b'MZ')
+
+            nupkg = root / 'downloads' / nupkg_asset['name']
+            with zipfile.ZipFile(nupkg, 'w') as zf:
+                zf.writestr('python.nuspec', '<package/>')
+                zf.writestr('tools/python.exe', b'MZ-standalone')
+                zf.writestr('tools/Lib/venv/__init__.py', '# venv\n')
+                zf.writestr('tools/Lib/ensurepip/__init__.py', '# ensurepip\n')
+
+            # Case 1: initial install exits 0 without creating python.exe -> /repair succeeds
+            cmds_case1: list[list[str]] = []
+
+            def run_case1(cmd, **_kw):
+                cmds_case1.append([str(c) for c in cmd])
+                return subprocess.CompletedProcess(cmd, 0, '', '')
+
+            # _runs_quiet sequence: [False (initial check), False (after install), True (after /repair)]
+            with mock.patch.object(wf, 'download', return_value=exe), \
+                 mock.patch.object(wf.subprocess, 'run', side_effect=run_case1), \
+                 mock.patch.object(tc, '_runs_quiet', side_effect=[False, False, True]):
+                out1 = wf.install_python(dest=root, log=lambda _s: None)
+            self.assertEqual(out1, root / f'python-{tc.PYTHON_VERSION}')
+            self.assertGreaterEqual(len(cmds_case1), 2)
+            self.assertNotIn('/repair', cmds_case1[0])
+            self.assertIn('/repair', cmds_case1[1])
+
+            # Case 2: /repair still leaves target missing (registered at another path) -> unpacks
+            # standalone NuGet archive into target and never invokes `/uninstall`
+            cmds_case2: list[list[str]] = []
+
+            def run_case2(cmd, **_kw):
+                cmds_case2.append([str(c) for c in cmd])
+                return subprocess.CompletedProcess(cmd, 0, '', '')
+
+            def fake_download(url, dest_path, *_a, **_kw):
+                return nupkg if 'nuget' in str(url) or str(dest_path).endswith('.nupkg') else exe
+
+            # _runs_quiet: [False (initial), False (after install), False (after /repair), True (after nupkg unpack)]
+            with mock.patch.object(wf, 'download', side_effect=fake_download), \
+                 mock.patch.object(wf.subprocess, 'run', side_effect=run_case2), \
+                 mock.patch.object(tc, '_runs_quiet', side_effect=[False, False, False, True]):
+                out2 = wf.install_python(dest=root, log=lambda _s: None)
+            self.assertEqual(out2, root / f'python-{tc.PYTHON_VERSION}')
+            self.assertTrue((out2 / 'python.exe').is_file())
+            self.assertTrue((out2 / 'Lib' / 'venv' / '__init__.py').is_file())
+            self.assertTrue(any('/repair' in c for c in cmds_case2), cmds_case2)
+            self.assertFalse(any('/uninstall' in c for c in cmds_case2), cmds_case2)
+            self.assertTrue(any('ensurepip' in c for c in cmds_case2), cmds_case2)
+
+            # Case 2b: unsafe path in nupkg is rejected and cleans up pre-existing partial target
+            bad_nupkg = root / 'downloads' / 'bad.nupkg'
+            with zipfile.ZipFile(bad_nupkg, 'w') as zf:
+                zf.writestr('tools/../evil.exe', b'MZ')
+            target_bad = root / 'bad-target'
+            target_bad.mkdir(parents=True)
+            (target_bad / 'partial.dll').write_bytes(b'MZ-partial')
+            self.assertFalse(wf._unpack_python_nupkg(bad_nupkg, root, target_bad, lambda _s: None))
+            self.assertFalse(target_bad.exists())
+
+            # Case 3: _clean_python_env strips PyInstaller _MEIPASS, frozen PYTHONHOME, VIRTUAL_ENV, and PIP_USER
+            with mock.patch.object(sys, 'frozen', True, create=True), \
+                 mock.patch.object(sys, '_MEIPASS', r'C:\App\_internal', create=True), \
+                 mock.patch.dict(os.environ, {
+                     '_MEIPASS': r'C:\App\_internal',
+                     'PYTHONHOME': r'C:\App\_internal',
+                     'PYTHONPATH': r'C:\App\_internal;C:\UserLib',
+                     'VIRTUAL_ENV': r'C:\Users\dev\.venv',
+                     'PYTHONSTARTUP': r'C:\Users\dev\startup.py',
+                     'PIP_USER': '1',
+                     'PIP_TARGET': r'C:\CustomTarget',
+                     'PIP_REQUIRE_VIRTUALENV': 'true',
+                 }, clear=False):
+                cenv = tc._clean_python_env()
+                self.assertNotIn('_MEIPASS', cenv)
+                self.assertNotIn('PYTHONHOME', cenv)
+                self.assertNotIn('VIRTUAL_ENV', cenv)
+                self.assertNotIn('PYTHONSTARTUP', cenv)
+                self.assertNotIn('PIP_USER', cenv)
+                self.assertNotIn('PIP_TARGET', cenv)
+                self.assertNotIn('PIP_REQUIRE_VIRTUALENV', cenv)
+                self.assertEqual(cenv.get('PYTHONPATH'), r'C:\UserLib')
+
+    def test_existing_windows_python_selection_and_in_thread_fallback(self) -> None:
+        """On Windows:
+        1. System Python 3.13/3.14 without pre-installed packages is not picked as `fallback`
+           (because bundled offline wheels target cp312), so onboarding installs managed 3.12.10.
+        2. Embeddable zip (`python312._pth`) or a partial install with `Lib/` but no `Lib/venv`
+           is rejected as a venv base.
+        3. If a system Python 3.12 is picked for venv creation and `_make_venv` fails, `install_dep`
+           falls back in the same worker thread to `wf.install_python()` + `_make_venv()`.
+        """
+        import ast
+        from nspb_qt import platform_util as pu
+        from nspb_qt.i18n import Lang
+        from nspb_qt.l10n import t as l10n_t
+        from nspb_qt.win import fetch as wf
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            # System Python 3.13 without packages -> must not be returned as fallback on Windows
+            py313 = root / 'Python313' / 'python.exe'
+            py313.parent.mkdir(parents=True)
+            py313.write_bytes(b'MZ')
+            py313.chmod(0o755)
+            with mock.patch.object(pu, 'IS_WIN', True), \
+                 mock.patch.object(pu, 'python_candidates', return_value=[str(py313)]), \
+                 mock.patch.object(pu, '_python_version', return_value='3.13'), \
+                 mock.patch.object(pu, '_runs', return_value=False):
+                got_py, got_ok, got_ver = pu.find_python()
+                self.assertEqual((got_py, got_ok, got_ver), ('python', False, ''))
+                self.assertIsNone(pu.venv_base(str(py313)))
+
+            # Embeddable Python 3.12 with `python312._pth` or `python312.zip` without `Lib/` -> rejected as venv base
+            py_embed = root / 'Python312Embed' / 'python.exe'
+            py_embed.parent.mkdir(parents=True)
+            py_embed.write_bytes(b'MZ')
+            (py_embed.parent / 'python312._pth').write_text('python312.zip\n', encoding='utf-8')
+            py_embed_no_pth = root / 'Python312EmbedNoPth' / 'python.exe'
+            py_embed_no_pth.parent.mkdir(parents=True)
+            py_embed_no_pth.write_bytes(b'MZ')
+            (py_embed_no_pth.parent / 'python312.zip').write_bytes(b'PK')
+            with mock.patch.object(pu, 'IS_WIN', True):
+                self.assertFalse(pu._usable_venv_base(str(py_embed), '3.12'))
+                self.assertFalse(pu._usable_venv_base(str(py_embed_no_pth), '3.12'))
+
+                # Partial Python 3.12 with `Lib/` but missing `Lib/ensurepip` -> rejected
+                py_partial = root / 'Python312Partial' / 'python.exe'
+                (py_partial.parent / 'Lib' / 'venv').mkdir(parents=True)
+                py_partial.write_bytes(b'MZ')
+                self.assertFalse(pu._usable_venv_base(str(py_partial), '3.12'))
+                (py_partial.parent / 'Lib' / 'ensurepip').mkdir(parents=True)
+                self.assertTrue(pu._usable_venv_base(str(py_partial), '3.12'))
+
+            # WindowsApps store stub is filtered out of python_candidates() on Windows
+            store_stub = r'C:\Users\u\AppData\Local\Microsoft\WindowsApps\python.exe'
+            with mock.patch.object(pu, 'IS_WIN', True), \
+                 mock.patch.object(pu, '_which', return_value=store_stub):
+                self.assertNotIn(store_stub, pu.python_candidates())
+
+            # In-thread fallback in `install_dep` when system Python 3.12 `_make_venv` fails
+            src = (QT / 'nspb_qt' / 'model.py').read_text(encoding='utf-8')
+            tree = ast.parse(src)
+            cls_node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'Model')
+            wanted = {
+                'install_dep',
+                '_stage_progress_logger',
+                '_progress_logger',
+                '_set_dep_progress',
+                '_clear_installing',
+                '_record_install_failure',
+                '_classify_install_failure',
+            }
+            methods = [n for n in cls_node.body if isinstance(n, ast.FunctionDef) and n.name in wanted]
+            mod_node = ast.fix_missing_locations(ast.Module(body=methods, type_ignores=[]))
+
+            class _SyncThread:
+                def __init__(self, target=None, daemon=None):
+                    self._target = target
+
+                def start(self):
+                    if self._target:
+                        self._target()
+
+            ns: dict = {
+                'Path': Path,
+                'shutil': shutil,
+                'subprocess': subprocess,
+                'pu': pu,
+                'threading': type('T', (), {'Thread': _SyncThread}),
+                '__package__': 'nspb_qt',
+            }
+            exec(compile(mod_node, str(QT / 'nspb_qt' / 'model.py'), 'exec'), ns)
+
+            managed_dir = root / 'tools' / f'python-{tc.PYTHON_VERSION}'
+            managed_dir.mkdir(parents=True)
+            managed_exe = managed_dir / 'python.exe'
+            managed_exe.write_bytes(b'MZ')
+
+            make_venv_calls: list[str] = []
+
+            class _FallbackHarness:
+                install_dep = ns['install_dep']
+                _stage_progress_logger = ns['_stage_progress_logger']
+                _progress_logger = ns['_progress_logger']
+                _set_dep_progress = ns['_set_dep_progress']
+                _clear_installing = ns['_clear_installing']
+                _record_install_failure = ns['_record_install_failure']
+                _classify_install_failure = ns['_classify_install_failure']
+
+                def __init__(self):
+                    self.lang = Lang('en')
+                    self.logs: list[str] = []
+                    self.deps: list = []
+                    self.python_path = r'C:\Python312\python.exe'
+                    self.python_ver = '3.12'
+
+                def log(self, msg: str) -> None:
+                    self.logs.append(str(msg))
+
+                def t(self, key: str, *args: object) -> str:
+                    return l10n_t(key, self.lang, *args)
+
+                def _emit_deps_changed(self) -> None:
+                    pass
+
+                def check_deps(self) -> None:
+                    pass
+
+                def _make_venv(self, py: str, dep=None) -> bool:
+                    make_venv_calls.append(py)
+                    return Path(py) == managed_exe
+
+            class _PyDep:
+                def __init__(self):
+                    self.id = 'python'
+                    self.title_key = 'dep.python'
+                    self.install = [r'C:\Python312\python.exe', '-m', 'pip', 'install', 'lz4']
+                    self.installing = False
+                    self.install_stage = ''
+                    self.install_detail = ''
+                    self.install_pct = None
+                    self.queue_index = 0
+                    self.last_error = ''
+                    self.fix_hint = ''
+
+            fh = _FallbackHarness()
+            py_dep = _PyDep()
+            fh.deps = [py_dep]
+            with mock.patch.object(pu, 'IS_WIN', True), \
+                 mock.patch.object(pu, 'venv_dir', return_value=root / 'venv'), \
+                 mock.patch.object(wf, 'install_python', return_value=managed_dir) as spy_inst:
+                fh.install_dep(py_dep)
+
+            spy_inst.assert_called_once()
+            self.assertEqual(make_venv_calls, [r'C:\Python312\python.exe', str(managed_exe)])
+            self.assertEqual(fh.python_path, str(managed_exe))
+            self.assertEqual(py_dep.last_error, '')
+            self.assertFalse(py_dep.installing)
+            self.assertTrue(getattr(py_dep, '_install_done', False))
+
+
+class LoveShadersWinTest(unittest.TestCase):
+    """Offline LÖVE GLSL shader reconstruction (`love_shaders.py`) and `driver.capture_shaders`."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from nspb_qt.win import driver as _drv, love_shaders
+        cls.driver = _drv
+        cls.love_shaders = love_shaders
+        cls.repo = QT.parent / 'engine'
+        cls.mod = _drv.load_upstream(cls.repo)
+        _drv.patch(cls.mod, cls.repo)
+
+    @staticmethod
+    def _make_nso0(img: bytes | bytearray, compress: bool = True) -> bytes:
+        import struct
+        import types
+        import zlib
+        try:
+            import lz4.block
+        except ModuleNotFoundError:
+            _m = types.ModuleType('lz4')
+            _b = types.ModuleType('lz4.block')
+            _b.compress = lambda raw, **_kw: zlib.compress(raw)
+            _b.decompress = lambda blob, **_kw: zlib.decompress(blob)
+            _m.block = _b
+            sys.modules['lz4'] = _m
+            sys.modules['lz4.block'] = _b
+            lz4 = _m
+        img_b = bytes(img)
+        assert len(img_b) >= 0x3000
+        segs = [(0x0000, 0x1000), (0x1000, 0x1000), (0x2000, len(img_b) - 0x2000)]
+        hdr = bytearray(0x100)
+        hdr[:4] = b'NSO0'
+        struct.pack_into('<I', hdr, 0x0C, 0b111 if compress else 0)
+        body = bytearray()
+        fo = 0x100
+        for i, (mo, sz) in enumerate(segs):
+            raw = img_b[mo:mo + sz]
+            blob = lz4.block.compress(raw, store_size=False) if compress else raw
+            struct.pack_into('<III', hdr, 0x10 + i * 0x10, fo, mo, sz)
+            struct.pack_into('<I', hdr, 0x60 + i * 4, len(blob))
+            body.extend(blob)
+            fo += len(blob)
+        return bytes(hdr + body)
+
+    def test_love_shaders_offline_reconstruction_completeness_and_driver_errors(self) -> None:
+        lua_src = (
+            'local GLSL = {}\n'
+            'GLSL.VERSION = {\n'
+            '    glsl1 = { [false] = "#version 120", [true] = "#version 100" },\n'
+            '    glsl3 = { [false] = "#version 330 core", [true] = "#version 300 es" },\n'
+            '}\n'
+            'GLSL.SYNTAX = [==[\n#define number float\n]==]\n'
+            'GLSL.UNIFORMS = [==[\nuniform mat4 TransformProjectionMatrix;\n]==]\n'
+            'GLSL.FUNCTIONS = [==[\nvec4 gammaCorrectColor(vec4 c) { return c; }\n]==]\n'
+            'GLSL.VERTEX = {\n'
+            '    HEADER = [==[\n#define LOVE_VERTEX_HEADER 1\n]==],\n'
+            '    FUNCTIONS = [==[\nvoid love_vfn() {}\n]==],\n'
+            '    MAIN = [==[\nvoid main() { gl_Position = position(TransformProjectionMatrix, vec4(0.0)); }\n]==],\n'
+            '}\n'
+            'GLSL.PIXEL = {\n'
+            '    HEADER = [==[\n#define LOVE_PIXEL_HEADER 1\n]==],\n'
+            '    FUNCTIONS = [==[\nvoid love_pfn() {}\n]==],\n'
+            '    MAIN = [==[\nvoid main() { love_PixelColor = effect(vec4(1.0), MainTex, VaryingTexCoord.xy, gl_FragCoord.xy); }\n]==],\n'
+            '    MAIN_CUSTOM = [==[\nvoid main() { effect(); }\n]==],\n'
+            '}\n'
+            'local defaultcode = {\n'
+            '    vertex = [==[\nvec4 position(mat4 m, vec4 p) { return m * p; }\n]==],\n'
+            '    pixel = [==[\nvec4 effect(vec4 c, Image t, vec2 tc, vec2 pc) { return c; }\n]==],\n'
+            '    videopixel = [==[\nvoid effect() { /* video */ }\n]==],\n'
+            '    arraypixel = [==[\nvoid effect() { /* array */ }\n]==],\n'
+            '}\n'
+            'function love.graphics._shaderCodeToGLSL(gles, arg1, arg2)\nend\n'
+        )
+        img = bytearray(0x3000)
+        lua_bytes = b'\x00' + lua_src.encode('utf-8') + b'\x00'
+        img[0x1100:0x1100 + len(lua_bytes)] = lua_bytes
+
+        with tempfile.TemporaryDirectory() as td:
+            game_dir = Path(td) / 'extract' / 'v0'
+            (game_dir / 'ExeFS').mkdir(parents=True)
+            (game_dir / 'ExeFS' / 'main').write_bytes(self._make_nso0(img, compress=True))
+
+            romfs = game_dir / 'RomFS'
+            (romfs / 'resources' / 'shaders').mkdir(parents=True)
+            (romfs / 'conf.lua').write_text('function love.conf(t) t.gammacorrect = false end\n', encoding='utf-8')
+            (romfs / 'resources' / 'shaders' / 'CRT.fs').write_bytes(
+                b'vec4 effect(vec4 c, Image t, vec2 tc, vec2 pc) {\r\n    return c * 0.5;\r\n}\r\n'
+            )
+            (romfs / 'resources' / 'shaders' / 'Vortex.fs').write_bytes(
+                b'vec4 position(mat4 m, vec4 p) { return m * p; }\n'
+                b'void effect() { love_Canvases[0] = vec4(1.0); }\n'
+            )
+
+            # 1) Direct generation without a capture table writes all 7 shaders
+            direct_out = Path(td) / 'direct_cap'
+            res_direct = self.love_shaders.generate(
+                game_dir / 'ExeFS' / 'main', romfs, direct_out, repo=self.repo
+            )
+            self.assertIsNotNone(res_direct)
+            files = sorted(p.name for p in direct_out.iterdir() if p.is_file())
+            self.assertEqual(len(files), 7, f'unexpected shader files: {files}')
+
+            # 2) Without a capture table (`g=None`), `driver.capture_shaders` passes
+            #    `require_table=True` and refuses instead of swapping in an unverified set
+            with self.assertRaises(self.mod.BuildError):
+                self.mod.capture_shaders(
+                    self.repo, game_dir, Path(td) / 'patched', Path(td), {}, Path(td), None, 'gl'
+                )
+            self.assertFalse((game_dir / 'gl_capture').exists())
+            self.assertFalse((game_dir / 'gl_capture.partial').exists())
+
+            # 3) With a matching `gl_capture.tsv` on the profile, `driver.capture_shaders` succeeds
+            tbl = Path(td) / 'gl_capture.tsv'
+            tbl.write_text('# test capture table\n' + '\n'.join(files) + '\n', encoding='utf-8')
+
+            class FakeProfile:
+                @staticmethod
+                def table(name: str) -> Path:
+                    assert name == 'gl_capture.tsv'
+                    return tbl
+
+            out_cap = self.mod.capture_shaders(
+                self.repo, game_dir, Path(td) / 'patched', Path(td), {}, Path(td), FakeProfile(), 'gl'
+            )
+            self.assertEqual(out_cap, game_dir / 'gl_capture')
+            self.assertEqual(sorted(p.name for p in out_cap.iterdir() if p.is_file()), files)
+
+            # 4) When `gl_capture.tsv` lists a key not produced offline (e.g., after a game update),
+            #    `generate` returns `None`, leaves no partial folder, and `capture_shaders` refuses
+            shutil.rmtree(out_cap)
+            tbl.write_text('\n'.join([*files, 'deadbeefcafebabe.frag']) + '\n', encoding='utf-8')
+            partial_out = Path(td) / 'incomplete_cap'
+            self.assertIsNone(
+                self.love_shaders.generate(
+                    game_dir / 'ExeFS' / 'main', romfs, partial_out, table=tbl, repo=self.repo
+                )
+            )
+            self.assertFalse(partial_out.exists(), 'incomplete reconstruction must not write files')
+            with self.assertRaises(self.mod.BuildError) as ctx_inc:
+                self.mod.capture_shaders(
+                    self.repo, game_dir, Path(td) / 'patched', Path(td), {}, Path(td), FakeProfile(), 'gl'
+                )
+            self.assertIn('booting the game in the Mac host', str(ctx_inc.exception))
+
+            # 5) Unsupported LÖVE template (missing required keys) raises `BuildError`, not `ValueError`
+            bad_img = bytearray(0x3000)
+            bad_lua = b'\x00function love.graphics._shaderCodeToGLSL(gles, a, b)\nend\n\x00'
+            bad_img[0x1100:0x1100 + len(bad_lua)] = bad_lua
+            (game_dir / 'ExeFS' / 'main').write_bytes(self._make_nso0(bad_img, compress=False))
+            with self.assertRaises(self.mod.BuildError) as ctx_bad:
+                self.mod.capture_shaders(
+                    self.repo, game_dir, Path(td) / 'patched', Path(td), {}, Path(td), FakeProfile(), 'gl'
+                )
+            self.assertIn('unsupported LÖVE version', str(ctx_bad.exception))
+
+            # 6) Non-LÖVE binary falls back to standard capture `BuildError`
+            (game_dir / 'ExeFS' / 'main').write_bytes(self._make_nso0(bytearray(0x3000), compress=False))
+            with self.assertRaises(self.mod.BuildError):
+                self.mod.capture_shaders(
+                    self.repo, game_dir, Path(td) / 'patched', Path(td), {}, Path(td), FakeProfile(), 'gl'
+                )
+
+            # 7) ZBIC (zstd) compressed NSO and corrupt LZ4 segment error handling
+            import struct
+            import types
+            import zlib
+            zbic_blob = zlib.compress(bytes(img))
+            zbic_hdr = bytearray(0x100)
+            zbic_hdr[:4] = b'NSO0'
+            struct.pack_into('<I', zbic_hdr, 0x0C, (1 << 7) | 1)
+            struct.pack_into('<III', zbic_hdr, 0x10, 0x100, 0, len(img))
+            struct.pack_into('<I', zbic_hdr, 0x60, len(zbic_blob))
+            zbic_nso = Path(td) / 'zbic_main'
+            zbic_nso.write_bytes(bytes(zbic_hdr) + zbic_blob)
+            fake_zbic = types.SimpleNamespace(decompress=zlib.decompress)
+            with mock.patch.dict(sys.modules, {'zbic': fake_zbic}):
+                self.assertEqual(self.love_shaders.nso_image(zbic_nso), bytes(img))
+
+            corrupt_hdr = bytearray(0x100)
+            corrupt_hdr[:4] = b'NSO0'
+            struct.pack_into('<I', corrupt_hdr, 0x0C, 1)
+            struct.pack_into('<III', corrupt_hdr, 0x10, 0x100, 0, 0x1000)
+            struct.pack_into('<I', corrupt_hdr, 0x60, 8)
+            (game_dir / 'ExeFS' / 'main').write_bytes(bytes(corrupt_hdr) + b'bad_lz4!')
+            with self.assertRaises(self.mod.BuildError) as ctx_lz4:
+                self.mod.capture_shaders(
+                    self.repo, game_dir, Path(td) / 'patched', Path(td), {}, Path(td), FakeProfile(), 'gl'
+                )
+            self.assertIn('failed to decompress LZ4 NSO segment', str(ctx_lz4.exception))
+
+
+class OodleEmuWinTest(unittest.TestCase):
+    """Tests for the Windows Oodle / LZ5 decoder host (`arm64_emu.py` + `oodle_emu.py`)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from nspb_qt.win import arm64_emu, driver as _drv, oodle_emu
+        cls.driver = _drv
+        cls.arm64_emu = arm64_emu
+        cls.oodle_emu = oodle_emu
+        cls.repo = QT.parent / 'engine'
+        cls.mod = _drv.load_upstream(cls.repo)
+        _drv.patch(cls.mod, cls.repo)
+
+    @staticmethod
+    def _make_nso0(img: bytes | bytearray, compress: bool = True) -> bytes:
+        import struct
+        import types
+        import zlib
+        try:
+            import lz4.block
+        except ModuleNotFoundError:
+            _m = types.ModuleType('lz4')
+            _b = types.ModuleType('lz4.block')
+            _b.compress = lambda raw, **_kw: zlib.compress(raw)
+            _b.decompress = lambda blob, **_kw: zlib.decompress(blob)
+            _m.block = _b
+            sys.modules['lz4'] = _m
+            sys.modules['lz4.block'] = _b
+            lz4 = _m
+        img_b = bytes(img)
+        assert len(img_b) >= 0x3000
+        segs = [(0x0000, 0x1000), (0x1000, 0x1000), (0x2000, len(img_b) - 0x2000)]
+        hdr = bytearray(0x100)
+        hdr[:4] = b'NSO0'
+        struct.pack_into('<I', hdr, 0x0C, 0b111 if compress else 0)
+        body = bytearray()
+        fo = 0x100
+        for i, (mo, sz) in enumerate(segs):
+            raw = img_b[mo:mo + sz]
+            blob = lz4.block.compress(raw, store_size=False) if compress else raw
+            struct.pack_into('<III', hdr, 0x10 + i * 0x10, fo, mo, sz)
+            struct.pack_into('<I', hdr, 0x60 + i * 4, len(blob))
+            body.extend(blob)
+            fo += len(blob)
+        return bytes(hdr + body)
+
+    def test_engine_oodle_error_strings_match_driver_detection(self) -> None:
+        tools_dir = self.repo / 'dm' / 'gfx' / 'tools'
+        texts = '\n'.join(
+            p.read_text(encoding='utf-8', errors='replace')
+            for p in sorted(tools_dir.glob('*.py'))
+        )
+        self.assertIn('Oodle- or LZ5-compressed game files: set DM_OODLE_HOST', texts)
+        # In shader_split.py the single-quoted f-string escapes the apostrophe as `game\'s`
+        self.assertTrue(
+            "the game's decoder in the Mac host" in texts
+            or r"the game\'s decoder in the Mac host" in texts
+        )
+
+    def test_find_native_oodle_dll_accepts_only_explicit_locations(self) -> None:
+        OE = self.oodle_emu
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.dict(os.environ, {}, clear=False), \
+                mock.patch.object(shutil, 'which', side_effect=AssertionError('must not probe PATH')):
+            root = Path(td)
+            os.environ.pop('NSPB_OODLE_DLL', None)
+            os.environ['LOCALAPPDATA'] = str(root / 'local')
+            cfg_path = root / 'toolchain.json'
+            os.environ['NSPB_TOOLCHAIN_JSON'] = str(cfg_path)
+
+            # 1) Nothing configured -> None (and shutil.which is never called)
+            self.assertIsNone(OE.find_native_oodle_dll())
+
+            # 2) App-managed tools_dir() / 'oodle' directory
+            app_oodle = tc.tools_dir() / 'oodle'
+            app_oodle.mkdir(parents=True)
+            dll_7 = app_oodle / 'oo2core_7_win64.dll'
+            dll_9 = app_oodle / 'oo2core_9_win64.dll'
+            dll_7.write_bytes(b'MZ7')
+            dll_9.write_bytes(b'MZ9')
+            self.assertEqual(OE.find_native_oodle_dll(), dll_9)
+
+            # 3) toolchain.json `oodle_dll` overrides tools_dir() / 'oodle'
+            cfg_dll = root / 'custom_oodle.dll'
+            cfg_dll.write_bytes(b'MZC')
+            cfg_path.write_text(json.dumps({'oodle_dll': str(cfg_dll)}), encoding='utf-8')
+            self.assertEqual(OE.find_native_oodle_dll(), cfg_dll)
+
+            # 4) NSPB_OODLE_DLL overrides everything
+            env_dll = root / 'env_oodle.dll'
+            env_dll.write_bytes(b'MZE')
+            os.environ['NSPB_OODLE_DLL'] = str(env_dll)
+            self.assertEqual(OE.find_native_oodle_dll(), env_dll)
+
+    def test_arm64_fast_stubs_disassemble_cleanly_and_cover_hot_imports(self) -> None:
+        import struct
+        E = self.arm64_emu
+        self.assertEqual(len(E.FAST_STUB_BYTES) % 4, 0)
+        words = [w for (w,) in struct.iter_unpack('<I', E.FAST_STUB_BYTES)]
+        self.assertGreater(len(words), 60)
+        self.assertIn(0xD65F03C0, words)
+        from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
+        cs = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+        insns = list(cs.disasm(E.FAST_STUB_BYTES, E.FAST_BASE))
+        self.assertEqual(len(insns), len(words), 'every 4-byte word must disassemble as a valid ARM64 instruction')
+        for sym, addr in E.FAST_STUB_ADDRS.items():
+            self.assertEqual(addr % 16, 0, f'{sym} at {addr:#x} is not 16-byte aligned')
+            self.assertGreaterEqual(addr, E.FAST_BASE)
+            self.assertLess(addr, E.FAST_BASE + len(E.FAST_STUB_BYTES))
+        for must_have in ('memcpy', 'memmove', 'memset', 'memcmp', 'strlen', 'strcmp', 'strncmp',
+                          'malloc', 'calloc', 'free', '_Znwm', '_ZdlPv', '__errno'):
+            self.assertIn(must_have, E.FAST_STUB_ADDRS)
+
+    def test_arm64_fast_stubs_differential_against_python_in_real_unicorn(self) -> None:
+        import struct
+        E = self.arm64_emu
+        self.assertTrue(E._HAS_UNICORN and E.Uc is not None, 'Unicorn must be installed in CI and local test runs')
+
+        # Build a minimal valid Mod where entry +0x80 is an exported `malloc` that tries to return
+        # 0xDEAD, so we can also verify in-place entry trampoline patching for exported allocators.
+        img = bytearray(0x4000)
+        struct.pack_into('<I', img, 4, 0x1000)
+        # +0x80: movz x0, #0xdead; ret (8 bytes, padded to 16 bytes so trampoline fits)
+        struct.pack_into('<IIII', img, 0x80, 0xD29BD5A0, 0xD65F03C0, 0xD503201F, 0xD503201F)
+        # +0x90: infinite loop `b .` (0x14000000) for timeout verification
+        struct.pack_into('<I', img, 0x90, 0x14000000)
+        img[0x1000:0x1004] = b'MOD0'
+        struct.pack_into('<i', img, 0x1004, 0x40)
+        strs = bytearray(b'\0malloc\0')
+        syms = bytearray(24)
+        # Defined & exported `malloc` at st_value = 0x80 (shndx = 1)
+        syms.extend(struct.pack('<IBBHQQ', 1, 0x12, 0, 1, 0x80, 16))
+        img[0x1100:0x1100 + len(syms)] = syms
+        img[0x1300:0x1300 + len(strs)] = strs
+        for i, (t, v) in enumerate([(6, 0x1100), (5, 0x1300), (7, 0x1500), (8, 0), (0, 0)]):
+            struct.pack_into('<qQ', img, 0x1040 + i * 16, t, v)
+
+        with tempfile.TemporaryDirectory() as mod_td:
+            mod_file = Path(mod_td) / 'test_mod'
+            mod_file.write_bytes(self._make_nso0(img, compress=False))
+            m = E.Machine([('test_mod', mod_file)], use_fast_stubs=True)
+            mod = m.mods[0]
+            scratch = m.malloc(0x4000)
+
+            def call_stub(sym: str, *args: int) -> int:
+                return m.call_fast(E.FAST_STUB_ADDRS[sym], *args)
+
+            # 1) Exported `malloc` at mod.base + 0x80 was patched in-place to jump to the allocator stub
+            ptr_from_export = m.call_fast(mod.base + 0x80, 128)
+            self.assertGreaterEqual(ptr_from_export, E.HEAP_BASE)
+            self.assertNotEqual(ptr_from_export, 0xDEAD)
+
+            # 2) Differential test for memset across sizes 0..40 and unaligned offsets 0..7
+            for n in (0, 1, 7, 8, 15, 16, 17, 31, 32, 33, 40):
+                for align in range(8):
+                    base_buf = bytes((i * 13 + 7) & 0xFF for i in range(64))
+                    m.write(scratch, base_buf)
+                    ret = call_stub('memset', scratch + align, 0x1AB, n)
+                    self.assertEqual(ret, scratch + align)
+                    expected = bytearray(base_buf)
+                    expected[align:align + n] = bytes([0xAB]) * n
+                    self.assertEqual(m.read(scratch, 64), bytes(expected), f'memset failed for n={n}, align={align}')
+
+            # 3) Differential test for memcpy & memmove (disjoint, forward overlap dst < src, backward overlap dst > src)
+            for n in (0, 1, 7, 8, 15, 16, 17, 31, 32, 33, 40):
+                for src_off, dst_off in ((0, 64), (3, 71), (8, 4), (4, 8), (16, 17), (17, 16)):
+                    initial = bytes((i * 29 + 3) & 0xFF for i in range(160))
+                    expected = bytearray(initial)
+                    expected[dst_off:dst_off + n] = initial[src_off:src_off + n]
+                    m.write(scratch, initial)
+                    fn_name = 'memcpy' if abs(dst_off - src_off) >= n else 'memmove'
+                    ret = call_stub(fn_name, scratch + dst_off, scratch + src_off, n)
+                    self.assertEqual(ret, scratch + dst_off)
+                    self.assertEqual(
+                        m.read(scratch, 160), bytes(expected),
+                        f'{fn_name} failed for n={n}, src_off={src_off}, dst_off={dst_off}',
+                    )
+
+            # 4) Differential test for memcmp (including high-bit unsigned byte comparisons >= 0x80)
+            for n in (0, 1, 7, 8, 15, 16, 24, 33):
+                buf_a = bytearray((i * 19 + 1) & 0xFF for i in range(n + 8))
+                buf_b = bytearray(buf_a)
+                m.write(scratch, bytes(buf_a))
+                m.write(scratch + 128, bytes(buf_b))
+                self.assertEqual(call_stub('memcmp', scratch, scratch + 128, n), 0)
+                if n > 0:
+                    for pos in {0, n // 2, n - 1}:
+                        a2 = bytearray(buf_a)
+                        b2 = bytearray(buf_b)
+                        a2[pos] = 0x80
+                        b2[pos] = 0x7F
+                        m.write(scratch, bytes(a2))
+                        m.write(scratch + 128, bytes(b2))
+                        res_gt = struct.unpack('<q', struct.pack('<Q', call_stub('memcmp', scratch, scratch + 128, n)))[0]
+                        res_lt = struct.unpack('<q', struct.pack('<Q', call_stub('memcmp', scratch + 128, scratch, n)))[0]
+                        self.assertGreater(res_gt, 0, f'memcmp unsigned 0x80 > 0x7F failed at pos={pos}, n={n}')
+                        self.assertLess(res_lt, 0, f'memcmp unsigned 0x7F < 0x80 failed at pos={pos}, n={n}')
+
+            # 5) Differential test for strlen, strcmp, strncmp
+            test_strings = [b'', b'a', b'hello', b'0123456789abcdef', b'0123456789abcdef_long_string_xyz']
+            for s in test_strings:
+                m.write(scratch, s + b'\x00\xFF\xFF')
+                self.assertEqual(call_stub('strlen', scratch), len(s))
+            pairs = [
+                (b'', b''),
+                (b'abc', b'abc'),
+                (b'abc', b'abd'),
+                (b'abc', b'ab'),
+                (b'\x80', b'\x7f'),
+                (b'prefix_same_1', b'prefix_same_2'),
+            ]
+            for sa, sb in pairs:
+                m.write(scratch, sa + b'\x00')
+                m.write(scratch + 128, sb + b'\x00')
+                got_cmp = struct.unpack('<q', struct.pack('<Q', call_stub('strcmp', scratch, scratch + 128)))[0]
+                exp_cmp = (1 if sa > sb else (-1 if sa < sb else 0))
+                self.assertEqual((got_cmp > 0) - (got_cmp < 0), exp_cmp, f'strcmp({sa!r}, {sb!r})')
+                for max_n in (0, 1, 3, 12, 20):
+                    got_ncmp = struct.unpack(
+                        '<q', struct.pack('<Q', call_stub('strncmp', scratch, scratch + 128, max_n))
+                    )[0]
+                    pa, pb = sa[:max_n], sb[:max_n]
+                    exp_ncmp = (1 if pa > pb else (-1 if pa < pb else 0))
+                    self.assertEqual((got_ncmp > 0) - (got_ncmp < 0), exp_ncmp, f'strncmp({sa!r}, {sb!r}, {max_n})')
+
+            # 6) calloc after heap_reset must zero dirty memory AND slow-path calloc (>= 64 KB) must not
+            #    multiply x0 * x1 twice!
+            mark = m.heap_mark()
+            p_dirty = call_stub('malloc', 256)
+            call_stub('memset', p_dirty, 0xCC, 256)
+            self.assertEqual(m.read(p_dirty, 256), b'\xCC' * 256)
+            m.heap_reset(mark)
+            p_clean = call_stub('calloc', 16, 16)
+            self.assertEqual(p_clean, p_dirty)
+            self.assertEqual(m.read(p_clean, 256), b'\x00' * 256, 'fast-path calloc must zero reused dirty heap bytes')
+
+            # Slow-path calloc: 2048 * 32 = 65536 (>= 65536 threshold -> traps into Python _calloc)
+            m.heap_reset(mark)
+            p_large = call_stub('calloc', 2048, 32)
+            self.assertEqual(p_large, mark + 16)
+            self.assertEqual(
+                m._vm_heap_top() - p_large, 65536,
+                'slow-path calloc must allocate exactly nmemb * size (65536), not nmemb * size * size',
+            )
+
+            # 7) Timeout enforcement on an infinite loop in call_fast
+            with self.assertRaises(E.EmuError) as ctx:
+                m.call_fast(mod.base + 0x90, timeout_us=50_000)
+            self.assertIn('timed out', str(ctx.exception))
+
+    def test_oodle_emu_work_dir_cache_sharded_job_partial_failure_and_serve(self) -> None:
+        import io
+        import struct
+        E = self.arm64_emu
+        OE = self.oodle_emu
+
+        # Build a synthetic NSO with MOD0, .eh_frame_hdr, and ADRP+ADD referencing "OodleLZ_Decompress\0"
+        img = bytearray(0x4000)
+        struct.pack_into('<I', img, 4, 0x1000)
+        struct.pack_into('<III', img, 0x40, 0xB0000010, 0x91180210, 0xD65F03C0)
+        img[0x1000:0x1004] = b'MOD0'
+        struct.pack_into('<i', img, 0x1004, 0x40)
+        struct.pack_into('<i', img, 0x1010, 0x700)
+        s_oodle = b'OodleLZ_Decompress\0'
+        img[0x1600:0x1600 + len(s_oodle)] = s_oodle
+        struct.pack_into('<BBBBIIII', img, 0x1700, 1, 0x03, 0x03, 0x03, 0, 1, 0x40, 0)
+
+        symtab_off, strtab_off, rela_off = 0x1100, 0x1300, 0x1500
+        strs = bytearray(b'\0malloc\0free\0memcpy\0')
+        syms = bytearray(24)
+        syms.extend(struct.pack('<IBBHQQ', 1, 0x10, 0, 0, 0, 0))
+        relas = struct.pack('<QQq', 0x2000, (1 << 32) | 1025, 0)
+        img[symtab_off:symtab_off + len(syms)] = syms
+        img[strtab_off:strtab_off + len(strs)] = strs
+        img[rela_off:rela_off + len(relas)] = relas
+        for i, (t, v) in enumerate([(6, symtab_off), (5, strtab_off), (7, rela_off), (8, len(relas)), (0, 0)]):
+            struct.pack_into('<qQ', img, 0x1040 + i * 16, t, v)
+
+        class StandInUc:
+            def __init__(self, _arch: int, _mode: int) -> None:
+                self.mem: dict[int, bytearray] = {}
+                self.regs: dict[int, int] = {}
+
+            def mem_map(self, addr: int, size: int, _prot: int = 7) -> None:
+                self.mem[addr] = bytearray(size)
+
+            def _find_seg(self, addr: int) -> tuple[int, bytearray]:
+                for base, buf in self.mem.items():
+                    if base <= addr < base + len(buf):
+                        return base, buf
+                raise RuntimeError(f'unmapped {addr:#x}')
+
+            def mem_write(self, addr: int, data: bytes) -> None:
+                base, buf = self._find_seg(addr)
+                off = addr - base
+                buf[off:off + len(data)] = data
+
+            def mem_read(self, addr: int, size: int) -> bytearray:
+                base, buf = self._find_seg(addr)
+                off = addr - base
+                return bytearray(buf[off:off + size])
+
+            def reg_write(self, reg: int, val: int) -> None:
+                self.regs[reg] = val & 0xFFFFFFFFFFFFFFFF
+
+            def reg_read(self, reg: int) -> int:
+                return self.regs.get(reg, 0)
+
+            def hook_add(self, *_a, **_kw) -> int:
+                return 1
+
+            def emu_start(self, _begin: int, _until: int, **_kw) -> None:
+                c = self.reg_read(E.UC_ARM64_REG_X0)
+                cl = self.reg_read(E.UC_ARM64_REG_X0 + 1)
+                r = self.reg_read(E.UC_ARM64_REG_X0 + 2)
+                rl = self.reg_read(E.UC_ARM64_REG_X0 + 3)
+                comp_data = bytes(self.mem_read(c, cl))
+                if cl == rl and comp_data.startswith(b'OK'):
+                    self.mem_write(r, bytes(b ^ 0xAA for b in comp_data))
+                    self.reg_write(E.UC_ARM64_REG_X0, rl)
+                else:
+                    self.reg_write(E.UC_ARM64_REG_X0, 0)
+                self.reg_write(E.UC_ARM64_REG_PC, E.STOP)
+
+        with tempfile.TemporaryDirectory() as td:
+            work_root = Path(td)
+            exefs = work_root / 'extract' / 'v0' / 'ExeFS'
+            exefs.mkdir(parents=True)
+            (exefs / 'main').write_bytes(self._make_nso0(img, compress=True))
+            patched = work_root / 'patched_v0'
+            patched.mkdir()
+
+            self.assertTrue(OE.has_decoder(exefs))
+            self.assertFalse(OE.has_decoder(patched))
+
+            with mock.patch.object(E, '_HAS_UNICORN', True), \
+                    mock.patch.object(E, 'Uc', StandInUc), \
+                    mock.patch.object(OE, 'find_native_oodle_dll', return_value=None):
+                # 1) Cold Decoder init writes JSON + raw binary cache inside <work>/tools/oodle_cache
+                dec1 = OE.Decoder(patched)
+                self.assertEqual(dec1.kind, 'OodleLZ_Decompress')
+                self.assertEqual(dec1.off, 0x40)
+                meta_p = OE._cache_file_for([('main', str(exefs / 'main'))], exefs=exefs)
+                self.assertIsNotNone(meta_p)
+                bin_p = meta_p.with_suffix('.bin')
+                self.assertTrue(meta_p.is_file() and bin_p.is_file())
+                self.assertEqual(meta_p.parent, work_root / 'tools' / 'oodle_cache')
+                meta_obj = json.loads(meta_p.read_text(encoding='utf-8'))
+                self.assertEqual(meta_obj['format'], 1)
+
+                # 2) Warm Decoder init loads from JSON + .bin cache; corrupted .bin or .json returns None and rebuilds
+                dec2 = OE.Decoder(patched)
+                self.assertEqual(dec2.kind, 'OodleLZ_Decompress')
+                bin_p.write_bytes(b'truncated')
+                self.assertIsNone(OE._read_reloc_cache(meta_p))
+                dec3 = OE.Decoder(patched)
+                self.assertTrue(bin_p.is_file() and bin_p.stat().st_size > 16)
+                meta_p.write_text('{corrupt', encoding='utf-8')
+                self.assertIsNone(OE._read_reloc_cache(meta_p))
+                dec3 = OE.Decoder(patched)
+                self.assertEqual(json.loads(meta_p.read_text(encoding='utf-8'))['format'], 1)
+
+                # 2b) eh_table bounds checks reject out-of-bounds MOD0 / .eh_frame_hdr offsets
+                import types
+                bad_mod = types.SimpleNamespace(img=b'0123456789', mod0=100, name='bad_mod')
+                with self.assertRaises(SystemExit):
+                    OE.eh_table(bad_mod)
+
+                # 3) Multi-worker sharded DM_OODLE_JOB where shard 1 exits with rc=1 (one bad record,
+                #    one good record): parent must preserve all good records, forward [RED] log, and
+                #    return rc=1 without re-running sequentially.
+                job_path = work_root / 'oodle.job'
+                recs = [b'OK_REC_00000000' + bytes([i]) for i in range(60)]
+                recs[45] = b'BAD_REC_00000045'
+                with open(job_path, 'wb') as jf:
+                    jf.write(struct.pack('<II', 0x4A4F4D44, len(recs)))
+                    for rec in recs:
+                        jf.write(struct.pack('<II', len(rec), len(rec)) + rec)
+
+                shard_calls: list[str] = []
+
+                def fake_shard_popen(cmd, env=None, stdout=None, stderr=None, **_kw):
+                    shard_job = env['DM_OODLE_JOB']
+                    shard_calls.append(shard_job)
+                    with mock.patch.dict(os.environ, {'NSPB_OODLE_WORKERS': '1'}, clear=False):
+                        rc_sub = OE.job(dec3, shard_job)
+                    if stdout is not None and rc_sub != 0:
+                        stdout.write('[RED] OodleLZ_Decompress: shard record failed\n')
+                        stdout.flush()
+
+                    class _DoneProc:
+                        def poll(self) -> int:
+                            return rc_sub
+
+                        def wait(self) -> int:
+                            return rc_sub
+
+                    return _DoneProc()
+
+                with mock.patch.dict(os.environ, {'NSPB_OODLE_WORKERS': '2'}, clear=False), \
+                        mock.patch.object(OE.subprocess, 'Popen', side_effect=fake_shard_popen) as spy_popen:
+                    rc = OE.job(dec3, str(job_path))
+                self.assertEqual(rc, 1, 'overall job must return 1 when 1 of 60 records failed')
+                self.assertEqual(spy_popen.call_count, 2)
+                self.assertEqual(len(shard_calls), 2)
+                out_data = Path(str(job_path) + '.out').read_bytes()
+                magic, cnt = struct.unpack_from('<II', out_data, 0)
+                self.assertEqual(magic, 0x524F4D44)
+                self.assertEqual(cnt, 60)
+                pos = 8
+                good_count = 0
+                for idx in range(60):
+                    (sz,) = struct.unpack_from('<I', out_data, pos)
+                    pos += 4
+                    if idx == 45:
+                        self.assertEqual(sz, 0)
+                    else:
+                        self.assertEqual(sz, 16)
+                        self.assertEqual(out_data[pos:pos + sz], bytes(b ^ 0xAA for b in recs[idx]))
+                        pos += sz
+                        good_count += 1
+                self.assertEqual(good_count, 59)
+
+                # 4) NativeOodleDll passthrough vs arm64_emu: decode the same blocks both ways and
+                #    compare byte-for-byte, plus verify automatic fallback to arm64_emu when the DLL
+                #    cannot decode a block (e.g., different Oodle version in the game's embedded decoder).
+                same_blocks = [
+                    b'OK_BLOCK_ALPHA_0',
+                    b'OK_BLOCK_BETA_12',
+                    b'OK_BLOCK_GAMMA_3',
+                ]
+                emu_decoded = [dec3.run(blk, len(blk)) for blk in same_blocks]
+                self.assertTrue(all(out is not None and len(out) == 16 for out in emu_decoded))
+
+                class ComparingNativeDll:
+                    path = Path('/fake/oo2core_9_win64.dll')
+
+                    def decompress(self, comp: bytes, rl: int) -> bytes | None:
+                        # Block 2 simulates a newer/different Oodle bitstream that the host DLL rejects,
+                        # forcing `Decoder.run()` to initialize Unicorn and fall back to `arm64_emu`.
+                        if comp == b'OK_BLOCK_GAMMA_3':
+                            return None
+                        if len(comp) == rl and comp.startswith(b'OK'):
+                            return bytes(b ^ 0xAA for b in comp)
+                        return None
+
+                with mock.patch.object(OE, 'find_native_oodle_dll', return_value=ComparingNativeDll.path), \
+                        mock.patch.object(OE, 'NativeOodleDll', return_value=ComparingNativeDll()):
+                    dec_dll = OE.Decoder(patched)
+                    self.assertIsNone(dec_dll.m, 'Unicorn must stay uninitialized while native DLL succeeds')
+                    self.assertTrue(dec_dll.using_native_dll)
+                    # First two blocks decode through the native DLL and match `arm64_emu` byte-for-byte
+                    dll_out_0 = dec_dll.run(same_blocks[0], len(same_blocks[0]))
+                    dll_out_1 = dec_dll.run(same_blocks[1], len(same_blocks[1]))
+                    self.assertIsNone(dec_dll.m, 'Unicorn must still be uninitialized after DLL hits')
+                    self.assertEqual(dll_out_0, emu_decoded[0])
+                    self.assertEqual(dll_out_1, emu_decoded[1])
+                    # Third block fails in the DLL, triggers lazy `arm64_emu` fallback, and still matches
+                    dll_out_2 = dec_dll.run(same_blocks[2], len(same_blocks[2]))
+                    self.assertIsNotNone(dec_dll.m, 'DLL miss must lazily initialize the ARM64 emulator fallback')
+                    self.assertEqual(dll_out_2, emu_decoded[2])
+                    self.assertEqual([dll_out_0, dll_out_1, dll_out_2], emu_decoded)
+
+                    req_stream = io.BytesIO(
+                        struct.pack('<QQ', 16, 16) + same_blocks[0]
+                        + struct.pack('<QQ', 16, 16) + same_blocks[2]
+                        + struct.pack('<QQ', 0, 0)
+                    )
+                    resp_stream = io.BytesIO()
+                    fake_in = mock.MagicMock(buffer=req_stream)
+                    fake_out = mock.MagicMock(buffer=resp_stream)
+                    with mock.patch.object(sys, 'stdin', fake_in), mock.patch.object(sys, 'stdout', fake_out):
+                        self.assertEqual(OE.serve(dec_dll), 0)
+                    self.assertEqual(
+                        resp_stream.getvalue(),
+                        struct.pack('<Q', 16) + emu_decoded[0]
+                        + struct.pack('<Q', 16) + emu_decoded[2]
+                        + struct.pack('<Q', 0),
+                    )
+
+import struct
+
+
+def _make_fake_gm_main() -> bytes:
+    """Build a synthetic GameMaker Switch Runner rodata table matching ExeFS/main's layout."""
+    parts = [
+        b'\xff' * 16,
+        b'#define LOWPREC lowp\n\x00',
+        b'#define MATRIX_VIEW                    0                               \n'
+        b'uniform mat4 gm_Matrices[5];\n\x00',
+        b'attribute vec3 in_Position;\nattribute vec2 in_TextureCoord;\n'
+        b'attribute LOWPREC vec4 in_Colour;\nvoid main() { gl_Position = vec4(in_Position, 1.0); }\n\x00',
+        b'attribute vec3 in_Position;\nattribute vec3 in_Normal;\n'
+        b'attribute vec2 in_TextureCoord;\nvoid main() { gl_Position = vec4(in_Position + in_Normal, 1.0); }\n\x00',
+        b'attribute vec3 in_Position;\nattribute LOWPREC vec4 in_Colour;\n'
+        b'void main() { gl_Position = vec4(in_Position, 1.0); }\n\x00',
+        b'precision mediump float;\t\t\t\t\t\t\n#define HIGHPREC \n'
+        b'#define LOWPREC lowp                           \n\x00',
+        b'uniform sampler2D gm_BaseTexture;              \n'
+        b'void DoAlphaTest(LOWPREC vec4 c) {}\n\x00',
+        b'varying HIGHPREC vec2 v_vTexcoord;\nvarying LOWPREC vec4 v_vColour;\n'
+        b'void main() { gl_FragColor = v_vColour; }\n\x00',
+        b'varying LOWPREC vec4 v_vColour;\nvarying float v_fFog;\n'
+        b'void main() { gl_FragColor = v_vColour; }\n\x00',
+        b'\xff' * 16,
+    ]
+    return b''.join(parts)
+
+
+def _make_fake_game_win(shaders: list[tuple[bytes, bytes, bytes]]) -> bytes:
+    """Build a valid IFF FORM container with a SHDR and STRG chunk holding `shaders`."""
+    # Layout after 8-byte FORM header:
+    #   chunk SHDR (8-byte hdr + count + ptrs + 16-byte entries)
+    #   chunk STRG (8-byte hdr + length-prefixed strings)
+    count = len(shaders)
+    shdr_data_len = 4 + count * 4 + count * 16
+    shdr_chunk_start = 8
+    shdr_entries_start = shdr_chunk_start + 8 + 4 + count * 4
+    strg_chunk_start = shdr_chunk_start + 8 + shdr_data_len
+    str_cursor = strg_chunk_start + 8
+
+    str_blobs: list[bytes] = []
+    entry_tuples: list[tuple[int, int, int, int]] = []
+    for name_b, vs_b, fs_b in shaders:
+        ptrs = []
+        for s in (name_b, vs_b, fs_b):
+            blob = struct.pack('<I', len(s)) + s + b'\x00'
+            str_ptr = str_cursor + 4
+            ptrs.append(str_ptr)
+            str_blobs.append(blob)
+            str_cursor += len(blob)
+        entry_tuples.append((ptrs[0], 0x80000001, ptrs[1], ptrs[2]))
+
+    strg_payload = b''.join(str_blobs)
+    entry_ptrs = [shdr_entries_start + i * 16 for i in range(count)]
+    shdr_payload = (
+        struct.pack(f'<I{count}I', count, *entry_ptrs)
+        + b''.join(struct.pack('<4I', *t) for t in entry_tuples)
+    )
+    body = (
+        b'SHDR' + struct.pack('<I', len(shdr_payload)) + shdr_payload
+        + b'STRG' + struct.pack('<I', len(strg_payload)) + strg_payload
+    )
+    return b'FORM' + struct.pack('<I', len(body)) + body
+
+
+class GMShadersAndCaptureReuseTest(unittest.TestCase):
+    """Tests for `gm_shaders.py` and `driver.py` capture reuse/reconstruction."""
+
+    def test_gm_shaders_reconstructs_48_builtins_and_shdr_custom_shaders(self) -> None:
+        from nspb_qt.win import gm_shaders
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            main_path = root / 'main'
+            main_path.write_bytes(_make_fake_gm_main())
+            rom_dir = root / 'RomFS'
+            rom_dir.mkdir()
+            custom_vs = b'#define _YY_GLSLES_ 1\nattribute vec3 pos;\nvoid main() {}\n'
+            custom_fs = b'#define _YY_GLSLES_ 1\nprecision mediump float;\nvoid main() {}\n'
+            (rom_dir / 'game.win').write_bytes(
+                _make_fake_game_win([(b'shd_custom', custom_vs, custom_fs)])
+            )
+
+            # Generate first without a table to collect the exact 50 keys (48 built-in + 2 custom)
+            out1 = root / 'out1'
+            res1 = gm_shaders.generate(main_path, rom_dir, out1, log=lambda _s: None)
+            self.assertIsNotNone(res1)
+            made1, want1 = res1
+            self.assertIsNone(want1)
+            self.assertEqual(len(made1), 50)
+            self.assertIn(f'{gm_shaders.key_bytes(custom_vs)}.vert', made1)
+            self.assertIn(f'{gm_shaders.key_bytes(custom_fs)}.frag', made1)
+
+            # Verify table completeness check passes when every key in gl_capture.tsv is present
+            tsv = root / 'gl_capture.tsv'
+            tsv.write_text('\n'.join(sorted(made1)) + '\n', encoding='utf-8')
+            out2 = root / 'out2'
+            res2 = gm_shaders.generate(
+                main_path, rom_dir, out2, tsv, log=lambda _s: None, require_table=True
+            )
+            self.assertIsNotNone(res2)
+            self.assertEqual(len(list(out2.glob('*'))), 50)
+
+    def test_gm_shaders_returns_none_and_writes_no_files_when_incomplete_or_non_gm(self) -> None:
+        from nspb_qt.win import gm_shaders
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            non_gm = root / 'plain_main'
+            non_gm.write_bytes(b'not a gamemaker binary')
+            rom_dir = root / 'RomFS'
+            rom_dir.mkdir()
+            (rom_dir / 'game.win').write_bytes(_make_fake_game_win([]))
+            out = root / 'out_non_gm'
+            self.assertIsNone(gm_shaders.generate(non_gm, rom_dir, out, log=lambda _s: None))
+            self.assertFalse(out.exists())
+
+            gm_main = root / 'gm_main'
+            gm_main.write_bytes(_make_fake_gm_main())
+            # require_table=True without a table must return None and leave out uncreated
+            self.assertIsNone(
+                gm_shaders.generate(gm_main, rom_dir, out, None, log=lambda _s: None, require_table=True)
+            )
+            self.assertFalse(out.exists())
+
+            # A table listing an unknown hash must return None and not write partial files
+            bad_tsv = root / 'bad.tsv'
+            bad_tsv.write_text('deadbeefcafebabe.vert\n', encoding='utf-8')
+            self.assertIsNone(
+                gm_shaders.generate(gm_main, rom_dir, out, bad_tsv, log=lambda _s: None, require_table=True)
+            )
+            self.assertFalse(out.exists())
+
+    def test_gm_shaders_rejects_corrupted_form_and_shdr_bounds(self) -> None:
+        from nspb_qt.win import gm_shaders
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            bad = root / 'game.win'
+
+            # 1. File shorter than 8 bytes
+            bad.write_bytes(b'FORM')
+            with self.assertRaises(gm_shaders.GMShaderError):
+                gm_shaders.shdr_chunk_shaders(bad)
+
+            # 2. FORM size larger than file
+            bad.write_bytes(b'FORM' + struct.pack('<I', 0x1000))
+            with self.assertRaises(gm_shaders.GMShaderError):
+                gm_shaders.shdr_chunk_shaders(bad)
+
+            # 3. Chunk size exceeds FORM boundary
+            bad.write_bytes(b'FORM' + struct.pack('<I', 8) + b'SHDR' + struct.pack('<I', 0x100))
+            with self.assertRaises(gm_shaders.GMShaderError):
+                gm_shaders.shdr_chunk_shaders(bad)
+
+            # 4. SHDR entry count exceeds chunk size
+            shdr = struct.pack('<I', 100)
+            body = b'SHDR' + struct.pack('<I', len(shdr)) + shdr
+            bad.write_bytes(b'FORM' + struct.pack('<I', len(body)) + body)
+            with self.assertRaises(gm_shaders.GMShaderError):
+                gm_shaders.shdr_chunk_shaders(bad)
+
+            # 5. Out-of-bounds string pointer inside SHDR entry
+            shdr = struct.pack('<II4I', 1, 16, 0xFFFFFFF0, 0x80000001, 0xFFFFFFF0, 0xFFFFFFF0)
+            body = b'SHDR' + struct.pack('<I', len(shdr)) + shdr
+            bad.write_bytes(b'FORM' + struct.pack('<I', len(body)) + body)
+            with self.assertRaises(gm_shaders.GMShaderError):
+                gm_shaders.shdr_chunk_shaders(bad)
+
+            # 6. Runner table with fewer than 3 VS templates raises GMShaderError
+            truncated_gm = _make_fake_gm_main().replace(
+                b'attribute vec3 in_Position;\nattribute LOWPREC vec4 in_Colour;\n'
+                b'void main() { gl_Position = vec4(in_Position, 1.0); }\n\x00',
+                b'',
+            )
+            with self.assertRaises(gm_shaders.GMShaderError):
+                gm_shaders.runner_builtins(truncated_gm)
+
+    def test_driver_capture_hooks_reconstruct_and_reuse(self) -> None:
+        from nspb_qt.win import driver, gm_shaders
+
+        repo = QT.parent / 'engine'
+        if not (repo / 'scripts/build_ipa_from_nsp.py').is_file():
+            self.skipTest('engine/ is missing: run python3 tools/engine.py sync')
+        mod = driver.load_upstream(repo)
+        driver.patch(mod, repo)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ver_dir = root / 'v0'
+            (ver_dir / 'ExeFS').mkdir(parents=True)
+            (ver_dir / 'RomFS').mkdir(parents=True)
+            (ver_dir / 'ExeFS' / 'main').write_bytes(_make_fake_gm_main())
+            custom_vs = b'#define _YY_GLSLES_ 1\nvoid main() {}\n'
+            custom_fs = b'#define _YY_GLSLES_ 1\nprecision lowp float;\nvoid main() {}\n'
+            (ver_dir / 'RomFS' / 'game.win').write_bytes(
+                _make_fake_game_win([(b's0', custom_vs, custom_fs)])
+            )
+
+            tsv_path = root / 'gl_capture.tsv'
+            tsv_path.write_text(
+                f'{gm_shaders.key_bytes(custom_vs)}.vert\n{gm_shaders.key_bytes(custom_fs)}.frag\n',
+                encoding='utf-8',
+            )
+
+            class FakeProfile:
+                id = '0100217023F6C000'
+
+                def table(self, name):
+                    if name == 'gl_capture.tsv':
+                        return tsv_path
+                    if name == 'vk_capture.tsv':
+                        return root / 'vk_capture.tsv'
+                    if name == 'shader_map.tsv':
+                        return root / 'shader_map.tsv'
+                    raise FileNotFoundError(name)
+
+                def get(self, key, default=''):
+                    return default
+
+            prof = FakeProfile()
+            # 1. Offline GameMaker GL reconstruction via mod.capture_shaders
+            cap_out = mod.capture_shaders(repo, ver_dir, None, root, {}, root, prof, 'gl')
+            self.assertEqual(cap_out, ver_dir / 'gl_capture')
+            self.assertTrue((cap_out / f'{gm_shaders.key_bytes(custom_vs)}.vert').is_file())
+
+            # 2. Reusing an already-populated vk_capture folder
+            (root / 'vk_capture.tsv').write_text('0123456789abcdef\n', encoding='utf-8')
+            vk_dir = ver_dir / 'vk_capture'
+            vk_dir.mkdir(parents=True)
+            (vk_dir / '0123456789abcdef.spv').write_bytes(b'spv')
+            vk_out = mod.capture_shaders(repo, ver_dir, None, root, {}, root, prof, 'vk')
+            self.assertEqual(vk_out, vk_dir)
+
+            # 3. Reusing a complete glslc_capture folder vs refusing when missing
+            sh_Name = 'fedcba9876543210.glslc'
+            (root / 'shader_map.tsv').write_text(
+                f'0\t1\t2\t3\t/glslc_capture/{sh_Name}#GLSLC@0\n', encoding='utf-8'
+            )
+            with self.assertRaises(mod.BuildError):
+                mod.capture_glslc(repo, {'v0': ver_dir}, 'v0', None, root, {}, root, prof)
+            glslc_dir = ver_dir / 'glslc_capture'
+            glslc_dir.mkdir(parents=True)
+            # GLSLC magic 0x19866891 at +0, total size 0x80 at +0x44
+            blob = bytearray(0x80)
+            struct.pack_into('<I', blob, 0, 0x19866891)
+            struct.pack_into('<I', blob, 0x44, 0x80)
+            (glslc_dir / sh_Name).write_bytes(bytes(blob))
+            self.assertIsNone(
+                mod.capture_glslc(repo, {'v0': ver_dir}, 'v0', None, root, {}, root, prof)
+            )
+
+            # 4. capture_jit returns Path(d) / 'jit' when jit.img exists, or packs from jit_capture/
+            jit_dir = ver_dir / 'jit'
+            jit_dir.mkdir(parents=True)
+            (jit_dir / 'jit.img').write_bytes(b'JIT')
+            self.assertEqual(
+                mod.capture_jit(sys.executable, repo, ver_dir, None, root, {}, root, prof),
+                jit_dir,
+            )
+            mod.rmtree(jit_dir)
+            caps_dir = ver_dir / 'jit_capture'
+            for bname in ('boot1', 'boot2'):
+                (caps_dir / bname).mkdir(parents=True)
+                (caps_dir / bname / '0.jit').write_bytes(b'J')
+            patched_dir = root / 'patched_v0'
+            patched_dir.mkdir()
+            (caps_dir / 'stamp.json').write_text(mod.jit_stamp(patched_dir, prof), encoding='utf-8')
+            ran_jit_cmd: list[list[str]] = []
+
+            def fake_jit_run(cmd, log, **_kw):
+                ran_jit_cmd.append([str(c) for c in cmd])
+                out_tmp = Path(cmd[-1])
+                out_tmp.mkdir(parents=True, exist_ok=True)
+                (out_tmp / 'jit.img').write_bytes(b'PACKED_JIT')
+                return 0
+
+            orig_run = mod.run
+            try:
+                mod.run = fake_jit_run
+                packed_jit = mod.capture_jit(
+                    sys.executable, repo, ver_dir, patched_dir, root, {}, root, prof
+                )
+            finally:
+                mod.run = orig_run
+            self.assertEqual(packed_jit, jit_dir)
+            self.assertEqual((jit_dir / 'jit.img').read_bytes(), b'PACKED_JIT')
+            self.assertEqual(len(ran_jit_cmd), 1)
+            self.assertTrue(ran_jit_cmd[0][1].endswith('dm/tools/jit_capture.py'))
+
+            # 5. capture_nro returns profile when missing.tsv is absent or empty, refuses when non-empty
+            nro_dir = root / 'nro_v0'
+            nro_dir.mkdir()
+            self.assertIs(
+                mod.capture_nro(sys.executable, repo, None, None, nro_dir, {}, root, prof, False),
+                prof,
+            )
+            (nro_dir / 'missing.tsv').write_text('', encoding='utf-8')
+            self.assertIs(
+                mod.capture_nro(sys.executable, repo, None, None, nro_dir, {}, root, prof, False),
+                prof,
+            )
+            (nro_dir / 'missing.tsv').write_text('deadbeef\tnro0\n', encoding='utf-8')
+            with self.assertRaises(mod.BuildError):
+                mod.capture_nro(sys.executable, repo, None, None, nro_dir, {}, root, prof, False)
+
+    def test_nxboot_offline_nro_decode_and_driver_capture_nro(self) -> None:
+        """Verify `nro_emu.decode_boot_nro` and `driver.capture_nro` decode `nxboot` NROs in Unicorn."""
+        from nspb_qt.win import arm64_emu as E
+        from nspb_qt.win import driver, nro_emu
+
+        self.assertTrue(E._HAS_UNICORN, 'unicorn is required for offline NRO tests')
+
+        # Build a synthetic ARM64 `nxboot` NSO with `pacibsp` / `retab` instructions:
+        # - PLT stubs at 0x200..0x240 jump via GOT slots in .data (0x2000..0x2020):
+        #     0x200 -> _ZN2nn2os12CreateThreadEPNS0_10ThreadTypeEPFvPvES3_S3_mii (GOT 0x2000)
+        #     0x210 -> _ZN2nn2ro10InitializeEv (GOT 0x2008)
+        #     0x220 -> _ZN2nn2os12AwaitBarrierEPNS0_11BarrierTypeE (GOT 0x2010)
+        #     0x230 -> malloc (GOT 0x2018)
+        # - `nnMain` at 0x020: calls `CreateThread(0, base+0x060, ...)`, `CreateThread(0, base+0x100, ...)`,
+        #   then `nn::ro::Initialize()`, and returns with `retab` (0xD65F0FFF).
+        # - Worker 0 at 0x060: writes `sizes[0] = 0x80`, calls `AwaitBarrier`, sums `sizes[0] + sizes[1]`,
+        #   calls `malloc(total)` and stores to `*out_buf_ptr`, calls `AwaitBarrier`, writes `NRO0` at +0x10
+        #   and `0x100` (256 bytes) at +0x18, and returns with `retab`.
+        # - Worker 1 at 0x100: writes `sizes[1] = 0x80`, calls `AwaitBarrier`, calls `AwaitBarrier`,
+        #   writes `0xCAFEBABE` at `(*out_buf_ptr) + sizes[0]`, and returns with `retab`.
+        text = bytearray(0x1000)
+
+        def put_insns(off: int, words: list[int]) -> None:
+            struct.pack_into(f'<{len(words)}I', text, off, *words)
+
+        def bl_at(pc: int, target: int) -> int:
+            return 0x94000000 | (((target - pc) // 4) & 0x3FFFFFF)
+
+        def adr_x1(pc: int, target: int) -> int:
+            delta = target - pc
+            return 0x10000001 | ((delta & 3) << 29) | (((delta >> 2) & 0x7FFFF) << 5)
+
+        # PLT stubs at 0x200, 0x210, 0x220, 0x230 (adrp x16, #0x2000; ldr x17, [x16, #slot]; br x17)
+        for idx, slot_off in enumerate((0x00, 0x08, 0x10, 0x18)):
+            ldr_imm = (slot_off // 8) << 10
+            put_insns(
+                0x200 + idx * 0x10,
+                [
+                    0xD0000010,                 # adrp x16, #0x2000
+                    0xF9400211 | ldr_imm,       # ldr x17, [x16, #slot_off]
+                    0xD61F0220,                 # br x17
+                    0xD503201F,                 # nop
+                ],
+            )
+
+        # nnMain at 0x020
+        put_insns(
+            0x020,
+            [
+                0xD503237F,                     # 0x020: pacibsp
+                0xA9BF7BFD,                     # 0x024: stp x29, x30, [sp, #-16]!
+                adr_x1(0x028, 0x060),           # 0x028: adr x1, 0x060 (worker 0)
+                bl_at(0x02C, 0x200),            # 0x02c: bl 0x200 (CreateThread)
+                adr_x1(0x030, 0x100),           # 0x030: adr x1, 0x100 (worker 1)
+                bl_at(0x034, 0x200),            # 0x034: bl 0x200 (CreateThread)
+                bl_at(0x038, 0x210),            # 0x038: bl 0x210 (ro::Initialize)
+                0xA8C17BFD,                     # 0x03c: ldp x29, x30, [sp], #16
+                0xD65F0FFF,                     # 0x040: retab
+            ],
+        )
+
+        # Worker 0 at 0x060
+        put_insns(
+            0x060,
+            [
+                0xD503237F,                     # 0x060: pacibsp
+                0xA9BD7BFD,                     # 0x064: stp x29, x30, [sp, #-48]!
+                0xA90153F3,                     # 0x068: stp x19, x20, [sp, #16]
+                0xA9402013,                     # 0x06c: ldp x19, x8, [x0] (x19=out_buf_ptr, x8=sizes_holder)
+                0xF9400114,                     # 0x070: ldr x20, [x8] (x20=sizes_arr)
+                0x52801008,                     # 0x074: mov w8, #0x80
+                0xB9000288,                     # 0x078: str w8, [x20]
+                bl_at(0x07C, 0x220),            # 0x07c: bl 0x220 (AwaitBarrier 1)
+                0x29402688,                     # 0x080: ldp w8, w9, [x20]
+                0x0B090100,                     # 0x084: add w0, w8, w9
+                bl_at(0x088, 0x230),            # 0x088: bl 0x230 (malloc)
+                0xF9000260,                     # 0x08c: str x0, [x19]
+                bl_at(0x090, 0x220),            # 0x090: bl 0x220 (AwaitBarrier 2)
+                0xF9400268,                     # 0x094: ldr x8, [x19]
+                0xB40000C8,                     # 0x098: cbz x8, 0x0b0
+                0x528A49C9,                     # 0x09c: mov w9, #0x524e ('NR' little-endian)
+                0x72A609E9,                     # 0x0a0: movk w9, #0x304f, lsl #16 ('NRO0')
+                0xB9001109,                     # 0x0a4: str w9, [x8, #0x10]
+                0x52802009,                     # 0x0a8: mov w9, #0x100
+                0xB9001909,                     # 0x0ac: str w9, [x8, #0x18]
+                0xA94153F3,                     # 0x0b0: ldp x19, x20, [sp, #16]
+                0xA8C37BFD,                     # 0x0b4: ldp x29, x30, [sp], #48
+                0xD65F0FFF,                     # 0x0b8: retab
+            ],
+        )
+
+        # Worker 1 at 0x100
+        put_insns(
+            0x100,
+            [
+                0xD503237F,                     # 0x100: pacibsp
+                0xA9BD7BFD,                     # 0x104: stp x29, x30, [sp, #-48]!
+                0xA90153F3,                     # 0x108: stp x19, x20, [sp, #16]
+                0xA9402013,                     # 0x10c: ldp x19, x8, [x0]
+                0xF9400114,                     # 0x110: ldr x20, [x8]
+                0x52801008,                     # 0x114: mov w8, #0x80
+                0xB9000688,                     # 0x118: str w8, [x20, #4]
+                bl_at(0x11C, 0x220),            # 0x11c: bl 0x220 (AwaitBarrier 1)
+                bl_at(0x120, 0x220),            # 0x120: bl 0x220 (AwaitBarrier 2)
+                0xF9400268,                     # 0x124: ldr x8, [x19]
+                0xB9800289,                     # 0x128: ldrsw x9, [x20]
+                0x8B090108,                     # 0x12c: add x8, x8, x9
+                0x529757C9,                     # 0x130: mov w9, #0xbabe
+                0x72B95FC9,                     # 0x134: movk w9, #0xcafe, lsl #16
+                0xB9000109,                     # 0x138: str w9, [x8]
+                0xA94153F3,                     # 0x13c: ldp x19, x20, [sp, #16]
+                0xA8C37BFD,                     # 0x140: ldp x29, x30, [sp], #48
+                0xD65F0FFF,                     # 0x144: retab
+            ],
+        )
+
+        # Build .rodata (at 0x1000) with MOD0, dynamic table, strtab, symtab, jmprel
+        ro = bytearray(0x1000)
+        struct.pack_into('<I', text, 4, 0x1000)  # mod0 offset at image+4
+        struct.pack_into('<4sii', ro, 0, b'MOD0', 0x20, 0x2000)  # dynamic at 0x1020
+
+        strtab = bytearray(b'\x00')
+        syms = bytearray(24)  # symbol 0 (STN_UNDEF)
+
+        def add_sym(name: str, shndx: int, val: int) -> int:
+            idx = len(syms) // 24
+            name_off = len(strtab)
+            strtab.extend(name.encode('ascii') + b'\x00')
+            info = (1 << 4) | 2
+            syms.extend(struct.pack('<IBBHQQ', name_off, info, 0, shndx, val, 0))
+            return idx
+
+        add_sym('nnMain', 1, 0x020)
+        s_create = add_sym('_ZN2nn2os12CreateThreadEPNS0_10ThreadTypeEPFvPvES3_S3_mii', 0, 0)
+        s_ro_init = add_sym('_ZN2nn2ro10InitializeEv', 0, 0)
+        s_barrier = add_sym('_ZN2nn2os12AwaitBarrierEPNS0_11BarrierTypeE', 0, 0)
+        s_malloc = add_sym('malloc', 0, 0)
+
+        jmprel = bytearray()
+        for slot_off, sym_i in ((0x00, s_create), (0x08, s_ro_init), (0x10, s_barrier), (0x18, s_malloc)):
+            jmprel.extend(struct.pack('<QQq', 0x2000 + slot_off, (sym_i << 32) | 1026, 0))
+
+        symtab_off = 0x1200
+        strtab_off = symtab_off + len(syms)
+        jmprel_off = 0x1600
+        ro[symtab_off - 0x1000:symtab_off - 0x1000 + len(syms)] = syms
+        ro[strtab_off - 0x1000:strtab_off - 0x1000 + len(strtab)] = strtab
+        ro[jmprel_off - 0x1000:jmprel_off - 0x1000 + len(jmprel)] = jmprel
+
+        dyn_entries = [
+            (5, strtab_off),
+            (6, symtab_off),
+            (10, len(strtab)),
+            (11, 24),
+            (23, jmprel_off),
+            (2, len(jmprel)),
+            (0, 0),
+        ]
+        for i, (tag, val) in enumerate(dyn_entries):
+            struct.pack_into('<QQ', ro, 0x20 + i * 16, tag, val)
+
+        data = bytearray(0x1000)
+        hdr = bytearray(0x100)
+        hdr[:4] = b'NSO0'
+        struct.pack_into('<III', hdr, 0x10, 0x100, 0x0, len(text))
+        struct.pack_into('<III', hdr, 0x20, 0x100 + len(text), 0x1000, len(ro))
+        struct.pack_into('<III', hdr, 0x30, 0x100 + len(text) + len(ro), 0x2000, len(data))
+        struct.pack_into('<I', hdr, 0x3C, 0x100)
+        struct.pack_into('<III', hdr, 0x60, len(text), len(ro), len(data))
+        nso_blob = bytes(hdr + text + ro + data)
+
+        expected_nro = bytearray(0x100)
+        expected_nro[0x10:0x14] = b'NRO0'
+        struct.pack_into('<I', expected_nro, 0x18, 0x100)
+        struct.pack_into('<I', expected_nro, 0x80, 0xCAFEBABE)
+        expected_sha = __import__('hashlib').sha256(expected_nro).hexdigest()
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            exe_dir = root / 'ExeFS'
+            exe_dir.mkdir()
+            main_path = exe_dir / 'main'
+            main_path.write_bytes(nso_blob)
+
+            decoded = nro_emu.decode_boot_nro(main_path, max_workers=2)
+            self.assertEqual(decoded, bytes(expected_nro))
+
+            # Non-nxboot NSO without AwaitBarrier/CreateThread imports is rejected before running nnMain
+            non_nxboot = nso_blob.replace(
+                b'_ZN2nn2os12AwaitBarrierEPNS0_11BarrierTypeE',
+                b'_ZN2nn2os12OtherSymbolEPNS0_11BarrierTypeE_',
+            )
+            non_nxboot_path = exe_dir / 'plain_main'
+            non_nxboot_path.write_bytes(non_nxboot)
+            with mock.patch.object(nro_emu._BootNroMachine, 'call') as m_call:
+                with self.assertRaises(E.EmuError):
+                    nro_emu.decode_boot_nro(non_nxboot_path)
+                m_call.assert_not_called()
+
+            # Verify driver.capture_nro decodes offline, updates nro.tsv/missing.tsv, and triggers rewrite
+            repo = QT.parent / 'engine'
+            if (repo / 'scripts/build_ipa_from_nsp.py').is_file():
+                mod = driver.load_upstream(repo)
+                driver.patch(mod, repo)
+                nro_dir = root / 'nro_v0'
+                nro_dir.mkdir()
+                (nro_dir / 'missing.tsv').write_text(f'{expected_sha}\tnrr.nrr\n', encoding='utf-8')
+                (nro_dir / 'nro.tsv').write_text('# name\tsha256\tsize\tnrr\twhere\n', encoding='utf-8')
+                rewrite_calls: list[Path] = []
+                orig_rewrite = mod.rewrite
+
+                def fake_rewrite(py_, repo_, ed, out_, env_, logs_, g_, prov_=False, *a, **kw):
+                    rewrite_calls.append(Path(out_))
+                    return g_
+
+                try:
+                    mod.rewrite = fake_rewrite
+                    sentinel_g = object()
+                    res = mod.capture_nro(
+                        sys.executable,
+                        repo,
+                        exe_dir,
+                        root / 'patched_v0',
+                        nro_dir,
+                        {},
+                        root,
+                        sentinel_g,
+                        False,
+                    )
+                finally:
+                    mod.rewrite = orig_rewrite
+
+                self.assertIs(res, sentinel_g)
+                self.assertEqual(rewrite_calls, [root / 'patched_v0'])
+                self.assertEqual((nro_dir / 'nro0.nro').read_bytes(), bytes(expected_nro))
+                self.assertEqual((nro_dir / 'missing.tsv').read_text(encoding='utf-8'), '')
+                self.assertIn(
+                    f'nro0\t{expected_sha}\t256\tnrr.nrr\tcapture',
+                    (nro_dir / 'nro.tsv').read_text(encoding='utf-8'),
+                )
+
+
+class WindowsDefenderExclusionsTest(unittest.TestCase):
+    """End-to-end unit tests for nspb_qt.win.defender and Model's Defender integration.
+
+    Runs on all platforms with or without PySide6 installed.
+    """
+
+    def setUp(self) -> None:
+        from nspb_qt.win import defender
+        self.defender = defender
+        self.defender._STATE_CACHE = None
+
+    def tearDown(self) -> None:
+        self.defender._STATE_CACHE = None
+
+    def test_safe_exclusion_dir_refuses_roots_system_and_broad_profile_folders(self) -> None:
+        d = self.defender
+        for unsafe in (
+            '',
+            '   ',
+            '/',
+            'C:',
+            'C:\\',
+            'D:\\',
+            'D:/',
+            r'\\server\share',
+            r'\\server\share\\',
+            r'C:\Windows',
+            r'C:\Windows\System32',
+            r'C:\Windows\Temp',
+            r'C:\Program Files',
+            r'C:\Program Files (x86)',
+            r'C:\ProgramData',
+            r'C:\Users',
+            r'C:\Users\Public',
+            r'C:\Users\Alice',
+            r'C:\Users\Alice\Desktop',
+            r'C:\Users\Alice\Downloads',
+            r'C:\Users\Alice\Documents',
+            r'C:\Users\Alice\AppData',
+            r'C:\Users\Alice\AppData\Local',
+            r'C:\Users\Alice\AppData\Roaming',
+            r'C:\Users\Alice\AppData\LocalLow',
+            r'C:\Users\Alice\AppData\Local\Temp',
+            str(Path.home()),
+            str(Path.home() / 'Downloads'),
+            str(Path.home() / 'Desktop'),
+            str(Path.home() / 'Documents'),
+        ):
+            self.assertFalse(
+                d.is_safe_exclusion_dir(unsafe),
+                f'expected unsafe directory to be refused: {unsafe!r}',
+            )
+
+        for safe in (
+            r'C:\Users\Alice\AppData\Local\NS Port Builder',
+            r'C:\Users\Alice\Downloads\01007ef00011e000_build',
+            r'C:\Users\Alice\Desktop\010015100b514000_build',
+            r'D:\SwitchGames',
+            r"E:\Games\塞尔达传说 O'Brien $100",
+        ):
+            self.assertTrue(
+                d.is_safe_exclusion_dir(safe),
+                f'expected specific build/game directory to be allowed: {safe!r}',
+            )
+
+        # Bare process names and binaries in system/broad folders must be refused
+        for unsafe_proc in (
+            '',
+            'clang.exe',
+            'zstd.exe',
+            'python.exe',
+            'dmsh_xlate.exe',
+            r'C:\Windows\System32\cmd.exe',
+            r'C:\Users\Alice\Downloads\clang.exe',
+            r'C:\Users\Alice\AppData\Local\Temp\evil.exe',
+            r'C:\Users\Alice\AppData\Local\NS Port Builder\tools\not_an_exe.dll',
+        ):
+            self.assertFalse(
+                d.is_safe_exclusion_process(unsafe_proc),
+                f'expected unsafe process exclusion to be refused: {unsafe_proc!r}',
+            )
+        for safe_proc in (
+            r'C:\Users\Alice\AppData\Local\NS Port Builder\tools\llvm-mingw-20261020\bin\clang.exe',
+            r'C:\Users\Alice\AppData\Local\NS Port Builder\tools\python-3.12.10\python.exe',
+            r'D:\MetalTools\macos\bin\metal.exe',
+        ):
+            self.assertTrue(
+                d.is_safe_exclusion_process(safe_proc),
+                f'expected full toolchain binary path to be allowed: {safe_proc!r}',
+            )
+
+    def test_collect_exclusions_and_status_lifecycle_with_cache_invalidation(self) -> None:
+        d = self.defender
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake_appdata = root / 'AppData' / 'Local' / 'NS Port Builder'
+            fake_tools = fake_appdata / 'tools'
+            fake_tools.mkdir(parents=True)
+
+            with mock.patch.object(tc, 'tools_dir', return_value=fake_tools):
+                # 1. When base_dir is broad Downloads, base_dir is skipped while specific work_dir is kept.
+                #    When games_folder covers work_dir, the child work_dir is deduplicated under games_folder.
+                folders, procs = d.collect_exclusions(
+                    games_folder=r'D:\SwitchGames',
+                    base_dir=r'C:\Users\Alice\Downloads',
+                    work_dir=r'C:\Users\Alice\Downloads\01007ef00011e000_build',
+                    out_dir=r'D:\SwitchGames\out',
+                )
+                norm_keys = {d._norm_key(p) for p in folders}
+                self.assertIn(d._norm_key(fake_appdata), norm_keys)
+                self.assertIn(d._norm_key(r'D:\SwitchGames'), norm_keys)
+                self.assertIn(d._norm_key(r'C:\Users\Alice\Downloads\01007ef00011e000_build'), norm_keys)
+                self.assertNotIn(d._norm_key(r'C:\Users\Alice\Downloads'), norm_keys)
+                # D:\SwitchGames\out is already covered by parent D:\SwitchGames
+                self.assertNotIn(d._norm_key(r'D:\SwitchGames\out'), norm_keys)
+                self.assertGreaterEqual(len(procs), 15)
+                # Every excluded process must be a full path inside a safe directory, never a bare exe name
+                for p in procs:
+                    self.assertTrue(d.is_safe_exclusion_process(p), f'expected full safe path, got {p!r}')
+                    self.assertTrue('\\' in p or '/' in p, f'bare process name leaked: {p!r}')
+                basenames = {p.replace('\\', '/').rsplit('/', 1)[-1].lower() for p in procs}
+                for req_proc in ('dmsh_xlate.exe', 'spirv-cross.exe', 'metal.exe', 'air-lld.exe', 'metallib.exe', 'clang.exe'):
+                    self.assertIn(req_proc.lower(), basenames)
+
+                # 2. Status transitions: needed -> ready -> partial -> ready
+                st0, f0, p0 = d.exclusions_status(games_folder=r'D:\SwitchGames')
+                self.assertEqual(st0, 'needed')
+
+                d.save_recorded_state(f0, p0)
+                st1, _, _ = d.exclusions_status(
+                    games_folder=r'D:\SwitchGames',
+                    work_dir=r'D:\SwitchGames\01007ef00011e000_build',
+                )
+                self.assertEqual(st1, 'ready', 'child work_dir under excluded games_folder must be ready')
+
+                st2, f2, p2 = d.exclusions_status(
+                    games_folder=r'D:\SwitchGames',
+                    out_dir=r'E:\NewOutputFolder',
+                )
+                self.assertEqual(st2, 'partial', 'newly added uncovered out_dir must report partial')
+
+                d.save_recorded_state(f2, p2)
+                st3, _, _ = d.exclusions_status(
+                    games_folder=r'D:\SwitchGames',
+                    out_dir=r'E:\NewOutputFolder',
+                )
+                self.assertEqual(st3, 'ready')
+
+                # 2b. Installing LLVM / Python / Metal on disk after exclusions were added must keep
+                # the exact same \bin\*.exe paths and 'ready' status, and must NEVER spawn a subprocess
+                llvm_bin = fake_tools / f'llvm-mingw-{tc.LLVM_MINGW_VERSION}' / 'bin'
+                llvm_bin.mkdir(parents=True, exist_ok=True)
+                (llvm_bin / 'clang.exe').write_bytes(b'MZ')
+                py_dir = fake_tools / f'python-{tc.PYTHON_VERSION}'
+                py_dir.mkdir(parents=True, exist_ok=True)
+                (py_dir / 'python.exe').write_bytes(b'MZ')
+                metal_bin = fake_tools / 'metal-developer-tools' / 'macos' / 'bin'
+                metal_bin.mkdir(parents=True, exist_ok=True)
+                (metal_bin / 'metal.exe').write_bytes(b'MZ')
+                with mock.patch('subprocess.run', side_effect=AssertionError('must not spawn subprocess on UI thread')), \
+                        mock.patch.object(tc, 'setting', return_value=None):
+                    st_installed, _, procs_installed = d.exclusions_status(
+                        games_folder=r'D:\SwitchGames',
+                        out_dir=r'E:\NewOutputFolder',
+                    )
+                self.assertEqual(st_installed, 'ready', 'installing toolchain must not drift process paths to partial')
+                self.assertTrue(any(p.replace('/', '\\').lower().endswith(r'\bin\clang.exe') for p in procs_installed))
+                self.assertTrue(any(p.replace('/', '\\').lower().endswith(r'\bin\ld64.lld.exe') for p in procs_installed))
+
+                # 3. External modification of defender_exclusions.json invalidates _STATE_CACHE via (path, size, mtime)
+                st_file = d.state_file_path()
+                st_file.write_text('{"paths": [], "processes": []}', encoding='utf-8')
+                st4, _, _ = d.exclusions_status(games_folder=r'D:\SwitchGames')
+                self.assertEqual(st4, 'needed')
+
+    def test_apply_exclusions_powershell_encoding_uac_cancel_and_result_verification(self) -> None:
+        import base64
+        import re
+        d = self.defender
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake_tools = root / 'NS Port Builder' / 'tools'
+            fake_tools.mkdir(parents=True)
+            tricky_dir = r"D:\Switch 游戏\Zelda O'Brien $HOME"
+
+            with mock.patch.object(tc, 'tools_dir', return_value=fake_tools):
+                folders, procs = d.collect_exclusions(games_folder=tricky_dir)
+
+                def extract_payload(cmd: list[str]) -> tuple[str, str, dict]:
+                    self.assertEqual(cmd[0], 'powershell.exe')
+                    outer_b64 = cmd[cmd.index('-EncodedCommand') + 1]
+                    outer_ps = base64.b64decode(outer_b64).decode('utf-16-le')
+                    self.assertIn('-Verb RunAs', outer_ps)
+                    m_arg = re.search(r'\$argList\s*=\s*@\(([^)]+)\)', outer_ps)
+                    self.assertIsNotNone(m_arg)
+                    self.assertLess(len(m_arg.group(1)), 512, 'elevated RunAs arguments must stay compact')
+                    m_ps1 = re.search(r"'-File',\s*'([^']+(?:''[^']+)*\.ps1)'", outer_ps)
+                    self.assertIsNotNone(m_ps1, f'expected -File *.ps1 in outer script, got:\n{outer_ps}')
+                    ps1_path = Path(m_ps1.group(1).replace("''", "'"))
+                    raw_ps1 = ps1_path.read_bytes()
+                    self.assertTrue(raw_ps1.startswith(b'\xef\xbb\xbf'), 'elevated .ps1 must include UTF-8 BOM')
+                    inner_ps = raw_ps1.decode('utf-8-sig')
+                    m_path = re.search(r"\$payloadPath = '([^']+(?:''[^']+)*)'", inner_ps)
+                    self.assertIsNotNone(m_path)
+                    payload_path = Path(m_path.group(1).replace("''", "'"))
+                    raw_payload = payload_path.read_text(encoding='utf-8')
+                    self.assertTrue(raw_payload.isascii(), 'payload.json should use ASCII \\u escapes')
+                    payload = json.loads(raw_payload)
+                    return outer_ps, inner_ps, payload
+
+                # Case A: UAC cancelled by user (exit code 1223) -> cancelled=True, state NOT saved
+                def runner_uac_cancelled(cmd, **_kw):
+                    _outer, inner_ps, payload = extract_payload(cmd)
+                    self.assertIn('Add-MpPreference -ExclusionPath', inner_ps)
+                    self.assertIn('Add-MpPreference -ExclusionProcess', inner_ps)
+                    self.assertIn(d._norm_win_path(tricky_dir), payload['paths'])
+                    return subprocess.CompletedProcess(cmd, d.ERROR_CANCELLED, '', '')
+
+                res_cancel = d.apply_exclusions(folders, procs, runner=runner_uac_cancelled)
+                self.assertFalse(res_cancel.ok)
+                self.assertTrue(res_cancel.cancelled)
+                self.assertFalse(d.state_file_path().exists(), 'cancelled UAC must not record state')
+
+                # Case B: Process exits 0 WITHOUT writing result.json -> must be rejected (no false positive)
+                def runner_no_result_file(cmd, **_kw):
+                    extract_payload(cmd)
+                    return subprocess.CompletedProcess(cmd, 0, '', '')
+
+                res_no_file = d.apply_exclusions(folders, procs, runner=runner_no_result_file)
+                self.assertFalse(res_no_file.ok)
+                self.assertFalse(res_no_file.cancelled)
+                self.assertIn('without writing result.json', res_no_file.error)
+                self.assertFalse(d.state_file_path().exists())
+
+                # Case C: Inner script writes ok=False in result.json -> must report failure even if returncode is 0
+                def runner_inner_error(cmd, **_kw):
+                    _outer, _inner, payload = extract_payload(cmd)
+                    Path(payload['result_path']).write_text(
+                        json.dumps({'ok': False, 'error': 'Tamper Protection blocked exclusion'}),
+                        encoding='utf-8',
+                    )
+                    return subprocess.CompletedProcess(cmd, 0, '', '')
+
+                res_err = d.apply_exclusions(folders, procs, runner=runner_inner_error)
+                self.assertFalse(res_err.ok)
+                self.assertIn('Tamper Protection blocked exclusion', res_err.error)
+                self.assertFalse(d.state_file_path().exists())
+
+                # Case D: Elevated PowerShell succeeds and writes ok=True in result.json -> recorded and ready
+                seen_result_parent: list[Path] = []
+
+                def runner_ok(cmd, **_kw):
+                    _outer, _inner, payload = extract_payload(cmd)
+                    r_path = Path(payload['result_path'])
+                    seen_result_parent.append(r_path.parent)
+                    r_path.write_text(json.dumps({'ok': True, 'error': ''}), encoding='utf-8')
+                    return subprocess.CompletedProcess(cmd, 0, '', '')
+
+                res_ok = d.apply_exclusions(folders, [*procs, 'bare_evil.exe'], runner=runner_ok)
+                self.assertTrue(res_ok.ok)
+                self.assertFalse(res_ok.cancelled)
+                self.assertNotIn('bare_evil.exe', res_ok.added_processes)
+                self.assertTrue(d.state_file_path().is_file())
+                self.assertFalse(seen_result_parent[0].exists(), 'temporary payload directory must be cleaned up')
+                st_after, _, _ = d.exclusions_status(games_folder=tricky_dir)
+                self.assertEqual(st_after, 'ready')
+
+                # Case E: remove_exclusions batches >20 historical dirs, reconciles remaining_paths on partial error, and deletes state file when all removed
+                many_historical = [rf'D:\HistoricalGames\Folder_{i:02d}' for i in range(45)]
+                d.save_recorded_state(many_historical, procs)
+                rec_before_p, _ = d.load_recorded_state()
+                self.assertGreaterEqual(len(rec_before_p), 46)
+
+                # E1: Partial removal failure retains remaining_paths in defender_exclusions.json
+                def runner_remove_partial(cmd, **_kw):
+                    _outer, inner_ps, payload = extract_payload(cmd)
+                    self.assertIn('$batchSize = 20', inner_ps)
+                    self.assertIn('Get-MpPreference', inner_ps)
+                    self.assertGreaterEqual(len(payload['paths']), 46)
+                    Path(payload['result_path']).write_text(
+                        json.dumps({
+                            'ok': False,
+                            'error': 'WMI locked one item',
+                            'remaining_paths': [many_historical[0]],
+                            'remaining_processes': [],
+                        }),
+                        encoding='utf-8',
+                    )
+                    return subprocess.CompletedProcess(cmd, 0, '', '')
+
+                res_rem_part = d.remove_exclusions(runner=runner_remove_partial)
+                self.assertFalse(res_rem_part.ok)
+                self.assertEqual(d.load_recorded_state(), ([many_historical[0]], []))
+
+                # E2: Full removal deletes defender_exclusions.json
+                def runner_remove_ok(cmd, **_kw):
+                    _outer, inner_ps, payload = extract_payload(cmd)
+                    self.assertIn('Remove-MpPreference -ExclusionPath', inner_ps)
+                    self.assertIn('Remove-MpPreference -ExclusionProcess', inner_ps)
+                    Path(payload['result_path']).write_text(
+                        json.dumps({'ok': True, 'error': '', 'remaining_paths': [], 'remaining_processes': []}),
+                        encoding='utf-8',
+                    )
+                    return subprocess.CompletedProcess(cmd, 0, '', '')
+
+                res_rem = d.remove_exclusions(runner=runner_remove_ok)
+                self.assertTrue(res_rem.ok)
+                self.assertFalse(d.state_file_path().exists(), 'state file must be deleted after removal')
+                st_removed, _, _ = d.exclusions_status(games_folder=tricky_dir)
+                self.assertEqual(st_removed, 'needed')
+
+    def test_defender_clixml_progress_stripping_win11_early_exit_and_tamper_codes(self) -> None:
+        import base64
+        import re
+        import threading
+        import time
+        d = self.defender
+
+        progress_xml = (
+            '#< CLIXML\n'
+            '<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04">'
+            '<Obj S="progress" RefId="0"><TN RefId="0">'
+            '<T>System.Management.Automation.PSCustomObject</T><T>System.Object</T></TN>'
+            '<MS><I64 N="SourceId">1</I64><PR N="Record">'
+            '<AV>\ufffd\ufffd\ufffd\ufffd\ufffd</AV><AI>0</AI><Nil /><PI>-1</PI><PC>-1</PC>'
+            '<T>Completed</T><SR>-1</SR><SD> </SD></PR></MS></Obj></Objs>'
+        )
+        self.assertEqual(d.sanitize_powershell_output(progress_xml), '')
+
+        mixed_xml = (
+            progress_xml
+            + '<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04">'
+            + '<S S="Error">Add-MpPreference : &lt;Tamper blocked&gt;_x000D__x000A_</S>'
+            + '</Objs>'
+        )
+        self.assertEqual(
+            d.sanitize_powershell_output(mixed_xml),
+            'Add-MpPreference : <Tamper blocked>',
+        )
+
+        # Localized Windows console codepage bytes must decode cleanly instead of mojibake
+        self.assertEqual(d._decode_console_bytes('正在准备'.encode('gbk')), '正在准备')
+
+        # Generated scripts must record started.json inside try/catch and guard HideExclusionsFromLocalAdmins
+        elev_script = d.build_inner_elevation_script(r'C:\Users\Test\payload.json')
+        self.assertIn("$ProgressPreference = 'SilentlyContinue'", elev_script)
+        self.assertIn('Write-AtomicJson $startedPath @{ pid = $PID }', elev_script)
+        self.assertIn('HideExclusionsFromLocalAdmins', elev_script)
+        self.assertIn('Get-DefenderFailureCode', elev_script)
+        self.assertLess(
+            elev_script.index('try {'),
+            elev_script.index('ReadAllText($payloadPath'),
+            'reading payload.json must sit inside top-level try/catch',
+        )
+
+        # Progress-only CLIXML bytes on stderr without result.json must never leak XML into user-facing error
+        with tempfile.TemporaryDirectory() as td:
+            fake_tools = Path(td) / 'NS Port Builder' / 'tools'
+            fake_tools.mkdir(parents=True)
+            with mock.patch.object(tc, 'tools_dir', return_value=fake_tools):
+                folders, procs = d.collect_exclusions(games_folder=r'D:\Games')
+
+                def runner_progress_only(cmd, **_kw):
+                    return subprocess.CompletedProcess(cmd, 1, b'', progress_xml.encode('gbk', errors='replace'))
+
+                res = d.apply_exclusions(folders, procs, runner=runner_progress_only)
+                self.assertFalse(res.ok)
+                self.assertNotIn('CLIXML', res.error)
+                self.assertNotIn('<Obj', res.error)
+                self.assertIn('without writing result.json', res.error)
+
+                def runner_clixml_real_error(cmd, **_kw):
+                    return subprocess.CompletedProcess(cmd, 1, b'', mixed_xml.encode('utf-8'))
+
+                res_real = d.apply_exclusions(folders, procs, runner=runner_clixml_real_error)
+                self.assertFalse(res_real.ok)
+                self.assertIn('<Tamper blocked>', res_real.error)
+
+                # Native result_path error_code must flow through DefenderResult
+                def runner_tamper_code(cmd, **_kw):
+                    outer_b64 = cmd[cmd.index('-EncodedCommand') + 1]
+                    outer_ps = base64.b64decode(outer_b64).decode('utf-16-le')
+                    m_ps1 = re.search(r"'-File',\s*'([^']+(?:''[^']+)*\.ps1)'", outer_ps)
+                    inner_ps = Path(m_ps1.group(1).replace("''", "'")).read_text(encoding='utf-8-sig')
+                    m_path = re.search(r"\$payloadPath = '([^']+(?:''[^']+)*)'", inner_ps)
+                    payload = json.loads(Path(m_path.group(1).replace("''", "'")).read_text(encoding='utf-8'))
+                    Path(payload['result_path']).write_text(
+                        json.dumps({'ok': False, 'error': 'blocked', 'error_code': 'tamper_blocked'}),
+                        encoding='utf-8',
+                    )
+                    return subprocess.CompletedProcess(cmd, 1, b'', b'')
+
+                res_tamper = d.apply_exclusions(folders, procs, runner=runner_tamper_code)
+                self.assertFalse(res_tamper.ok)
+                self.assertEqual(res_tamper.error_code, 'tamper_blocked')
+
+        # Win11 Windows Terminal delegation: initial broker exits at t=0, elevated script writes result.json later
+        with tempfile.TemporaryDirectory() as td:
+            work = Path(td)
+            res_f = work / 'result.json'
+            start_f = work / 'started.json'
+
+            def delayed_elevated():
+                time.sleep(0.06)
+                start_f.write_text(json.dumps({'pid': 424242}), encoding='utf-8')
+                time.sleep(0.08)
+                res_f.write_text(json.dumps({'ok': True, 'error': ''}), encoding='utf-8')
+
+            th = threading.Thread(target=delayed_elevated, daemon=True)
+            th.start()
+            got_res = d._wait_for_elevated_result(
+                res_f,
+                start_f,
+                initial_done_fn=lambda: True,
+                pid_alive_fn=lambda pid: pid == 424242,
+                timeout_sec=3.0,
+                early_start_grace_sec=1.0,
+                poll_interval_sec=0.01,
+            )
+            th.join(timeout=1.0)
+            self.assertTrue(got_res)
+            self.assertTrue(res_f.is_file())
+
+            # Dead inner pid without result.json must stop early instead of waiting for full timeout
+            work2 = Path(td) / 'dead'
+            work2.mkdir()
+            res_f2 = work2 / 'result.json'
+            start_f2 = work2 / 'started.json'
+            start_f2.write_text(json.dumps({'pid': 999999}), encoding='utf-8')
+            t0 = time.monotonic()
+            got_res2 = d._wait_for_elevated_result(
+                res_f2,
+                start_f2,
+                initial_done_fn=lambda: True,
+                pid_alive_fn=lambda _pid: False,
+                timeout_sec=5.0,
+                early_start_grace_sec=1.0,
+                poll_interval_sec=0.01,
+            )
+            self.assertFalse(got_res2)
+            self.assertLess(time.monotonic() - t0, 1.0)
+
+        # Transient PermissionError on rmdir retries cleanly, removes empty stale defender-* sibling dirs,
+        # and preserves non-empty sibling dirs; _launch_elevated_win32 avoids locking work_td as lpDirectory
+        import inspect
+        launch_src = inspect.getsource(d._launch_elevated_win32)
+        self.assertIn('Path(work_td).parent', launch_src)
+        self.assertNotIn('sei.lpDirectory = work_td', launch_src)
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            work_dir = base / 'defender-current'
+            work_dir.mkdir()
+            temp_file = work_dir / 'result.json'
+            temp_file.write_text('{}', encoding='utf-8')
+            stale_empty = base / 'defender-stale'
+            stale_empty.mkdir()
+            stale_active = base / 'defender-active'
+            stale_active.mkdir()
+            (stale_active / 'payload.json').write_text('{}', encoding='utf-8')
+
+            real_rmdir = os.rmdir
+            attempts = {'n': 0}
+
+            def flaky_rmdir(path):
+                if Path(path) == work_dir and attempts['n'] < 2:
+                    attempts['n'] += 1
+                    raise PermissionError(32, 'directory handle still held')
+                return real_rmdir(path)
+
+            with mock.patch('nspb_qt.win.defender.os.rmdir', side_effect=flaky_rmdir), \
+                 mock.patch('nspb_qt.win.defender.time.sleep'):
+                d._cleanup_work_dir(str(work_dir), temp_file)
+
+            self.assertEqual(attempts['n'], 2)
+            self.assertFalse(work_dir.exists())
+            self.assertFalse(stale_empty.exists())
+            self.assertTrue((stale_active / 'payload.json').is_file())
+
+    def test_ipc_work_dir_avoids_mkdtemp_owner_rights_and_grants_caller_dacl(self) -> None:
+        import base64
+        import re
+        d = self.defender
+        with tempfile.TemporaryDirectory() as td:
+            fake_tools = Path(td) / 'NS Port Builder' / 'tools'
+            fake_tools.mkdir(parents=True)
+            seen_dirs: list[Path] = []
+
+            def fake_runner(cmd, **_kw):
+                outer_b64 = cmd[cmd.index('-EncodedCommand') + 1]
+                outer_ps = base64.b64decode(outer_b64).decode('utf-16-le')
+                m_ps1 = re.search(r"'-File',\s*'([^']+(?:''[^']+)*\.ps1)'", outer_ps)
+                ps1_path = Path(m_ps1.group(1).replace("''", "'"))
+                seen_dirs.append(ps1_path.parent)
+                inner_ps = ps1_path.read_text(encoding='utf-8-sig')
+                self.assertIn('GetAccessControl($payloadPath)', inner_ps)
+                self.assertIn('SetAccessControl($tmpPath, $dacl)', inner_ps)
+                self.assertIn('AccessControlSections]::Access', inner_ps)
+                m_path = re.search(r"\$payloadPath = '([^']+(?:''[^']+)*)'", inner_ps)
+                payload = json.loads(Path(m_path.group(1).replace("''", "'")).read_text(encoding='utf-8'))
+                Path(payload['result_path']).write_text(
+                    json.dumps({'ok': True, 'error': '', 'error_code': ''}),
+                    encoding='utf-8',
+                )
+                return subprocess.CompletedProcess(cmd, 0, b'', b'')
+
+            with mock.patch.object(tc, 'tools_dir', return_value=fake_tools), \
+                 mock.patch('nspb_qt.win.defender.tempfile.mkdtemp', side_effect=AssertionError('must not call mkdtemp')):
+                folders, procs = d.collect_exclusions(games_folder=r'D:\Games')
+                res = d.apply_exclusions(folders, procs, runner=fake_runner)
+
+            self.assertTrue(res.ok, res.error)
+            self.assertEqual(len(seen_dirs), 1)
+            self.assertTrue(seen_dirs[0].name.startswith('defender-'))
+            self.assertFalse(seen_dirs[0].exists())
+
+    def test_result_json_transient_permission_error_retries_and_surfaces_unrecoverable_error(self) -> None:
+        import base64
+        import re
+        d = self.defender
+        with tempfile.TemporaryDirectory() as td:
+            fake_tools = Path(td) / 'NS Port Builder' / 'tools'
+            fake_tools.mkdir(parents=True)
+            real_read_text = Path.read_text
+
+            def runner_ok(cmd, **_kw):
+                outer_b64 = cmd[cmd.index('-EncodedCommand') + 1]
+                outer_ps = base64.b64decode(outer_b64).decode('utf-16-le')
+                m_ps1 = re.search(r"'-File',\s*'([^']+(?:''[^']+)*\.ps1)'", outer_ps)
+                inner_ps = real_read_text(Path(m_ps1.group(1).replace("''", "'")), encoding='utf-8-sig')
+                m_path = re.search(r"\$payloadPath = '([^']+(?:''[^']+)*)'", inner_ps)
+                payload = json.loads(real_read_text(Path(m_path.group(1).replace("''", "'")), encoding='utf-8'))
+                Path(payload['result_path']).write_text(
+                    json.dumps({'ok': True, 'error': '', 'error_code': ''}),
+                    encoding='utf-8',
+                )
+                return subprocess.CompletedProcess(cmd, 0, b'', b'')
+
+            # Scenario A: two transient sharing-violation failures on result.json, third attempt succeeds
+            transient_reads = {'n': 0}
+
+            def flaky_read_text(path_self, *args, **kwargs):
+                if path_self.name == 'result.json' and transient_reads['n'] < 2:
+                    transient_reads['n'] += 1
+                    raise PermissionError(32, 'WinError 32: file in use by AV scan')
+                return real_read_text(path_self, *args, **kwargs)
+
+            with mock.patch.object(tc, 'tools_dir', return_value=fake_tools), \
+                 mock.patch.object(Path, 'read_text', autospec=True, side_effect=flaky_read_text), \
+                 mock.patch('nspb_qt.win.defender.time.sleep'):
+                folders, procs = d.collect_exclusions(games_folder=r'D:\Games')
+                res_a = d.apply_exclusions(folders, procs, runner=runner_ok)
+
+            self.assertTrue(res_a.ok, res_a.error)
+            self.assertEqual(transient_reads['n'], 2)
+
+            # Scenario B: persistent ACL denial with exit code 0 must report real read error, never 'exit code 0'
+            def denied_read_text(path_self, *args, **kwargs):
+                if path_self.name == 'result.json':
+                    raise PermissionError(5, 'WinError 5: Access is denied')
+                return real_read_text(path_self, *args, **kwargs)
+
+            with mock.patch.object(tc, 'tools_dir', return_value=fake_tools), \
+                 mock.patch.object(Path, 'read_text', autospec=True, side_effect=denied_read_text), \
+                 mock.patch('nspb_qt.win.defender.time.sleep'):
+                res_b = d.apply_exclusions(folders, procs, runner=runner_ok)
+
+            self.assertFalse(res_b.ok)
+            self.assertIn('failed to read result.json', res_b.error)
+            self.assertIn('PermissionError', res_b.error)
+            self.assertNotEqual(res_b.error.strip(), 'exit code 0')
+
+    def test_model_defender_generation_guard_and_all_seven_languages(self) -> None:
+        import ast
+        from nspb_qt.i18n import Lang
+        from nspb_qt.l10n import t as l10n_t
+
+        # 1. Verify all 29 defender.* keys exist, contain no semicolons, and format cleanly across all 10 languages
+        self.assertGreaterEqual(len(Lang.all()), 10)
+        defender_keys = (
+            'defender.addBtn',
+            'defender.addingBtn',
+            'defender.msg.added',
+            'defender.msg.cancelled',
+            'defender.msg.failed',
+            'defender.msg.inactive',
+            'defender.msg.removed',
+            'defender.msg.tamperBlocked',
+            'defender.msg.waiting',
+            'defender.note',
+            'defender.prompt.addAndBuild',
+            'defender.prompt.body',
+            'defender.prompt.confirmApply',
+            'defender.prompt.dontAskAgain',
+            'defender.prompt.foldersHeader',
+            'defender.prompt.procsHeader',
+            'defender.prompt.securityNote',
+            'defender.prompt.skipOnce',
+            'defender.prompt.title',
+            'defender.removeBtn',
+            'defender.removePrompt.body',
+            'defender.removePrompt.confirm',
+            'defender.removePrompt.title',
+            'defender.status.needed',
+            'defender.status.partial',
+            'defender.status.ready',
+            'defender.summary',
+            'defender.title',
+            'defender.updateBtn',
+        )
+        for lg in Lang.all():
+            for key in defender_keys:
+                if key in ('defender.msg.added', 'defender.summary'):
+                    val = l10n_t(key, lg, 3, 16)
+                elif key == 'defender.msg.failed':
+                    val = l10n_t(key, lg, 'access denied')
+                else:
+                    val = l10n_t(key, lg)
+                self.assertTrue(val and val != key, f'missing translation for {key} in {lg.code}')
+                self.assertNotIn('%@', val, f'unformatted placeholder in {key} ({lg.code}): {val}')
+                self.assertNotIn(';', val, f'semicolon forbidden in UI string {key} ({lg.code}): {val}')
+                self.assertNotIn('；', val, f'fullwidth semicolon forbidden in UI string {key} ({lg.code}): {val}')
+
+        # 2. Verify Model.apply_defender_exclusions and remove_defender_exclusions generation guard
+        src = (QT / 'nspb_qt' / 'model.py').read_text(encoding='utf-8')
+        tree = ast.parse(src)
+        cls_node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'Model')
+        wanted = {
+            '_current_build_dirs',
+            '_defender_failure_message',
+            'defender_info',
+            'should_prompt_defender_before_build',
+            'apply_defender_exclusions',
+            'remove_defender_exclusions',
+            '_invoke_defender_done',
+        }
+        methods = [n for n in cls_node.body if isinstance(n, ast.FunctionDef) and n.name in wanted]
+        mod_node = ast.fix_missing_locations(ast.Module(body=methods, type_ignores=[]))
+
+        pending_workers: list = []
+
+        class _ManualThread:
+            def __init__(self, target=None, daemon=None):
+                self._target = target
+
+            def start(self):
+                if self._target:
+                    pending_workers.append(self._target)
+
+        class _Sig:
+            def emit(self):
+                pass
+
+        class _DummyQThread:
+            @staticmethod
+            def currentThread():
+                return 'main'
+
+        ns: dict = {
+            'Path': Path,
+            'Callable': object,
+            'Slot': lambda *a, **k: (lambda fn: fn),
+            'Q_ARG': lambda *_a: None,
+            'QThread': _DummyQThread,
+            'QMetaObject': type('QM', (), {'invokeMethod': staticmethod(lambda obj, name, *_a: getattr(obj, name)())}),
+            'Qt': type('Qt', (), {'QueuedConnection': 1}),
+            'threading': type('T', (), {'Thread': _ManualThread}),
+            'pu': type('PU', (), {'IS_WIN': True}),
+            '__package__': 'nspb_qt',
+        }
+        exec(compile(mod_node, str(QT / 'nspb_qt' / 'model.py'), 'exec'), ns)
+
+        class _Harness:
+            _current_build_dirs = ns['_current_build_dirs']
+            _defender_failure_message = ns['_defender_failure_message']
+            defender_info = ns['defender_info']
+            should_prompt_defender_before_build = ns['should_prompt_defender_before_build']
+            apply_defender_exclusions = ns['apply_defender_exclusions']
+            remove_defender_exclusions = ns['remove_defender_exclusions']
+            _invoke_defender_done = ns['_invoke_defender_done']
+            show_defender_ui = True
+            build_key = '01007EF00011E000'
+            repo_ok = False
+
+            def __init__(self):
+                import threading as real_th
+                self.lang = Lang('zh')
+                self.library = type('Lib', (), {'games_folder': r'D:\SwitchGames', 'games': []})()
+                self.out_dir = ''
+                self.base_path = ''
+                self.game_dir = ''
+                self.game_folder = None
+                self.shell_cache_path = r'D:\ShellCache'
+                self.repo_path = ''
+                self.defender_busy = False
+                self.defender_status_msg = ''
+                self.defender_status_ok = False
+                self._defender_gen = 0
+                self._defender_lock = real_th.RLock()
+                self._defender_callbacks = {}
+                self.repoChanged = _Sig()
+                self.depsChanged = _Sig()
+                self.logs: list[str] = []
+                self._settings: dict[str, bool] = {}
+
+            def _emit_repo_changed(self) -> None:
+                self.repoChanged.emit()
+
+            def _emit_deps_changed(self) -> None:
+                self.depsChanged.emit()
+
+            def thread(self):
+                return 'main'
+
+            def log(self, msg: str) -> None:
+                self.logs.append(msg)
+
+            def t(self, key: str, *args: object) -> str:
+                return l10n_t(key, self.lang, *args)
+
+            def settings_value(self, k: str, default=False):
+                return self._settings.get(k, default)
+
+            def settings_set(self, k: str, val: bool) -> None:
+                self._settings[k] = val
+
+        h = _Harness()
+        cb1_calls: list[tuple[bool, bool]] = []
+        cb2_calls: list[tuple[bool, bool]] = []
+
+        with tempfile.TemporaryDirectory() as td:
+            fake_tools = Path(td) / 'NS Port Builder' / 'tools'
+            fake_tools.mkdir(parents=True)
+            with mock.patch.object(tc, 'tools_dir', return_value=fake_tools):
+                self.assertTrue(h.should_prompt_defender_before_build())
+                h.apply_defender_exclusions(on_done=lambda ok, c, _m: cb1_calls.append((ok, c)))
+                self.assertEqual(len(pending_workers), 1)
+                w1 = pending_workers.pop(0)
+
+                # Simulate a second request superseding the first before w1 finishes
+                h.defender_busy = False
+                h.apply_defender_exclusions(on_done=lambda ok, c, _m: cb2_calls.append((ok, c)))
+                self.assertEqual(len(pending_workers), 1)
+                w2 = pending_workers.pop(0)
+
+                # w2 finishes first with success
+                with mock.patch.object(
+                    self.defender,
+                    'apply_exclusions',
+                    return_value=self.defender.DefenderResult(ok=True, added_paths=['a'], added_processes=['b']),
+                ):
+                    w2()
+                self.assertTrue(h.defender_status_ok)
+                self.assertEqual(cb2_calls, [(True, False)])
+
+                # Stale w1 finishes later with failure -> must NOT overwrite h.defender_status_ok or fire cb1
+                with mock.patch.object(
+                    self.defender,
+                    'apply_exclusions',
+                    return_value=self.defender.DefenderResult(ok=False, error='stale failure'),
+                ):
+                    w1()
+                self.assertTrue(h.defender_status_ok, 'stale worker generation must not overwrite newer state')
+                self.assertEqual(cb1_calls, [], 'superseded callback must not fire')
+
+                # Removing exclusions resets defenderPromptDismissed and updates status message
+                h.settings_set('defenderPromptDismissed', True)
+                rem_calls: list[tuple[bool, bool]] = []
+                h.remove_defender_exclusions(on_done=lambda ok, c, _m: rem_calls.append((ok, c)))
+                w_rem = pending_workers.pop(0)
+                with mock.patch.object(
+                    self.defender,
+                    'remove_exclusions',
+                    return_value=self.defender.DefenderResult(ok=True),
+                ):
+                    w_rem()
+                self.assertTrue(h.defender_status_ok)
+                self.assertEqual(h.defender_status_msg, h.t('defender.msg.removed'))
+                self.assertFalse(h.settings_value('defenderPromptDismissed', False))
+                self.assertEqual(rem_calls, [(True, False)])
+
+                # Structured failure codes map cleanly to localized user guidance on both apply & remove
+                h.apply_defender_exclusions()
+                w_tamper = pending_workers.pop(0)
+                with mock.patch.object(
+                    self.defender,
+                    'apply_exclusions',
+                    return_value=self.defender.DefenderResult(ok=False, error='blocked', error_code='tamper_blocked'),
+                ):
+                    w_tamper()
+                self.assertFalse(h.defender_status_ok)
+                self.assertEqual(h.defender_status_msg, h.t('defender.msg.tamperBlocked'))
+
+                h.remove_defender_exclusions()
+                w_inact = pending_workers.pop(0)
+                with mock.patch.object(
+                    self.defender,
+                    'remove_exclusions',
+                    return_value=self.defender.DefenderResult(ok=False, error='stopped', error_code='service_inactive'),
+                ):
+                    w_inact()
+                self.assertFalse(h.defender_status_ok)
+                self.assertEqual(h.defender_status_msg, h.t('defender.msg.inactive'))
+
+
+class WindowsEngineBumpFollowUpTest(unittest.TestCase):
+    """Windows stand-ins for upstream `8b55ebb3` (`DMSH_PROCS`) and `0b124486` (`proc_group`)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from nspb_qt.win import driver
+        cls.driver = driver
+        cls.repo = QT.parent / 'engine'
+        if not (cls.repo / 'scripts/build_ipa_from_nsp.py').is_file():
+            raise unittest.SkipTest('engine/ is missing: run python3 tools/engine.py sync')
+        cls.saved_upstream_run = driver._UPSTREAM_RUN
+        driver._UPSTREAM_RUN = None
+        cls.mod = driver.load_upstream(cls.repo)
+        cls.orig_group = cls.mod.proc_group.Group
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.mod.proc_group.Group = cls.orig_group
+        cls.driver._UPSTREAM_RUN = cls.saved_upstream_run
+
+    def test_build_env_defaults_dmsh_procs_to_zero_and_respects_override(self) -> None:
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(shim, 'shim_dir', return_value=Path(td)):
+            env_default = shim.build_env({'PATH': '', 'PYTHONPATH': ''}, python_exe=sys.executable)
+            env_custom = shim.build_env({'PATH': '', 'PYTHONPATH': '', 'DMSH_PROCS': '4'},
+                                        python_exe=sys.executable)
+        self.assertEqual(env_default.get('DMSH_PROCS'), '0')
+        self.assertEqual(env_custom.get('DMSH_PROCS'), '4')
+
+    def test_patch_installs_win_proc_group_and_dmsh_procs(self) -> None:
+        self.mod.proc_group.Group = self.orig_group
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('DMSH_PROCS', None)
+            self.driver.patch(self.mod, self.repo)
+            self.assertEqual(os.environ.get('DMSH_PROCS'), '0')
+            self.assertIs(self.mod.proc_group.Group, self.driver._WinProcGroup)
+
+    def test_mod_run_streams_lines_and_reports_nonzero_exit_via_win_proc_group(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            self.driver.patch(self.mod, self.repo)
+        seen: list[str] = []
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / 'ok.log'
+            rc = self.mod.run(
+                [sys.executable, '-c', 'import sys; sys.stdout.write("alpha\\nbeta\\ngamma"); sys.stdout.flush()'],
+                log,
+                on_line=seen.append,
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual(seen, ['alpha', 'beta', 'gamma'])
+            self.assertEqual(log.read_text(encoding='utf-8'), 'alpha\nbeta\ngamma')
+
+            bad_log = Path(td) / 'bad.log'
+            with self.assertRaises(self.mod.BuildError) as ctx:
+                self.mod.run(
+                    [sys.executable, '-c', 'import sys; print("boom", flush=True); sys.exit(7)'],
+                    bad_log,
+                )
+            self.assertIn('exit code 7', str(ctx.exception))
+
+    def test_mod_run_interrupt_stops_whole_child_tree(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            self.driver.patch(self.mod, self.repo)
+        grandchild_pid: list[int] = []
+
+        def on_line(line: str) -> None:
+            if line.startswith('CHILD_PID='):
+                grandchild_pid.append(int(line.split('=', 1)[1]))
+                raise KeyboardInterrupt()
+
+        script = (
+            'import subprocess, sys, time\n'
+            'p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])\n'
+            'print(f"CHILD_PID={p.pid}", flush=True)\n'
+            'time.sleep(30)\n'
+        )
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / 'intr.log'
+            with self.assertRaises(KeyboardInterrupt):
+                self.mod.run([sys.executable, '-c', script], log, on_line=on_line)
+        self.assertEqual(len(grandchild_pid), 1)
+        pid = grandchild_pid[0]
+        if sys.platform != 'win32':
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+    def test_mod_run_catches_straggler_holding_stdout_after_drain(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            self.driver.patch(self.mod, self.repo)
+        script = (
+            'import os, subprocess, sys\n'
+            'p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])\n'
+            'print(f"STRAGGLER={p.pid}", flush=True)\n'
+            'os._exit(0)\n'
+        )
+        leaked_pid: list[int] = []
+
+        def on_line(line: str) -> None:
+            if line.startswith('STRAGGLER='):
+                leaked_pid.append(int(line.split('=', 1)[1]))
+
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(self.driver._WinProcGroup, 'DRAIN', 0.15):
+            log = Path(td) / 'straggler.log'
+            with self.assertRaises(self.mod.BuildError) as ctx:
+                self.mod.run([sys.executable, '-c', script], log, on_line=on_line)
+            self.assertIn('still ran', str(ctx.exception))
+        self.assertEqual(len(leaked_pid), 1)
+        if sys.platform != 'win32':
+            with self.assertRaises(ProcessLookupError):
+                os.kill(leaked_pid[0], 0)
+
+    def test_win_proc_group_uses_job_object_and_closes_handle_on_win32(self) -> None:
+        calls: list[tuple] = []
+
+        class FakeK32:
+            def CreateJobObjectW(self, sec, name):
+                calls.append(('create',))
+                return 0x12340000ABCD
+
+            def AssignProcessToJobObject(self, job, proc):
+                calls.append(('assign', job, proc))
+                return 1
+
+            def QueryInformationJobObject(self, job, cls_id, info_ptr, sz, ret_ptr):
+                calls.append(('query', job, cls_id, sz))
+                return 1
+
+            def TerminateJobObject(self, job, code):
+                calls.append(('terminate', job, code))
+                return 1
+
+            def CloseHandle(self, job):
+                calls.append(('close', job))
+                return 1
+
+        class FakePopen:
+            def __init__(self, args, **kw):
+                calls.append(('popen', kw.get('creationflags', 0)))
+                self.pid = 9999
+                self.returncode = 0
+                self._handle = 0x55AA
+                self.stdout = None
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        with mock.patch.object(self.driver.sys, 'platform', 'win32'), \
+             mock.patch.object(self.driver, '_k32', FakeK32()), \
+             mock.patch.object(self.driver.subprocess, 'CREATE_NEW_PROCESS_GROUP', 0x200, create=True), \
+             mock.patch.object(self.driver.subprocess, 'CREATE_NO_WINDOW', 0x08000000, create=True), \
+             mock.patch.object(self.driver.subprocess, 'Popen', FakePopen):
+            with self.assertRaises(RuntimeError):
+                with self.driver._WinProcGroup(['tool.exe']) as _g:
+                    raise RuntimeError('boom')
+
+        self.assertIn(('popen', 0x08000200), calls)
+        self.assertIn(('assign', 0x12340000ABCD, 0x55AA), calls)
+        self.assertIn(('terminate', 0x12340000ABCD, 1), calls)
+        self.assertIn(('close', 0x12340000ABCD), calls)
+
+
+class RomfsTrailerAndManifestArgsTests(unittest.TestCase):
+    """Tests for DMMSLTR1 64B trailer validation, custom *.img directory lookup, and manifest metadata flags."""
+
+    @staticmethod
+    def _make_dmromfs1_image(mask: str) -> bytes:
+        import struct
+        payload = mask.encode('utf-8')
+        data_off = 32
+        idx_off = data_off + len(payload)
+        names = b'SystemRegionLangMask.txt'
+        ent_struct = struct.Struct('<QQIHBB')
+        entries = (
+            ent_struct.pack(1, 1, 0, 0, 0, 0)
+            + ent_struct.pack(2, 1, 0, 6, 0, 0)
+            + ent_struct.pack(data_off, len(payload), 6, 18, 1, 0)
+        )
+        idx = entries + names
+        return struct.pack('<8sQQQ', b'DMROMFS1', idx_off, len(idx), 3) + payload + idx
+
+    @staticmethod
+    def _append_dmmsl_trailer(
+        base: bytes,
+        *,
+        gfx_api: int = 1,
+        flags: int = 0,
+        chain: str = 'b-d0e99bd4b2fe',
+        msl_size: int = 40,
+    ) -> bytes:
+        import struct
+        base_end = len(base)
+        msl_offset = (base_end + 16383) & ~16383
+        pad1 = b'\x00' * (msl_offset - base_end)
+        msl_payload = (b'DMROMFS1' + b'\x00' * max(0, msl_size - 8))[:msl_size]
+        raw_end = msl_offset + len(msl_payload)
+        aligned_end = (raw_end + 7) & ~7
+        pad2 = b'\x00' * (aligned_end - raw_end)
+        chain_bytes = chain.encode('utf-8')[:24]
+        footer = (
+            b'DMMSLTR1'
+            + struct.pack(
+                '<IBBHQQQ',
+                1,
+                gfx_api,
+                flags,
+                len(chain_bytes),
+                base_end,
+                msl_offset,
+                len(msl_payload),
+            )
+            + chain_bytes
+            + b'\x00' * (24 - len(chain_bytes))
+        )
+        assert len(footer) == 64
+        return base + pad1 + msl_payload + pad2 + footer
+
+    def test_romfs_languages_accepts_valid_dmmsltr1_trailers_and_refreshes_cache(self) -> None:
+        from nspb_qt import romfs_languages as rl
+
+        base = self._make_dmromfs1_image('JPja USen CNzh\n011\n')
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            nvn_bytes = self._append_dmmsl_trailer(base, gfx_api=1, flags=0, chain='b-d0e99bd4b2fe', msl_size=37)
+            nvn_img = root / 'nvn.img'
+            nvn_img.write_bytes(nvn_bytes)
+            self.assertEqual([o[0] for o in rl.options_in(nvn_img)], ['en-US', 'ja', 'zh-Hans'])
+
+            vk_img = root / 'vk.img'
+            vk_img.write_bytes(self._append_dmmsl_trailer(base, gfx_api=2, flags=0, chain='', msl_size=32))
+            self.assertEqual([o[0] for o in rl.options_in(vk_img)], ['en-US', 'ja', 'zh-Hans'])
+
+            gl_img = root / 'gl.img'
+            gl_img.write_bytes(
+                self._append_dmmsl_trailer(base, gfx_api=3, flags=1, chain='b-abcdef0123456789abcdef', msl_size=48)
+            )
+            self.assertEqual([o[0] for o in rl.options_in(gl_img)], ['en-US', 'ja', 'zh-Hans'])
+
+            # In-place upgrade refreshes (path, st_size, st_mtime_ns) cache and narrows launcher.json
+            upgrading = root / 'upgrading.img'
+            upgrading.write_bytes(nvn_bytes[:-1])
+            self.assertEqual(rl.options_in(upgrading), [])
+            upgrading.write_bytes(nvn_bytes)
+            self.assertEqual([o[0] for o in rl.options_in(upgrading)], ['en-US', 'ja', 'zh-Hans'])
+
+            launcher_json = root / 'launcher.json'
+            launcher_json.write_text(
+                json.dumps({
+                    'schema': 1,
+                    'game': '040074A01BF12000',
+                    'settings': [{
+                        'env': 'DM_LANG',
+                        'kind': 'choice',
+                        'section': 'Game',
+                        'label': 'Game language',
+                        'note': "This game's files do not list its languages.",
+                        'default': 'en-US',
+                        'level': 'basic',
+                        'options': [[code, label] for code, label in rl.TABLE],
+                    }],
+                }),
+                encoding='utf-8',
+            )
+            self.assertTrue(rl.apply_to_launcher_json(launcher_json, upgrading))
+            updated = json.loads(launcher_json.read_text(encoding='utf-8'))
+            self.assertEqual([o[0] for o in updated['settings'][0]['options']], ['en-US', 'ja', 'zh-Hans'])
+
+    def test_romfs_languages_rejects_corrupt_or_overflowing_dmmsltr1_trailers(self) -> None:
+        import struct
+        from nspb_qt import romfs_languages as rl
+
+        base = self._make_dmromfs1_image('USen JPja\n')
+        valid = bytearray(self._append_dmmsl_trailer(base, gfx_api=1, flags=0, chain='b-1234567890ab', msl_size=40))
+        foot = len(valid) - 64
+
+        def mut(patch_fn) -> bytes:
+            b = bytearray(valid)
+            patch_fn(b)
+            return bytes(b)
+
+        bad_cases = [
+            base + b'\x00' * 10,
+            base + b'\x00' * 63,
+            bytes(valid[:-1]),
+            bytes(valid[:16384 + 20]),
+            bytes(valid[:foot]) + b'\x00' * 8 + bytes(valid[foot:]),
+            mut(lambda b: b.__setitem__(foot + 7, ord('0'))),
+            mut(lambda b: struct.pack_into('<I', b, foot + 8, 2)),
+            mut(lambda b: b.__setitem__(foot + 12, 0)),
+            mut(lambda b: b.__setitem__(foot + 12, 4)),
+            mut(lambda b: b.__setitem__(foot + 12, 255)),
+            mut(lambda b: struct.pack_into('<Q', b, foot + 16, len(base) + 1)),
+            mut(lambda b: struct.pack_into('<Q', b, foot + 24, len(base))),
+            mut(lambda b: struct.pack_into('<Q', b, foot + 32, 31)),
+            mut(lambda b: struct.pack_into('<Q', b, foot + 32, (1 << 64) - 1)),
+            mut(lambda b: struct.pack_into('<H', b, foot + 14, 25)),
+            mut(lambda b: b.__setitem__(foot + 42, 0)),
+            mut(lambda b: b.__setitem__(foot + 63, ord('x'))),
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for idx, data in enumerate(bad_cases):
+                p = root / f'bad_trailer_{idx}.img'
+                p.write_bytes(data)
+                self.assertEqual(rl.options_in(p), [], f'case {idx} should be rejected')
+
+    def test_romfs_languages_directory_fallback_scans_sorted_custom_img_and_skips_parts_and_hidden(self) -> None:
+        from nspb_qt import romfs_languages as rl
+
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td) / 'custom_dir'
+            folder.mkdir()
+            wrong = self._make_dmromfs1_image('EUde EUit\n')
+            (folder / '.hidden.img').write_bytes(wrong)
+            (folder / '._星露谷物语.img').write_bytes(wrong)
+            (folder / '00_game.nxpart.img').write_bytes(wrong)
+            (folder / '00_game.img.nxpart.0000.0002').write_bytes(wrong)
+            (folder / '01_folder.img').mkdir()
+            (folder / '02_dlc.img').write_bytes(self._make_dmromfs1_image('USen\n'))
+
+            stardew = self._append_dmmsl_trailer(
+                self._make_dmromfs1_image('USen JPja CNzh\n'),
+                gfx_api=1,
+                flags=0,
+                chain='b-stardew12345',
+                msl_size=40,
+            )
+            (folder / 'a_星露谷物语.img').write_bytes(stardew)
+            (folder / 'b_空洞骑士.img').write_bytes(self._make_dmromfs1_image('USen EUfr\n'))
+
+            self.assertEqual([o[0] for o in rl.options_in(folder)], ['en-US', 'ja', 'zh-Hans'])
+
+            # Standard romfs.img takes precedence; when corrupt, do not fall back to sibling *.img files
+            (folder / 'romfs.img').write_bytes(b'corrupt')
+            self.assertEqual(rl.options_in(folder), [])
+
+    def test_build_manifest_args_includes_gfx_api_and_utc_built_at_and_main_wires_them(self) -> None:
+        import re
+        import time
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = root / 'engine'
+            patched = root / 'patched'
+            gd = root / 'gd'
+            patched.mkdir()
+            gd.mkdir()
+            out_manifest = root / 'game.manifest.json'
+
+            # 1. Default backwards-compatible call omits --gfx-api and --built-at
+            legacy_args = build_app.build_manifest_args(
+                repo=repo,
+                out_manifest=out_manifest,
+                game='0100000000010000',
+                name='Super Mario Odyssey',
+                version='1.3.0',
+                pkg='v0',
+                mods=['main'],
+                chain_ver='deadbeef',
+                marker='romfs/a.bin',
+                romfs_id='DMROMFSID1',
+                fw_name='DmGame0100000000010000',
+                patched=patched,
+                gd=gd,
+            )
+            self.assertNotIn('--gfx-api', legacy_args)
+            self.assertNotIn('--built-at', legacy_args)
+
+            # 2. Explicit gfx_api and built_at flags are forwarded verbatim
+            explicit_args = build_app.build_manifest_args(
+                repo=repo,
+                out_manifest=out_manifest,
+                game='0100000000010000',
+                name='Super Mario Odyssey',
+                version='1.3.0',
+                pkg='v0',
+                mods=['main'],
+                chain_ver='deadbeef',
+                marker='romfs/a.bin',
+                romfs_id='DMROMFSID1',
+                fw_name='DmGame0100000000010000',
+                patched=patched,
+                gd=gd,
+                gfx_api='vulkan',
+                built_at='2026-11-13T18:16:06Z',
+            )
+            idx_gfx = explicit_args.index('--gfx-api')
+            self.assertEqual(explicit_args[idx_gfx + 1], 'vulkan')
+            idx_built = explicit_args.index('--built-at')
+            self.assertEqual(explicit_args[idx_built + 1], '2026-11-13T18:16:06Z')
+
+            # 3. End-to-end call-chain check through build_app.main() in DM_FRAMEWORK_ONLY mode
+            (repo / 'dm/games/0100000000010000').mkdir(parents=True)
+            for fname in ('game.tsv', 'shader_map.tsv', 'pso_manifest.tsv'):
+                (repo / 'dm/games/0100000000010000' / fname).write_text('# stub\n', encoding='utf-8')
+            (repo / 'dm/games/game.py').write_text(
+                'from pathlib import Path\n'
+                'class _P:\n'
+                '    def __init__(self, d): self.dir = d\n'
+                '    def get(self, k, default=""):\n'
+                '        return {"package": "v0", "modules": "main", "romfs_marker": "a.bin", "ipa": "out.ipa"}.get(k, default)\n'
+                '    def modules_in(self, _p): return ["main"]\n'
+                'def load(_g): return _P(Path(__file__).resolve().parent / "0100000000010000")\n',
+                encoding='utf-8',
+            )
+            (repo / 'dm/gfx/nvn').mkdir(parents=True)
+            (repo / 'dm/gfx/nvn/dmsh_chain.h').write_text('#define DMSH_CHAIN "cafe1234"\n', encoding='utf-8')
+            (repo / 'dm/host').mkdir(parents=True)
+            (repo / 'dm/host/main.c').write_text('int main(void){return 0;}\n', encoding='utf-8')
+            for rel in (
+                'dm/ios/framework/DmGameMarker.m',
+                'dm/ios/framework/ShellGlue.m',
+                'dm/ios/Sources/front_ios.m',
+                'dm/ios/Sources/DmGamepad.m',
+                'dm/ios/Sources/CloudSaves.m',
+                'dm/ios/Sources/SaveSync.m',
+                'dm/ios/Sources/DataBookmark.m',
+            ):
+                p = repo / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text('// stub\n', encoding='utf-8')
+
+            w = root / 'work'
+            (w / 'build/patched_v0').mkdir(parents=True)
+            (w / 'build/patched_v0/main.patched.bin').write_bytes(b'\x00' * 16)
+            (w / 'build/patched_v0/main.fixups.tsv').write_text('', encoding='utf-8')
+            (w / 'data/v0/RomFS').mkdir(parents=True)
+            (w / 'build/ios/dmsh_b/vk').mkdir(parents=True)
+            (w / 'build/ios/dmsh_b/vk/vk_shaders.metallib').write_bytes(b'MTLB')
+            fw_out = root / 'fw_out'
+            sdk = make_fake_sdk(root)
+
+            captured_manifest_cmd: list[str] = []
+
+            def fake_py(*py_args, **_kw) -> str:
+                strs = [str(a) for a in py_args]
+                if strs[0].endswith('game.py') and strs[1] == 'header':
+                    Path(strs[3]).write_text('// profile\n', encoding='utf-8')
+                elif strs[0].endswith('gen_embed.py'):
+                    Path(strs[-2]).write_text('// embed\n', encoding='utf-8')
+                elif strs[0].endswith('settings.py'):
+                    Path(strs[4]).write_text('{"schema": 1, "settings": []}\n', encoding='utf-8')
+                elif strs[0].endswith('game.py') and strs[1] == 'profile':
+                    Path(strs[3]).write_text('', encoding='utf-8')
+                elif strs[0].endswith('gen_manifest.py'):
+                    captured_manifest_cmd.extend(strs)
+                    Path(strs[1]).write_text('{}\n', encoding='utf-8')
+                return ''
+
+            saved_path = list(sys.path)
+            saved_game_mod = sys.modules.pop('game', None)
+            fixed_utc = time.struct_time((2026, 11, 13, 18, 16, 6, 4, 317, 0))
+            env_patch = {
+                'NSPB_REPO': str(repo),
+                'GAME': '0100000000010000',
+                'W': str(w),
+                'DM_DISPLAY_NAME': 'Super Mario Odyssey',
+                'GFXAPI': 'vulkan',
+                'DM_FRAMEWORK_ONLY': str(fw_out),
+            }
+            try:
+                with (
+                    mock.patch.dict(os.environ, env_patch, clear=False),
+                    mock.patch.object(build_app, 'romfs_has', return_value=True),
+                    mock.patch.object(build_app, 'host_sources', return_value=([], [])),
+                    mock.patch.object(build_app, 'compat_rt_needed', return_value=False),
+                    mock.patch.object(build_app, 'compile_all', return_value=[]),
+                    mock.patch.object(build_app, 'link_framework', side_effect=lambda *_a, **_k: (fw_out / 'DmGame0100000000010000.framework' / 'DmGame0100000000010000').write_bytes(b'dylib')),
+                    mock.patch.object(build_app, 'py', side_effect=fake_py),
+                    mock.patch.object(build_app.tc, 'ios_sdk', return_value=sdk),
+                    mock.patch.object(build_app.tc, 'llvm_tool', return_value=root / 'clang.exe'),
+                    mock.patch.object(build_app.tc, 'ensure_ld64_lld', return_value=(root / 'ld64.lld.exe', '')),
+                    mock.patch.object(build_app.time, 'gmtime', return_value=fixed_utc),
+                ):
+                    rc = build_app.main([])
+            finally:
+                sys.path[:] = saved_path
+                sys.modules.pop('game', None)
+                if saved_game_mod is not None:
+                    sys.modules['game'] = saved_game_mod
+
+            self.assertEqual(rc, 0)
+            self.assertTrue(captured_manifest_cmd, 'main() did not invoke gen_manifest.py')
+            self.assertIn('--gfx-api', captured_manifest_cmd)
+            self.assertEqual(captured_manifest_cmd[captured_manifest_cmd.index('--gfx-api') + 1], 'vulkan')
+            self.assertIn('--built-at', captured_manifest_cmd)
+            built_val = captured_manifest_cmd[captured_manifest_cmd.index('--built-at') + 1]
+            self.assertEqual(built_val, '2026-11-13T18:16:06Z')
+            self.assertRegex(built_val, r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$')
+            # PR 2 strips msl/ from DmGame<ID>.framework and emits .msl-cache/<ID>.json metadata instead
+            self.assertFalse(
+                (fw_out / 'DmGame0100000000010000.framework' / 'msl').exists()
+            )
+            msl_cache_file = fw_out / '.msl-cache' / '0100000000010000.json'
+            self.assertTrue(msl_cache_file.is_file(), 'missing .msl-cache/0100000000010000.json')
+            msl_cache = json.loads(msl_cache_file.read_text(encoding='utf-8'))
+            self.assertEqual(msl_cache.get('schema'), 1)
+            self.assertEqual(msl_cache.get('gfx_api'), 'vulkan')
+            self.assertEqual(Path(msl_cache.get('msl_root', '')), w / 'build' / 'ios' / 'dmsh_b')
+            self.assertEqual(Path(msl_cache.get('lib_path', '')), w / 'build' / 'ios' / 'dmsh_b' / 'vk')
+
+
+class WindowsMissingPrereqAndStrippedDefenderTest(unittest.TestCase):
+    """Stripped-Windows Defender module fallback, VC++ Redistributable probe, NTSTATUS diagnostics, and shader failure attribution."""
+
+    def test_defender_scripts_handle_missing_module_and_stripped_windows(self) -> None:
+        from nspb_qt.win import defender
+
+        elev = defender.build_inner_elevation_script(r'C:\Temp\payload.json')
+        self.assertIn('Ensure-DefenderModule', elev)
+        self.assertIn(r'System32\WindowsPowerShell\v1.0\Modules\Defender', elev)
+        self.assertIn("if ($null -eq (Get-Command -Name 'Add-MpPreference'", elev)
+        self.assertIn("error_code = 'service_inactive'", elev)
+        self.assertIn('if ($null -eq $svc -and $null -eq $st)', elev)
+        self.assertIn('CommandNotFoundException', elev)
+
+        rem = defender.build_inner_removal_script(r'C:\Temp\payload.json')
+        self.assertIn('Ensure-DefenderModule', rem)
+        self.assertIn("if ($null -eq (Get-Command -Name 'Remove-MpPreference'", rem)
+        self.assertIn('Write-AtomicJson $resultPath @{ ok = $true', rem)
+
+    def test_model_apply_defender_service_inactive_dismisses_prompt(self) -> None:
+        import ast
+        import threading
+        from nspb_qt.i18n import Lang
+        from nspb_qt.l10n import t as l10n_t
+        from nspb_qt.win import defender
+
+        src = (QT / 'nspb_qt' / 'model.py').read_text(encoding='utf-8')
+        tree = ast.parse(src)
+        cls_node = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'Model')
+        wanted = {
+            '_defender_failure_message',
+            'defender_info',
+            'should_prompt_defender_before_build',
+            'apply_defender_exclusions',
+            '_invoke_defender_done',
+        }
+        methods = [n for n in cls_node.body if isinstance(n, ast.FunctionDef) and n.name in wanted]
+        mod_node = ast.fix_missing_locations(ast.Module(body=methods, type_ignores=[]))
+
+        pending_workers: list[object] = []
+
+        class _ImmediateThread:
+            def __init__(self, target=None, daemon=None):
+                self._target = target
+
+            def start(self):
+                if self._target:
+                    pending_workers.append(self._target)
+
+        class _Sig:
+            def emit(self, *a):
+                pass
+
+        class _DummyQThread:
+            @staticmethod
+            def currentThread():
+                return 'main'
+
+        ns: dict = {
+            'Callable': object,
+            'Slot': lambda *a, **k: (lambda fn: fn),
+            'Q_ARG': lambda *_a: None,
+            'QThread': _DummyQThread,
+            'QMetaObject': type('QM', (), {'invokeMethod': staticmethod(lambda obj, name, *_a: getattr(obj, name)())}),
+            'Qt': type('Qt', (), {'QueuedConnection': 1}),
+            'threading': type('T', (), {'Thread': _ImmediateThread}),
+            '__package__': 'nspb_qt',
+        }
+        exec(compile(mod_node, str(QT / 'nspb_qt' / 'model.py'), 'exec'), ns)
+
+        class _Harness:
+            apply_defender_exclusions = ns['apply_defender_exclusions']
+            _defender_failure_message = ns['_defender_failure_message']
+            _invoke_defender_done = ns['_invoke_defender_done']
+            should_prompt_defender_before_build = ns['should_prompt_defender_before_build']
+            defender_info = ns['defender_info']
+
+            def __init__(self):
+                self.show_defender_ui = True
+                self.defender_busy = False
+                self.defender_status_ok = False
+                self.defender_status_msg = ''
+                self.lang = Lang('zh')
+                self.repo_path = ''
+                self.repo_ok = False
+                self.out_dir = ''
+                self.shell_cache_path = ''
+                self.base_path = ''
+                self._defender_gen = 0
+                self._defender_lock = threading.RLock()
+                self._defender_callbacks = {}
+                self.repoChanged = _Sig()
+                self.depsChanged = _Sig()
+                self._settings: dict[str, bool] = {}
+
+            def _current_build_dirs(self, *, title_id=None):
+                return r'D:\games\botw', r'D:\build\01007EF00011E000_build'
+
+            def _emit_repo_changed(self):
+                pass
+
+            def _emit_deps_changed(self):
+                pass
+
+            def thread(self):
+                return 'main'
+
+            def log(self, _msg):
+                pass
+
+            def t(self, key: str, *args: object) -> str:
+                return l10n_t(key, self.lang, *args)
+
+            def settings_value(self, k: str, default=False):
+                return self._settings.get(k, default)
+
+            def settings_set(self, k: str, val: bool):
+                self._settings[k] = val
+
+        h = _Harness()
+        with tempfile.TemporaryDirectory() as td:
+            fake_tools = Path(td) / 'NS Port Builder' / 'tools'
+            fake_tools.mkdir(parents=True)
+            with mock.patch.object(tc, 'tools_dir', return_value=fake_tools):
+                self.assertTrue(h.should_prompt_defender_before_build())
+                h.apply_defender_exclusions()
+                w = pending_workers.pop(0)
+                with mock.patch.object(
+                    defender,
+                    'apply_exclusions',
+                    return_value=defender.DefenderResult(ok=False, error='no module', error_code='service_inactive'),
+                ):
+                    w()
+                self.assertEqual(h.defender_status_msg, h.t('defender.msg.inactive'))
+                self.assertTrue(h.settings_value('defenderPromptDismissed', False))
+                self.assertFalse(h.should_prompt_defender_before_build())
+
+    def test_vcredist_probe_and_ntstatus_exit_explanation(self) -> None:
+        if os.name != 'nt':
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop(tc.ENV_SYSTEM32, None)
+                self.assertIsNone(tc.probe_vcredist())
+
+        with tempfile.TemporaryDirectory() as td:
+            sys32 = Path(td)
+            (sys32 / 'VCRUNTIME140.dll').write_bytes(b'MZ')
+            with mock.patch.dict(os.environ, {tc.ENV_SYSTEM32: str(sys32)}, clear=False):
+                probe = tc.probe_vcredist()
+                self.assertIsNotNone(probe)
+                assert probe is not None
+                self.assertEqual(probe.state, 'missing')
+                self.assertIn('vcruntime140_1.dll, msvcp140.dll', probe.detail)
+                self.assertIn(tc.VCREDIST_URL, probe.hint)
+                all_ids = {p.id: p for p in tc.check_all(deep=False)}
+                self.assertIn('vcredist', all_ids)
+                self.assertEqual(all_ids['vcredist'].state, 'missing')
+
+                hint_135 = tc.explain_process_exit(-1073741515, Path('metal.exe'))
+                self.assertIn('0xC0000135', hint_135)
+                self.assertIn('vcruntime140_1.dll, msvcp140.dll', hint_135)
+
+                hint_07b = tc.explain_process_exit(0xC000007B, Path('metal.exe'))
+                self.assertIn('0xC000007B', hint_07b)
+                self.assertIn('32-bit/64-bit DLL mismatch', hint_07b)
+
+                (sys32 / 'vcruntime140_1.dll').write_bytes(b'MZ')
+                (sys32 / 'msvcp140.dll').write_bytes(b'MZ')
+                ok_probe = tc.probe_vcredist()
+                self.assertIsNotNone(ok_probe)
+                assert ok_probe is not None
+                self.assertEqual(ok_probe.state, 'ok')
+
+    def test_probe_metal_passes_relaxed_math_and_flags_old_metal_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            sdk = make_fake_sdk(root, '26.0')
+            seen_cmds: list[list[str]] = []
+
+            def fake_ok(cmd, *a, **kw):
+                seen_cmds.append([str(c) for c in cmd])
+                if '-o' in cmd:
+                    Path(cmd[cmd.index('-o') + 1]).write_bytes(b'MTLB')
+                return subprocess.CompletedProcess(cmd, 0, '', '')
+
+            with (
+                mock.patch.object(tc, 'metal_tool', side_effect=lambda name, *a: Path(f'C:/metal/{name}.exe')),
+                mock.patch.object(tc.subprocess, 'run', side_effect=fake_ok),
+            ):
+                ok, detail = tc.probe_metal(sdk)
+            self.assertTrue(ok, detail)
+            self.assertIn('-fmetal-math-mode=relaxed', seen_cmds[0])
+            self.assertIn('-fpreserve-invariance', seen_cmds[0])
+            self.assertIn('-fwrapv', seen_cmds[0])
+
+            def fake_old(cmd, *a, **kw):
+                return subprocess.CompletedProcess(cmd, 1, '', "metal.exe: error: unknown argument: '-fmetal-math-mode=relaxed'\n")
+
+            with (
+                mock.patch.object(tc, 'metal_tool', side_effect=lambda name, *a: Path(f'C:/metal/{name}.exe')),
+                mock.patch.object(tc.subprocess, 'run', side_effect=fake_old),
+            ):
+                ok, detail = tc.probe_metal(sdk)
+            self.assertFalse(ok)
+            self.assertIn('installed Metal Developer Tools for Windows is too old', detail)
+
+            def fake_135(cmd, *a, **kw):
+                return subprocess.CompletedProcess(cmd, -1073741515, '', '')
+
+            sys32 = root / 'sys32'
+            sys32.mkdir()
+            with (
+                mock.patch.dict(os.environ, {tc.ENV_SYSTEM32: str(sys32)}, clear=False),
+                mock.patch.object(tc, 'metal_tool', side_effect=lambda name, *a: Path(f'C:/metal/{name}.exe')),
+                mock.patch.object(tc.subprocess, 'run', side_effect=fake_135),
+            ):
+                ok, detail = tc.probe_metal(sdk)
+            self.assertFalse(ok)
+            self.assertIn('0xC0000135', detail)
+            self.assertIn('vcruntime140.dll', detail)
+
+    def test_driver_diagnoses_empty_ios_shader_log_and_missing_spirv_cross(self) -> None:
+        from types import SimpleNamespace
+        from nspb_qt.win import driver
+
+        with tempfile.TemporaryDirectory() as td:
+            sys32 = Path(td) / 'sys32'
+            sys32.mkdir()
+            (sys32 / 'vcruntime140.dll').write_bytes(b'MZ')
+            with mock.patch.dict(os.environ, {tc.ENV_SYSTEM32: str(sys32)}, clear=False):
+                msg_135 = driver.diagnose_empty_shader_log('metal.exe failed with exit code -1073741515 (0xc0000135)')
+                self.assertIn('0xC0000135', msg_135)
+                self.assertIn('vcruntime140_1.dll, msvcp140.dll', msg_135)
+
+            self.assertIn(
+                'Metal Developer Tools for Windows (metal.exe / metallib.exe) is missing',
+                driver.diagnose_empty_shader_log("no Windows tool for `xcrun -sdk iphoneos metal`"),
+            )
+            self.assertIn(
+                'installed Metal Developer Tools for Windows is too old',
+                driver.diagnose_empty_shader_log("metal.exe: error: unknown argument: '-fmetal-math-mode=relaxed'"),
+            )
+            self.assertIn(
+                'all 24 shader compiles failed: unexpected AIR opcode',
+                driver.diagnose_empty_shader_log('  [fail] unexpected AIR opcode\nshaders 24: ok 0, fail 24\n'),
+            )
+
+            # Verify driver.patch wraps build_shaders to surface dmsh_build.log root cause and missing spirv-cross
+            class FakeBuildError(Exception):
+                pass
+
+            logs = Path(td) / 'logs'
+            logs.mkdir()
+            (logs / 'dmsh_build.log').write_text(
+                "error: unknown argument: '-fmetal-math-mode=relaxed'\nshaders 12: ok 0, fail 12\n",
+                encoding='utf-8',
+            )
+            sh = Path(td) / 'shader'
+            sh.mkdir()
+            repo = Path(td) / 'repo'
+            repo.mkdir()
+            (repo / 'dm/gfx/tools/spirv_cross_bin').mkdir(parents=True)
+
+            def failing_build_shaders(py, repo_, sh_, xlate, env, logs_, g, *a, **kw):
+                raise FakeBuildError(rf'no iOS shader libraries in {sh_}\ios\b-0123456789ab')
+
+            mod = SimpleNamespace(
+                BuildError=FakeBuildError,
+                say=lambda *_a, **_k: None,
+                run=lambda *_a, **_k: 0,
+                PROG=SimpleNamespace(stage=lambda *a, **k: None, end=lambda *a, **k: None),
+                chain_of=lambda *_a: '0123456789ab',
+                build_shaders=failing_build_shaders,
+                glslc_done=lambda *_a: set(),
+                capture_wanted=lambda *_a: 0,
+            )
+            with mock.patch.object(tc, 'llvm_dir', return_value=None), \
+                 mock.patch.object(tc, 'find_exe', return_value=None), \
+                 mock.patch.object(tc, 'dotnet_dir', return_value=None):
+                driver.patch(mod, repo)
+
+            with (
+                mock.patch.object(tc, 'find_exe', return_value=None),
+                mock.patch.object(driver.shutil, 'which', return_value=None),
+            ):
+                with self.assertRaises(FakeBuildError) as ctx_sc:
+                    mod.build_shaders(sys.executable, repo, sh, repo / 'xlate', {}, logs, None)
+                self.assertIn('missing on this PC', str(ctx_sc.exception))
+                self.assertIn('spirv-cross', str(ctx_sc.exception))
+
+            fake_sc = Path(td) / 'spirv-cross.exe'
+            fake_sc.write_bytes(b'MZ')
+            with self.assertRaises(FakeBuildError) as ctx_log:
+                mod.build_shaders(sys.executable, repo, sh, repo / 'xlate', {'SPIRV_CROSS': str(fake_sc)}, logs, None)
+            self.assertIn('no iOS shader libraries in', str(ctx_log.exception))
+            self.assertIn('installed Metal Developer Tools for Windows is too old', str(ctx_log.exception))
+
+
+class WindowsIosPackagerParityTest(unittest.TestCase):
+    """Contract parity between `dm/ios/tools/build_ipa.sh` and `nspb_qt/win/build_app.py`."""
+
+    @staticmethod
+    def _setup_minimal_fixture(root: Path, *, tid: str = '0400A3A01EE4C000', gfx: str = 'nvn',
+                               with_manifest: bool = False) -> dict[str, Path]:
+        repo = root / 'engine'
+        gd = repo / 'dm' / 'games' / tid
+        gd.mkdir(parents=True)
+        (gd / 'game.tsv').write_text('modules\tmain\n', encoding='utf-8')
+        (gd / 'shader_map.tsv').write_text('# shader map\n', encoding='utf-8')
+        if gfx == 'nvn':
+            (gd / 'c1_full.tsv').write_text('# chain b-v0 inputs abcdef012345 1\n', encoding='utf-8')
+        if with_manifest:
+            (gd / 'pso_manifest.tsv').write_bytes(b'# recorded seed\nS\t1234\tvertex\n')
+        (repo / 'dm' / 'fork_patches.txt').write_text('patch-alpha\npatch-beta\n', encoding='utf-8')
+        (repo / 'dm' / 'gfx' / 'nvn').mkdir(parents=True)
+        (repo / 'dm' / 'gfx' / 'nvn' / 'dmsh_chain.h').write_text('#define DMSH_CHAIN "v0"\n', encoding='utf-8')
+        (repo / 'dm' / 'ios' / 'Sources').mkdir(parents=True)
+        (repo / 'dm' / 'ios' / 'framework').mkdir(parents=True)
+        (repo / 'dm' / 'ios' / 'tools').mkdir(parents=True)
+        (repo / 'dm' / 'host').mkdir(parents=True)
+        (repo / 'dm' / 'host' / 'main.c').write_text('int main(void){return 0;}\n', encoding='utf-8')
+        for rel in (
+            'dm/ios/framework/DmGameMarker.m',
+            'dm/ios/framework/ShellGlue.m',
+            'dm/ios/Sources/front_ios.m',
+            'dm/ios/Sources/DmGamepad.m',
+            'dm/ios/Sources/CloudSaves.m',
+            'dm/ios/Sources/SaveSync.m',
+            'dm/ios/Sources/DataBookmark.m',
+        ):
+            p = repo / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text('@interface StubObjcClass : NSObject\n@end\n@implementation StubObjcClass\n@end\n',
+                         encoding='utf-8')
+
+        w = root / '游戏,测试_work'
+        patched = w / 'build' / 'patched_v65536'
+        patched.mkdir(parents=True)
+        (patched / 'main.patched.bin').write_bytes(b'\x00' * 16)
+        (patched / 'main.fixups.tsv').write_text('', encoding='utf-8')
+        romfs = w / 'extract' / 'v65536' / 'RomFS'
+        romfs.mkdir(parents=True)
+        msl_ios = w / 'msl_ios'
+        if gfx == 'vulkan':
+            (msl_ios / 'vk').mkdir(parents=True)
+            (msl_ios / 'vk' / 'vk_shaders.metallib').write_bytes(b'MTLB')
+        elif gfx == 'gl':
+            (msl_ios / 'gl').mkdir(parents=True)
+            (msl_ios / 'gl' / 'gl_shaders.metallib').write_bytes(b'MTLB')
+        else:
+            (msl_ios / 'b-v0').mkdir(parents=True)
+
+        sdk = make_fake_sdk(root)
+        clang = root / 'clang.exe'
+        clang.write_bytes(b'MZ')
+        lld = root / 'lld' / 'ld64.lld.exe'
+        lld.parent.mkdir(parents=True, exist_ok=True)
+        lld.write_bytes(b'MZ')
+        std_font = root / 'std.ttf'
+        std_font.write_bytes(b'ttf')
+        letter_font = root / 'letter.ttf'
+        letter_font.write_bytes(b'ttf')
+        return {
+            'repo': repo, 'gd': gd, 'w': w, 'patched': patched, 'romfs': romfs,
+            'msl_ios': msl_ios, 'sdk': sdk, 'clang': clang, 'lld': lld,
+            'std_font': std_font, 'letter_font': letter_font,
+        }
+
+    @staticmethod
+    def _make_fake_game_module(gd: Path, pkg: str = 'v65536'):
+        import types
+        fake_gm = types.ModuleType('game')
+        fake_gm._nspb_patched = True
+
+        class _Prof:
+            dir = str(gd)
+
+            @staticmethod
+            def get(k: str, default: str = '') -> str:
+                return {
+                    'package': pkg,
+                    'modules': 'main',
+                    'romfs_marker': 'marker.bin',
+                    'ipa': 'out.ipa',
+                    'zip_store': '',
+                }.get(k, default)
+
+            @staticmethod
+            def modules_in(_p: Path) -> list[str]:
+                return ['main']
+
+        fake_gm.load = lambda _g: _Prof()
+        return fake_gm
+
+    def test_missing_pso_manifest_is_optional_across_all_apis_and_preserved_when_present(self) -> None:
+        from nspb_qt.win import build_app, toolchain as tc
+
+        for gfx in ('nvn', 'vulkan', 'gl'):
+            for with_manifest in (False, True):
+                with self.subTest(gfx=gfx, with_manifest=with_manifest), tempfile.TemporaryDirectory() as td:
+                    fx = self._setup_minimal_fixture(Path(td), gfx=gfx, with_manifest=with_manifest)
+                    if with_manifest:
+                        (fx['gd'] / 'bc3_keep_rgba8.tsv').write_bytes(b'# keep\n0123456789abcdef\n')
+                    fake_gm = self._make_fake_game_module(fx['gd'])
+                    fw_out = Path(td) / 'fw_out'
+
+                    def fake_py(script, *args, **_kw):
+                        sname = Path(script).name
+                        if sname == 'dmsh_chain.py':
+                            return 'abcdef012345'
+                        if sname == 'game.py' and args and args[0] in ('header', 'profile'):
+                            Path(args[2]).write_text('// stub\n', encoding='utf-8')
+                            return ''
+                        if sname == 'gen_embed.py':
+                            Path(args[-2]).write_text('.text\n', encoding='utf-8')
+                            return ''
+                        if sname == 'settings.py':
+                            Path(args[3]).write_text('{"schema":1,"settings":[]}', encoding='utf-8')
+                            return 'launcher.json'
+                        if sname == 'gen_manifest.py':
+                            Path(args[0]).write_text('{}\n', encoding='utf-8')
+                            return ''
+                        return ''
+
+                    env_cur = {
+                        'NSPB_REPO': str(fx['repo']),
+                        'GAME': '0400A3A01EE4C000',
+                        'W': str(fx['w']),
+                        'PATCHED': str(fx['patched']),
+                        'ROMFS': str(fx['romfs']),
+                        'MSL_IOS': str(fx['msl_ios']),
+                        'GFXAPI': gfx,
+                        'DM_DISPLAY_NAME': 'Pokemon Pokopia',
+                        'DM_FRAMEWORK_ONLY': str(fw_out),
+                    }
+                    with (
+                        mock.patch.dict(os.environ, env_cur, clear=False),
+                        mock.patch.dict(sys.modules, {'game': fake_gm}),
+                        mock.patch.object(tc, 'ios_sdk', return_value=fx['sdk']),
+                        mock.patch.object(tc, 'sdk_version', return_value=('26.0', '23A344')),
+                        mock.patch.object(tc, 'llvm_tool', return_value=fx['clang']),
+                        mock.patch.object(tc, 'ensure_ld64_lld', return_value=(fx['lld'], '')),
+                        mock.patch.multiple(
+                            build_app,
+                            py=fake_py,
+                            romfs_has=lambda *_a, **_kw: True,
+                            shader_lib_has=lambda *_a, **_kw: True,
+                            shader_lib_stamp_lines=lambda *_a, **_kw: ['game\t0400A3A01EE4C000', 'inputs\tabcdef012345'],
+                            host_sources=lambda *_a, **_kw: ([], []),
+                            compat_rt_needed=lambda *_a, **_kw: False,
+                            compile_all=lambda *_a, **_kw: [],
+                            build_pso_archive=lambda *_a, **_kw: None,
+                            link_framework=lambda *_a, **_kw: (fw_out / 'DmGame0400A3A01EE4C000.framework' / 'DmGame0400A3A01EE4C000').write_bytes(b'dylib'),
+                        ),
+                    ):
+                        rc = build_app.main([])
+                    self.assertEqual(rc, 0)
+                    dm_manifest = fw_out / 'DmGame0400A3A01EE4C000.framework' / 'dm' / 'pso_manifest.tsv'
+                    dm_keep = fw_out / 'DmGame0400A3A01EE4C000.framework' / 'dm' / 'bc3_keep_rgba8.tsv'
+                    if with_manifest:
+                        self.assertEqual(dm_manifest.read_bytes(), b'# recorded seed\nS\t1234\tvertex\n')
+                        if gfx == 'nvn':
+                            self.assertEqual(dm_keep.read_bytes(), b'# keep\n0123456789abcdef\n')
+                        else:
+                            self.assertFalse(dm_keep.exists())
+                    else:
+                        self.assertFalse(dm_manifest.exists())
+                        self.assertFalse(dm_keep.exists())
+
+        # Missing required shader_map.tsv must still stop the build
+        with tempfile.TemporaryDirectory() as td:
+            fx = self._setup_minimal_fixture(Path(td), gfx='vulkan', with_manifest=False)
+            (fx['gd'] / 'shader_map.tsv').unlink()
+            fake_gm = self._make_fake_game_module(fx['gd'])
+            env_bad = {
+                'NSPB_REPO': str(fx['repo']),
+                'GAME': '0400A3A01EE4C000',
+                'W': str(fx['w']),
+                'PATCHED': str(fx['patched']),
+                'ROMFS': str(fx['romfs']),
+                'MSL_IOS': str(fx['msl_ios']),
+                'GFXAPI': 'vulkan',
+                'DM_DISPLAY_NAME': 'Pokemon Pokopia',
+                'DM_FRAMEWORK_ONLY': str(Path(td) / 'fw_bad'),
+            }
+            with (
+                mock.patch.dict(os.environ, env_bad, clear=False),
+                mock.patch.dict(sys.modules, {'game': fake_gm}),
+                mock.patch.object(tc, 'ios_sdk', return_value=fx['sdk']),
+                mock.patch.object(tc, 'sdk_version', return_value=('26.0', '23A344')),
+                mock.patch.object(tc, 'llvm_tool', return_value=fx['clang']),
+                mock.patch.object(tc, 'ensure_ld64_lld', return_value=(fx['lld'], '')),
+                mock.patch.multiple(
+                    build_app,
+                    py=lambda script, *args, **_kw: (
+                        Path(args[2]).write_text('// stub\n', encoding='utf-8') or ''
+                        if Path(script).name == 'game.py'
+                        else (Path(args[-2]).write_text('.text\n', encoding='utf-8') or '')
+                    ),
+                    romfs_has=lambda *_a, **_kw: True,
+                ),
+            ):
+                with self.assertRaises(SystemExit) as ctx:
+                    build_app.main([])
+                self.assertEqual(ctx.exception.code, 1)
+
+    def test_framework_only_generates_objc_namespace_and_passes_ascii_exported_symbol_flags(self) -> None:
+        from nspb_qt.win import build_app, toolchain as tc
+
+        repo_root = Path(__file__).resolve().parents[2]
+        real_ns_tool = repo_root / 'engine' / 'dm' / 'ios' / 'tools' / 'gen_objc_namespace.py'
+        real_boot_h = repo_root / 'engine' / 'dm' / 'ios' / 'Sources' / 'FrameworkBootstrap.h'
+        self.assertTrue(real_ns_tool.is_file(), f'missing synced engine tool: {real_ns_tool}')
+
+        with tempfile.TemporaryDirectory() as td:
+            fx = self._setup_minimal_fixture(Path(td), gfx='vulkan', with_manifest=False)
+            shutil.copy2(real_ns_tool, fx['repo'] / 'dm' / 'ios' / 'tools' / 'gen_objc_namespace.py')
+            if real_boot_h.is_file():
+                shutil.copy2(real_boot_h, fx['repo'] / 'dm' / 'ios' / 'Sources' / 'FrameworkBootstrap.h')
+            fake_gm = self._make_fake_game_module(fx['gd'])
+            fw_out = Path(td) / 'fw_ns_out'
+
+            real_py = build_app.py
+            real_subproc_run = subprocess.run
+            captured_compile: dict[str, object] = {}
+            captured_link_cmd: list[str] = []
+
+            def selective_py(script, *args, **kw):
+                if Path(script).name == 'gen_objc_namespace.py':
+                    return real_py(script, *args, **kw)
+                sname = Path(script).name
+                if sname == 'game.py' and args and args[0] in ('header', 'profile'):
+                    Path(args[2]).write_text('// stub\n', encoding='utf-8')
+                elif sname == 'gen_embed.py':
+                    Path(args[-2]).write_text('.text\n', encoding='utf-8')
+                elif sname == 'settings.py':
+                    Path(args[3]).write_text('{"schema":1,"settings":[]}', encoding='utf-8')
+                elif sname == 'gen_manifest.py':
+                    Path(args[0]).write_text('{}\n', encoding='utf-8')
+                return ''
+
+            def spy_compile_all(_clang, _sdk, files, incs, _obj_dir, _dep, extra=None):
+                captured_compile['files'] = list(files)
+                captured_compile['incs'] = list(incs)
+                captured_compile['extra'] = list(extra or [])
+                return []
+
+            def spy_subproc_run(cmd, *a, **kw):
+                cmd_strs = [str(c) for c in cmd]
+                if any('gen_objc_namespace.py' in c for c in cmd_strs):
+                    return real_subproc_run(cmd, *a, **kw)
+                if cmd_strs and cmd_strs[0] == str(fx['clang']) and '-dynamiclib' in cmd_strs:
+                    captured_link_cmd.extend(cmd_strs)
+                    out_idx = cmd_strs.index('-o') + 1
+                    Path(cmd_strs[out_idx]).write_bytes(b'dylib')
+                return subprocess.CompletedProcess(cmd_strs, 0, '', '')
+
+            env_cur = {
+                'NSPB_REPO': str(fx['repo']),
+                'GAME': '0400A3A01EE4C000',
+                'W': str(fx['w']),
+                'PATCHED': str(fx['patched']),
+                'ROMFS': str(fx['romfs']),
+                'MSL_IOS': str(fx['msl_ios']),
+                'GFXAPI': 'vulkan',
+                'DM_DISPLAY_NAME': 'Pokemon Pokopia',
+                'DM_FRAMEWORK_ONLY': str(fw_out),
+                'DM_CHAIN_INDEX': '2',
+            }
+            with (
+                mock.patch.dict(os.environ, env_cur, clear=False),
+                mock.patch.dict(sys.modules, {'game': fake_gm}),
+                mock.patch.object(tc, 'ios_sdk', return_value=fx['sdk']),
+                mock.patch.object(tc, 'sdk_version', return_value=('26.0', '23A344')),
+                mock.patch.object(tc, 'llvm_tool', return_value=fx['clang']),
+                mock.patch.object(tc, 'ensure_ld64_lld', return_value=(fx['lld'], '')),
+                mock.patch.multiple(
+                    build_app,
+                    py=selective_py,
+                    romfs_has=lambda *_a, **_kw: True,
+                    host_sources=lambda *_a, **_kw: ([], []),
+                    compat_rt_needed=lambda *_a, **_kw: False,
+                    compile_all=spy_compile_all,
+                    build_pso_archive=lambda *_a, **_kw: None,
+                    check_dylib=lambda *_a, **_kw: None,
+                ),
+                mock.patch.object(build_app.macho_sign, 'sign', return_value=64),
+                mock.patch.object(build_app.subprocess, 'run', side_effect=spy_subproc_run),
+            ):
+                rc = build_app.main([])
+
+            self.assertEqual(rc, 0)
+            self.assertTrue((fw_out / 'DmGame0400A3A01EE4C000_2.framework').is_dir())
+            ns_h = fx['w'] / 'build' / 'ios' / 'win' / 'Gen' / 'framework' / 'objc_namespace.h'
+            self.assertTrue(ns_h.is_file())
+            ns_text = ns_h.read_text(encoding='utf-8')
+            self.assertIn('#define StubObjcClass DmFw_0400A3A01EE4C000_2_c2_StubObjcClass', ns_text)
+            self.assertIn('#define NspbSetting DmFw_0400A3A01EE4C000_2_c2_NspbSetting', ns_text)
+            self.assertEqual(captured_compile['extra'], ['-DDM_SHELL_FRAMEWORK=1', '-include', 'objc_namespace.h'])
+            self.assertIn(ns_h.parent.resolve(), captured_compile['incs'])
+
+            # Linker receives ASCII -exported_symbol flags (immune to commas and non-ASCII work paths)
+            self.assertIn('-Wl,-exported_symbol', captured_link_cmd)
+            for req_sym in build_app.REQUIRED_DYLIB_SYMBOLS:
+                self.assertIn(f'-Wl,{req_sym}', captured_link_cmd)
+            self.assertNotIn('-Wl,_dm_main', captured_link_cmd)
+
+    def test_one_game_ipa_pulling_shaders_shader_files_nacp_and_metadata(self) -> None:
+        import plistlib
+        from nspb_qt import win as win_pkg
+        from nspb_qt.win import build_app, toolchain as tc
+
+        self.assertEqual(win_pkg.IOS_CPU, 'apple-m1')
+        self.assertEqual(
+            build_app.REQUIRED_DYLIB_SYMBOLS,
+            (
+                '_dmgame_image_marker',
+                '_dm_glue_version',
+                '_dm_glue_start_game',
+                '_dm_glue_present_game',
+                '_dm_glue_focus_event',
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            fx = self._setup_minimal_fixture(Path(td), gfx='nvn', with_manifest=False)
+            fake_gm = self._make_fake_game_module(fx['gd'])
+            v0_nacp = fx['w'] / 'data' / 'v0' / 'control.nacp'
+            v0_nacp.parent.mkdir(parents=True, exist_ok=True)
+            v0_nacp.write_bytes(b'BASE_NACP_BYTES')
+            upd_nacp = fx['romfs'].parent / 'control.nacp'
+            upd_nacp.write_bytes(b'UPDATE_NACP_BYTES')
+
+            settings_nacp_seen: list[Path] = []
+            pack_calls: list[list[str]] = []
+
+            def fake_py(script, *args, **_kw):
+                sname = Path(script).name
+                if sname == 'nacp.py':
+                    if args and str(args[0]) == '--version':
+                        self.assertEqual(Path(args[1]), upd_nacp)
+                        return '2.4.1'
+                    self.assertEqual(Path(args[0]), v0_nacp)
+                    return 'Pokopia Base Title'
+                if sname == 'dmsh_chain.py':
+                    return 'abcdef012345'
+                if sname == 'game.py' and args and args[0] == 'header':
+                    Path(args[2]).write_text('#define DM_GAME_PSO_MTL4 0\n', encoding='utf-8')
+                    return ''
+                if sname == 'gen_embed.py':
+                    Path(args[-2]).write_text('.text\n', encoding='utf-8')
+                    return ''
+                if sname == 'settings.py':
+                    settings_nacp_seen.append(Path(args[2]))
+                    Path(args[3]).write_text('{"schema":1,"settings":[]}', encoding='utf-8')
+                    return 'launcher.json'
+                return ''
+
+            def fake_subproc_run(cmd, *_a, **_kw):
+                cmd_list = [str(c) for c in cmd]
+                if any(c.endswith('pack_ipa.py') for c in cmd_list):
+                    pack_calls.append(cmd_list)
+                    Path(cmd_list[2]).write_bytes(b'ipa')
+                return subprocess.CompletedProcess(cmd_list, 0, '', '')
+
+            out_ipa = Path(td) / 'out.ipa'
+            base_env = {
+                'NSPB_REPO': str(fx['repo']),
+                'GAME': '0400A3A01EE4C000',
+                'W': str(fx['w']),
+                'PATCHED': str(fx['patched']),
+                'ROMFS': str(fx['romfs']),
+                'MSL_IOS': str(fx['msl_ios']),
+                'GFXAPI': 'nvn',
+                'DM_DISPLAY_NAME': '',
+                'DM_APP_VERSION': '',
+                'DM_FRAMEWORK_ONLY': '',
+                'CONTROL': '',
+                'PROGRAMS_TSV': '',
+            }
+
+            # Case 1: default IOS_PULL=1 keeps _bp.metallib even when DM_GAME_PSO_MTL4 is 0 and pso is None
+            with (
+                mock.patch.dict(os.environ, dict(base_env, IOS_PULL='', DM_SHADER_FILES='1'), clear=False),
+                mock.patch.dict(sys.modules, {'game': fake_gm}),
+                mock.patch.object(tc, 'ios_sdk', return_value=fx['sdk']),
+                mock.patch.object(tc, 'sdk_version', return_value=('26.0', '23A344')),
+                mock.patch.object(tc, 'llvm_tool', return_value=fx['clang']),
+                mock.patch.object(tc, 'ensure_ld64_lld', return_value=(fx['lld'], '')),
+                mock.patch.object(tc, 'std_font', return_value=fx['std_font']),
+                mock.patch.object(tc, 'letter_font', return_value=fx['letter_font']),
+                mock.patch.multiple(
+                    build_app,
+                    py=fake_py,
+                    _build_shared_fonts=lambda *_a, **_kw: None,
+                    romfs_has=lambda *_a, **_kw: True,
+                    shader_lib_has=lambda *_a, **_kw: True,
+                    shader_lib_stamp_lines=lambda *_a, **_kw: ['game\t0400A3A01EE4C000', 'inputs\tabcdef012345'],
+                    host_sources=lambda *_a, **_kw: ([], []),
+                    framework_list=lambda *_a, **_kw: ['Foundation'],
+                    compat_rt_needed=lambda *_a, **_kw: False,
+                    compile_all=lambda *_a, **_kw: [],
+                    link=lambda *_a, **_kw: None,
+                    build_pso_archive=lambda *_a, **_kw: None,
+                    _read_source_commit=lambda *_a, **_kw: '94a0944755da',
+                ),
+                mock.patch.object(build_app.fix_ipa_modes, 'fix', return_value='ok'),
+                mock.patch.object(build_app.subprocess, 'run', side_effect=fake_subproc_run),
+            ):
+                rc = build_app.main([str(out_ipa)])
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(settings_nacp_seen, [upd_nacp])
+            app_dir = fx['w'] / 'build' / 'ios' / 'win' / 'Payload' / 'DmIOS.app'
+            self.assertEqual((app_dir / 'dm' / 'control.nacp').read_bytes(), b'UPDATE_NACP_BYTES')
+            with open(app_dir / 'Info.plist', 'rb') as pf:
+                plist = plistlib.load(pf)
+            self.assertEqual(plist['CFBundleDisplayName'], 'Pokopia Base Title')
+            self.assertEqual(plist['CFBundleShortVersionString'], '2.4.1')
+            self.assertEqual(plist['DMForkPatches'], 'patch-alpha,patch-beta')
+            self.assertEqual(plist['DMCommit'], '94a0944755da')
+            self.assertEqual(plist['DMChain'], 'v0')
+            scene_cfgs = plist['UIApplicationSceneManifest']['UISceneConfigurations']
+            self.assertIn('UIWindowSceneSessionRoleExternalDisplayNonInteractive', scene_cfgs)
+            self.assertNotIn('_bp.metallib', pack_calls[-1])
+            self.assertIn('--shader-files', pack_calls[-1])
+
+            # Case 2: explicit IOS_PULL=0 without offline PSO omits _bp.metallib
+            pack_calls.clear()
+            with (
+                mock.patch.dict(os.environ, dict(base_env, IOS_PULL='0', DM_SHADER_FILES='0'), clear=False),
+                mock.patch.dict(sys.modules, {'game': fake_gm}),
+                mock.patch.object(tc, 'ios_sdk', return_value=fx['sdk']),
+                mock.patch.object(tc, 'sdk_version', return_value=('26.0', '23A344')),
+                mock.patch.object(tc, 'llvm_tool', return_value=fx['clang']),
+                mock.patch.object(tc, 'ensure_ld64_lld', return_value=(fx['lld'], '')),
+                mock.patch.object(tc, 'std_font', return_value=fx['std_font']),
+                mock.patch.object(tc, 'letter_font', return_value=fx['letter_font']),
+                mock.patch.multiple(
+                    build_app,
+                    py=fake_py,
+                    _build_shared_fonts=lambda *_a, **_kw: None,
+                    romfs_has=lambda *_a, **_kw: True,
+                    shader_lib_has=lambda *_a, **_kw: True,
+                    shader_lib_stamp_lines=lambda *_a, **_kw: ['game\t0400A3A01EE4C000', 'inputs\tabcdef012345'],
+                    host_sources=lambda *_a, **_kw: ([], []),
+                    framework_list=lambda *_a, **_kw: ['Foundation'],
+                    compat_rt_needed=lambda *_a, **_kw: False,
+                    compile_all=lambda *_a, **_kw: [],
+                    link=lambda *_a, **_kw: None,
+                    build_pso_archive=lambda *_a, **_kw: None,
+                ),
+                mock.patch.object(build_app.fix_ipa_modes, 'fix', return_value='ok'),
+                mock.patch.object(build_app.subprocess, 'run', side_effect=fake_subproc_run),
+            ):
+                rc2 = build_app.main([str(out_ipa)])
+            self.assertEqual(rc2, 0)
+            self.assertIn('--skip-suffix', pack_calls[-1])
+            self.assertIn('_bp.metallib', pack_calls[-1])
+            self.assertNotIn('--shader-files', pack_calls[-1])
+
+            # Case 3: non-empty PROGRAMS_TSV refuses explicitly instead of packing an incomplete p0-only app
+            with (
+                mock.patch.dict(os.environ, dict(base_env, PROGRAMS_TSV=str(Path(td) / 'progs.tsv')), clear=False),
+                mock.patch.dict(sys.modules, {'game': fake_gm}),
+            ):
+                with self.assertRaises(SystemExit) as ctx_mp:
+                    build_app.main([str(out_ipa)])
+                self.assertEqual(ctx_mp.exception.code, 1)
 
 
 if __name__ == '__main__':

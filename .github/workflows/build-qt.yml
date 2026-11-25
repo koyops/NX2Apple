@@ -49,6 +49,10 @@ jobs:
     needs: shell-template
     runs-on: windows-latest
     steps:
+      - name: Disable Git CRLF conversion
+        shell: bash
+        run: git config --global core.autocrlf false
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download the DmShell.app template
@@ -77,7 +81,7 @@ jobs:
       # Exact versions, wheels only: the zip ships these to players, so the supply is pinned
       # (hash-locking the full closure can follow the Mac bundled-Python pattern if wanted).
       - name: Download the venv wheels
-        run: "python -m pip download --only-binary=:all: lz4==4.4.5 capstone==5.0.9 fonttools==4.68.0 zbic==1.0.1.post1 backports.zstd==1.8.0 nsz==5.0.0 -d frontend-qt/wheels"
+        run: "python -m pip download --only-binary=:all: lz4==4.4.5 capstone==5.0.9 unicorn==2.1.4 fonttools==4.68.0 zbic==1.0.1.post1 backports.zstd==1.8.0 nsz==5.0.0 -d frontend-qt/wheels"
 
       - name: Build the engine tree
         shell: bash
@@ -89,7 +93,7 @@ jobs:
           python tools/engine.py tree --out engine-tree
           du -sh engine-tree
 
-      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
           dotnet-version: '10.0.x'
 
@@ -97,19 +101,29 @@ jobs:
         shell: bash
         run: |
           # Use the patched sources that produced engine-tree. Keep obj/ and other build
-          # intermediates in engine/ so only the published output goes into the Windows zip.
+          # intermediates outside engine/ so only the published output goes into the Windows zip.
           out=engine-tree/dm/tools/nx_extract_bin
           cp frontend-qt/nx_extract/packages.lock.json engine/dm/tools/nx_extract/
-          dotnet publish engine/dm/tools/nx_extract -c Release --self-contained false -p:RestoreLockedMode=true -o "$out"
+          dotnet publish engine/dm/tools/nx_extract -c Release --self-contained false -p:PublishAot=false -p:RestoreLockedMode=true --artifacts-path "$RUNNER_TEMP/nx_extract_artifacts" -o "$out"
           cp frontend-qt/nx_extract/LibHac-LICENSE.txt "$out/"
+          "$out/nx_extract.exe" --source-sha
 
           # Open a synthetic empty PFS0 through LibHac before packaging.
           touch empty.keys
           python -c "from pathlib import Path; Path('empty.nsp').write_bytes(b'PFS0' + bytes(256))"
           "$out/nx_extract.exe" empty.keys --keys empty.nsp
 
+          # The engine tree ships a macOS Mach-O dmsh_xlate NativeAOT binary in dm/gfx/tools/dmsh_xlate_bin/.
+          # Publish the managed Windows assemblies alongside it so shim.py's `dotnet dmsh_xlate.dll` runs
+          # on Windows while tool_lock.py still sees the committed Mach-O binary's sha16 fingerprint.
+          dotnet publish engine/dm/gfx/tools/dmsh_xlate -c Release --self-contained false -p:PublishAot=false -p:SatelliteResourceLanguages=en --artifacts-path "$RUNNER_TEMP/dmsh_xlate_artifacts" -o "$RUNNER_TEMP/dmsh_xlate_out"
+          cp "$RUNNER_TEMP/dmsh_xlate_out"/*.dll "$RUNNER_TEMP/dmsh_xlate_out"/*.json "$RUNNER_TEMP/dmsh_xlate_out"/*.exe engine-tree/dm/gfx/tools/dmsh_xlate_bin/
+          dotnet engine-tree/dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate.dll --source-sha
+
       - name: Build Windows shader tools for the bundled engine
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           # The engine tree ships a macOS Mach-O spirv-cross binary in dm/gfx/tools/spirv_cross_bin/.
           # Build the Windows executable from the exact commit build.sh pins, and bundle Khronos's
@@ -130,7 +144,8 @@ jobs:
 
           GLSLANG_URL="https://github.com/KhronosGroup/glslang/releases/download/16.6.0/glslang-16.6.0-windows-x86_64-release.zip"
           GLSLANG_SHA="82bf434e69b9bb4829de7e2b4bc2c5e7a7861e53d66cf75e5cc70f5f694a8d9b"
-          curl -fsSL "$GLSLANG_URL" -o glslang.zip
+          gh release download 16.6.0 -R KhronosGroup/glslang -p glslang-16.6.0-windows-x86_64-release.zip -O glslang.zip --clobber \
+            || curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors "$GLSLANG_URL" -o glslang.zip
           got_sha=$(sha256sum glslang.zip | awk '{print $1}')
           [ "$got_sha" = "$GLSLANG_SHA" ] || { echo "glslang.zip sha256 is $got_sha, expected $GLSLANG_SHA" >&2; exit 1; }
           unzip -q glslang.zip bin/glslang.exe
@@ -184,10 +199,18 @@ jobs:
             --hidden-import nspb_qt.win.driver \
             --hidden-import nspb_qt.win.shim \
             --hidden-import nspb_qt.win.mp_worker \
+            --hidden-import nspb_qt.win.big_result \
             --hidden-import nspb_qt.win.build_app \
             --hidden-import nspb_qt.win.shell_export \
             --hidden-import nspb_qt.win.fix_ipa_modes \
             --hidden-import nspb_qt.win.doctor \
+            --hidden-import nspb_qt.win.love_shaders \
+            --hidden-import nspb_qt.win.arm64_emu \
+            --hidden-import nspb_qt.win.oodle_emu \
+            --hidden-import nspb_qt.win.gm_shaders \
+            --hidden-import nspb_qt.win.nro_emu \
+            --hidden-import nspb_qt.win.glslc_emu \
+            --hidden-import nspb_qt.win.defender \
             --collect-data PySide6 \
             --hidden-import PySide6.QtCore \
             --hidden-import PySide6.QtGui \
@@ -258,6 +281,9 @@ jobs:
           cp -r ../wheels "NX2Apple/wheels"
           # The engine tree goes inside the app folder, where the launcher finds it at
           # <exe_dir>/engine (and also at <exe_dir>/../engine) and skips the repo/sync route entirely.
+          # Refresh .engine-files after Windows tools (nx_extract.exe, dmsh_xlate.dll, spirv-cross.exe,
+          # glslangValidator.exe) were added so bundled pruning keeps them and drops stale upgrade files.
+          python ../../tools/engine.py tree-manifest --out ../../engine-tree
           cp -r ../../engine-tree "NX2Apple/engine"
           NSPB_PACKAGED_BUNDLE_DIR="$PWD/NX2Apple/_internal" \
           NSPB_ENGINE_DIR="$PWD/NX2Apple/engine" \

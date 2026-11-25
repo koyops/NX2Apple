@@ -4,7 +4,7 @@ import Testing
 import ShellUI
 
 @Suite struct ShellSettingsStoreTests {
-    private func shell() -> ShellSettingsStore { ShellSettingsStore(defaults: UserDefaults(suiteName: "t-shell-\(UUID().uuidString)")!) }
+    private func shell() -> ShellSettingsStore { ShellSettingsStore(defaults: TestDefaults.make("t-shell")) }
 
     @Test func padMapPersistsAndResetsWithoutChangingOtherSettings() {
         let store = shell()
@@ -110,5 +110,52 @@ import ShellUI
         #expect(defaults.object(forKey: "launcher.DM_SHOW_FPS") == nil, "a choice equal to the shell's value follows the shell again")
         store = GameSettingsStore(profile: profile, defaults: defaults, shell: ["DM_OPMODE": "7"])
         #expect(store.values()["DM_OPMODE"] == "1", "a value the game does not offer is ignored")
+    }
+
+    @Test func aSavedGamePadLayoutWinsTheGlobalTouchMode() throws {
+        let profile = try LauncherProfile.parse(Data("""
+        {"schema":1,"game":"0100000000010000","settings":[{"env":"DM_PROF_PAD_LAYOUT","kind":"choice","section":"Touch","label":"Layout","note":"","default":"2","options":[["0","2D"],["1","3D"],["2","Tap"]]}]}
+        """.utf8))
+        let defaults = TestDefaults.make("t-game-touch")
+        let shell = shell()
+        shell.storeTouchMode("3d")
+        let game = GameSettingsStore(profile: profile, defaults: defaults, shell: shell.gameDefaults)
+        let layout = try #require(profile.settings.first { $0.env == "DM_PROF_PAD_LAYOUT" })
+
+        #expect(game.values()[layout.env] == "1" && game.isFromShell(layout))
+        game.set(layout.env, to: "0")
+        #expect(game.values()[layout.env] == "0" && !game.isFromShell(layout))
+        game.reset()
+        #expect(game.values()[layout.env] == "1" && game.isFromShell(layout))
+        #expect(GameSettingsStore(profile: profile, defaults: defaults).values()[layout.env] == "2", "an unset shell mode preserves the game's Tap default")
+    }
+
+    @Test func audioMixDefaultsOffPersistsAndClearsKeyWhenDisabled() {
+        let store = shell()
+        #expect(!store.audioMix)
+        #expect(store.defaults.object(forKey: ShellSettingsStore.audioMixKey) == nil)
+        #expect(store.gameDefaults["DM_AUDIO_MIX"] == nil)
+
+        store.storeAudioMix(true)
+        #expect(store.audioMix)
+        #expect(store.gameDefaults["DM_AUDIO_MIX"] == "1")
+        #expect(ShellSettingsStore(defaults: store.defaults).audioMix)
+
+        store.storeAudioMix(false)
+        #expect(!store.audioMix)
+        #expect(store.defaults.object(forKey: ShellSettingsStore.audioMixKey) == nil)
+        #expect(store.gameDefaults["DM_AUDIO_MIX"] == nil)
+    }
+
+    @Test func legacyTouchToggleDefaultsAreIgnoredWhileTouchSizeAndStickRemain() {
+        let store = shell()
+        store.defaults.set("b,zr", forKey: "touchToggle")
+        store.storeTouchSize("large")
+        store.storeTouchStick("inward")
+
+        #expect(store.touchLayout.isEmpty)
+        #expect(store.gameDefaults["DM_TOUCH_TOGGLE"] == nil)
+        #expect(store.gameDefaults["DM_TOUCH_SIZE"] == "large")
+        #expect(store.gameDefaults["DM_TOUCH_STICK"] == "inward")
     }
 }

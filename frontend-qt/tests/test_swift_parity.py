@@ -4,6 +4,7 @@ BuildFolder (FreeSpace), GameDeletion, DriveCopy, Diagnostics, and the 3-page UI
 """
 from __future__ import annotations
 
+import importlib.util
 import os
 import struct
 import sys
@@ -191,15 +192,18 @@ def _ensure_model_mod():
             def currentThread():
                 return None
 
+        _QUEUED = object()
+
         class Qt:
-            QueuedConnection = 1
+            QueuedConnection = _QUEUED
 
         class QMetaObject:
             @staticmethod
-            def invokeMethod(obj, name: str, *_a) -> None:
+            def invokeMethod(obj, name: str, *args) -> None:
                 fn = getattr(obj, name, None)
                 if callable(fn):
-                    fn()
+                    call_args = args[1:] if args and args[0] is Qt.QueuedConnection else args
+                    fn(*call_args)
 
         class QSettings:
             IniFormat = 1
@@ -220,7 +224,7 @@ def _ensure_model_mod():
         qt_core.QObject = QObject
         qt_core.Signal = Signal
         qt_core.Slot = Slot
-        qt_core.Q_ARG = lambda *_a: None
+        qt_core.Q_ARG = lambda _t, v: v
         qt_core.QThread = QThread
         qt_core.Qt = Qt
         qt_core.QMetaObject = QMetaObject
@@ -429,11 +433,15 @@ class SharedShellParityTests(unittest.TestCase):
 
             def checked_se_run(cmd, *a, **kw):
                 cmd_list = [str(c) for c in cmd]
-                if any(c.endswith('make_ext_font.py') for c in cmd_list):
+                if any('make_shared_fonts' in c for c in cmd_list):
                     ext_font_calls.append(cmd_list)
-                    if len(cmd_list) < 4 or Path(cmd_list[3]) != letter_font:
-                        return subprocess.CompletedProcess(cmd_list, 1, '', f'bad letter font: {cmd_list}')
-                    Path(cmd_list[2]).write_bytes(b'EXT_TTF_BYTES')
+                    if len(cmd_list) < 7 or Path(cmd_list[5]) != std_font or Path(cmd_list[6]) != letter_font:
+                        return subprocess.CompletedProcess(cmd_list, 1, '', f'bad font args: {cmd_list}')
+                    out_dir = Path(cmd_list[4])
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    for fname in ('standard.ttf', 'chinese_simplified.ttf', 'chinese_simplified_ext.ttf',
+                                  'chinese_traditional.ttf', 'korean.ttf', 'nintendo_ext.ttf'):
+                        (out_dir / fname).write_bytes(b'FONT_TTF_BYTES')
                     return subprocess.CompletedProcess(cmd_list, 0, 'ok\n', '')
                 return real_se_run(cmd, *a, **kw)
 
@@ -488,15 +496,15 @@ class SharedShellParityTests(unittest.TestCase):
                 _wait_outcomes()
                 self.assertTrue(outcomes and outcomes[-1][0], f'Game 2 build failed: {outcomes}')
 
-            self.assertTrue(ext_font_calls, '_prepare_fonts must invoke make_ext_font.py')
-            self.assertEqual(Path(ext_font_calls[0][3]), letter_font)
+            self.assertTrue(ext_font_calls, '_prepare_fonts must invoke make_shared_fonts')
+            self.assertEqual(Path(ext_font_calls[0][6]), letter_font)
 
-            # Verify both games' archives exist side-by-side under <shared_out>/games/<TID> without overwriting each other
-            arch1 = shared_out / 'games' / tid1
-            arch2 = shared_out / 'games' / tid2
-            self.assertEqual((arch1 / 'romfs.img').read_bytes(), b'ROMFS_GAME_ONE_1111')
+            # Verify both games' archives exist side-by-side under <shared_out>/games/<SafeName> without overwriting each other
+            arch1 = shared_out / 'games' / 'Super Mario Bros. Wonder'
+            arch2 = shared_out / 'games' / 'Breath of the Wild'
+            self.assertEqual((arch1 / 'Super Mario Bros. Wonder.img').read_bytes(), b'ROMFS_GAME_ONE_1111')
             self.assertEqual((arch1 / 'aoc' / '0.img').read_bytes(), b'AOC_GAME_ONE_1111')
-            self.assertEqual((arch2 / 'romfs.img').read_bytes(), b'ROMFS_GAME_TWO_2222')
+            self.assertEqual((arch2 / 'Breath of the Wild.img').read_bytes(), b'ROMFS_GAME_TWO_2222')
             self.assertEqual((arch2 / 'aoc' / '0.img').read_bytes(), b'AOC_GAME_TWO_2222')
 
             # Verify library recorded both games under their verified 16-hex Title IDs
@@ -517,8 +525,8 @@ class SharedShellParityTests(unittest.TestCase):
             self.assertEqual(m.packed_title_id, tid1)
             ok_d1, dest_d1 = m.copy_archive_to_drive(str(drive_dir))
             self.assertTrue(ok_d1, dest_d1)
-            self.assertEqual((drive_dir / tid1 / 'romfs.img').read_bytes(), b'ROMFS_GAME_ONE_1111')
-            self.assertEqual((drive_dir / tid1 / 'aoc' / '0.img').read_bytes(), b'AOC_GAME_ONE_1111')
+            self.assertEqual((drive_dir / 'Super Mario Bros. Wonder' / 'Super Mario Bros. Wonder.img').read_bytes(), b'ROMFS_GAME_ONE_1111')
+            self.assertEqual((drive_dir / 'Super Mario Bros. Wonder' / 'aoc' / '0.img').read_bytes(), b'AOC_GAME_ONE_1111')
 
             # Reopen the SECOND game entry and send its game data to the same staging drive folder
             m.load_game_from_library(g2)
@@ -526,10 +534,10 @@ class SharedShellParityTests(unittest.TestCase):
             self.assertEqual(m.packed_title_id, tid2)
             ok_d2, dest_d2 = m.copy_archive_to_drive(str(drive_dir))
             self.assertTrue(ok_d2, dest_d2)
-            self.assertEqual((drive_dir / tid2 / 'romfs.img').read_bytes(), b'ROMFS_GAME_TWO_2222')
-            self.assertEqual((drive_dir / tid2 / 'aoc' / '0.img').read_bytes(), b'AOC_GAME_TWO_2222')
+            self.assertEqual((drive_dir / 'Breath of the Wild' / 'Breath of the Wild.img').read_bytes(), b'ROMFS_GAME_TWO_2222')
+            self.assertEqual((drive_dir / 'Breath of the Wild' / 'aoc' / '0.img').read_bytes(), b'AOC_GAME_TWO_2222')
             # First game's staged data is still untouched
-            self.assertEqual((drive_dir / tid1 / 'romfs.img').read_bytes(), b'ROMFS_GAME_ONE_1111')
+            self.assertEqual((drive_dir / 'Super Mario Bros. Wonder' / 'Super Mario Bros. Wonder.img').read_bytes(), b'ROMFS_GAME_ONE_1111')
 
             # 4. Verify export/NX2Apple.ipa contains both frameworks and no .tmp or .idx sidecars leaked in export/
             expected_ipa = shell_root / 'export' / 'NX2Apple.ipa'
@@ -542,8 +550,9 @@ class SharedShellParityTests(unittest.TestCase):
                 self.assertIn('Payload/DmShell.app/DmShell', names)
                 self.assertIn(f'Payload/DmShell.app/Frameworks/DmGame{tid1}.framework/DmGame{tid1}', names)
                 self.assertIn(f'Payload/DmShell.app/Frameworks/DmGame{tid2}.framework/DmGame{tid2}', names)
-                self.assertEqual(zf.read('Payload/DmShell.app/dm/font/standard.ttf'), b'WIN_ARIAL_TTF_BYTES')
-                self.assertEqual(zf.read('Payload/DmShell.app/dm/font/nintendo_ext.ttf'), b'EXT_TTF_BYTES')
+                for fname in ('standard.ttf', 'chinese_simplified.ttf', 'chinese_simplified_ext.ttf',
+                              'chinese_traditional.ttf', 'korean.ttf', 'nintendo_ext.ttf'):
+                    self.assertEqual(zf.read(f'Payload/DmShell.app/dm/font/{fname}'), b'FONT_TTF_BYTES')
                 for exec_entry in (
                     'Payload/DmShell.app/DmShell',
                     f'Payload/DmShell.app/Frameworks/DmGame{tid1}.framework/DmGame{tid1}',
@@ -864,6 +873,145 @@ class SharedShellParityTests(unittest.TestCase):
                 prog.close()
                 m._stop_pso_poll()
 
+    def test_onboarding_install_all_missing_tracks_sub_stages_and_pip_packages(self) -> None:
+        """Verify Model.install_all_missing, _stage_progress_logger, and _make_venv update per-item
+        sub-stages (Python interpreter download -> venv -> pip packages, download -> unpack) and overall progress.
+        """
+        import io
+        import time
+        from unittest import mock
+
+        model_mod = self._model_mod
+        Model = model_mod.Model
+        Dep = model_mod.Dep
+        DepState = model_mod.DepState
+
+        with mock.patch.object(Model, 'check_deps', lambda self: None):
+            m = Model()
+
+        py_dep = Dep('python', 'dep.python', 'dep.python.hint', DepState.MISSING, install=['__win__:python'])
+        dn_dep = Dep('dotnet', 'dep.dotnet', 'dep.dotnet.hint', DepState.MISSING, install=['__win__:dotnet'])
+        llvm_dep = Dep('llvm', 'dep.llvm', 'dep.llvm.hint', DepState.MISSING, install=['__win__:llvm'])
+        lld_dep = Dep('lld', 'dep.lld', 'dep.lld.hint', DepState.MISSING, install=[])
+        sdk_dep = Dep('ios_sdk', 'dep.iossdk', 'dep.iossdk.hint', DepState.MISSING, install=['__win__:ios_sdk'])
+        m.deps = [py_dep, dn_dep, llvm_dep, lld_dep, sdk_dep]
+        m.deps_checked = True
+
+        # 1. Verify _stage_progress_logger updates py_download, download, and unpack percentages
+        m._install_all_running = True
+        m.install_all_step = 1
+        m.install_all_total = 4
+        m.install_all_pct = 0
+
+        py_cb = m._stage_progress_logger(
+            py_dep, m.t('dep.phase.download'), 'python-3.12.8-amd64.exe',
+            phase='py_download', py_version='3.12.8',
+        )
+        py_cb(13 * 1048576, 26 * 1048576)
+        self.assertEqual(py_dep.install_pct, 50)
+        self.assertIn('50%', py_dep.install_stage)
+        self.assertIn('3.12.8', py_dep.install_detail)
+        self.assertGreater(m.install_all_pct, 0)
+
+        dl_cb = m._stage_progress_logger(
+            llvm_dep, m.t('dep.phase.download'), 'llvm-mingw.zip', phase='download'
+        )
+        dl_cb(160 * 1048576, 250 * 1048576)
+        self.assertEqual(llvm_dep.install_pct, 64)
+        self.assertIn('64%', llvm_dep.install_stage)
+        self.assertIn('160 / 250 MB', llvm_dep.install_detail)
+
+        up_cb = m._stage_progress_logger(
+            llvm_dep, m.t('dep.phase.unpack'), 'llvm-mingw.zip', phase='unpack'
+        )
+        up_cb(180 * 1048576, 250 * 1048576)
+        self.assertEqual(llvm_dep.install_pct, 72)
+        self.assertIn('72%', llvm_dep.install_stage)
+        m._install_all_running = False
+
+        # 2. Verify _make_venv tracks pip package progress across all 6 packages
+        seen_stages: list[tuple[str, str, int | None]] = []
+        orig_set = m._set_dep_progress
+
+        def spy_set(dep, stage='', detail='', pct=None, **kw):
+            orig_set(dep, stage, detail, pct, **kw)
+            seen_stages.append((stage, detail, dep.install_pct))
+
+        class FakePipPopen:
+            def __init__(self, *_a, **_kw) -> None:
+                self.stdout = io.StringIO(
+                    'Processing ./wheels/lz4-4.3.3.whl\n'
+                    'Processing ./wheels/capstone-5.0.3.whl\n'
+                    'Processing ./wheels/unicorn-2.1.4.whl\n'
+                    'Processing ./wheels/fonttools-4.55.0.whl\n'
+                    'Processing ./wheels/zbic-0.1.0.whl\n'
+                    'Processing ./wheels/backports_zstd-1.0.0.whl\n'
+                    'Processing ./wheels/nsz-4.6.1.whl\n'
+                    'Successfully installed lz4 capstone unicorn fonttools zbic backports.zstd nsz\n'
+                )
+                self.returncode = 0
+
+            def wait(self) -> int:
+                return 0
+
+        with tempfile.TemporaryDirectory() as td:
+            vdir = Path(td) / 'venv'
+            vpy = vdir / 'bin' / 'python3'
+            base_py = Path(td) / 'base_python3'
+            base_py.write_text('', encoding='utf-8')
+
+            def fake_runs(exe, args):
+                if args[:2] == ['-m', 'venv']:
+                    vpy.parent.mkdir(parents=True, exist_ok=True)
+                    vpy.write_text('', encoding='utf-8')
+                return True
+
+            py_dep.installing = True
+            with mock.patch.object(model_mod.pu, 'venv_dir', return_value=vdir), \
+                 mock.patch.object(model_mod.pu, 'venv_python', return_value=str(vpy)), \
+                 mock.patch.object(model_mod.pu, 'venv_base', return_value=str(base_py)), \
+                 mock.patch.object(model_mod.pu, '_python_version', return_value='3.12.8'), \
+                 mock.patch.object(model_mod.pu, '_runs', side_effect=fake_runs), \
+                 mock.patch.object(model_mod.subprocess, 'Popen', FakePipPopen), \
+                 mock.patch.object(m, '_set_dep_progress', side_effect=spy_set):
+                ok = m._make_venv(str(base_py))
+            py_dep.installing = False
+        self.assertTrue(ok)
+        self.assertTrue(any(pct == 100 for _s, _d, pct in seen_stages), seen_stages)
+        self.assertTrue(any('fonttools' in d for _s, d, _p in seen_stages), seen_stages)
+
+        # 3. Verify install_all_missing assigns queue_index, advances install_all_step, and clears state at end
+        snapshots: list[tuple[int, int, list[int]]] = []
+
+        def fake_install_dep(dep: Dep) -> None:
+            snapshots.append((
+                m.install_all_step,
+                m.install_all_total,
+                [r.queue_index for r in m.deps],
+            ))
+            dep.installing = False
+            dep._install_done = True  # type: ignore[attr-defined]
+            dep.state = DepState.OK
+            if dep.id == 'llvm':
+                lld_dep.state = DepState.OK
+
+        with mock.patch.object(m, 'install_dep', side_effect=fake_install_dep), \
+             mock.patch.object(m, 'check_deps', lambda: None):
+            m.install_all_missing()
+            deadline = time.time() + 5.0
+            while m._install_all_running and time.time() < deadline:
+                time.sleep(0.02)
+
+        self.assertFalse(m._install_all_running)
+        self.assertEqual(m.install_all_step, 0)
+        self.assertEqual(len(snapshots), 4)
+        self.assertEqual([s[0] for s in snapshots], [1, 2, 3, 4])
+        self.assertTrue(all(s[1] == 4 for s in snapshots))
+        # At step 1, dotnet/llvm/ios_sdk are queued as #2, #3, #4
+        self.assertEqual(snapshots[0][2], [1, 2, 3, 0, 4])
+        self.assertTrue(all(r.ok for r in m.deps))
+        self.assertTrue(all(r.queue_index == 0 for r in m.deps))
+
 
 class KeyCheckTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -964,6 +1112,58 @@ class LibraryAndSpaceTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
+    def test_delete_game_removes_only_its_shared_framework_and_shell_entry(self) -> None:
+        import shutil
+
+        from nspb_qt.win.shell_export import ShellGame, ShellLibrary
+
+        title_id = '010082A0205AE000'
+        other_id = '0100000000010000'
+        shell_root = self.dir / 'shell'
+        frameworks = shell_root / 'frameworks'
+        game_framework = frameworks / f'DmGame{title_id}.framework'
+        other_framework = frameworks / f'DmGame{other_id}.framework'
+        for framework in (game_framework, other_framework):
+            framework.mkdir(parents=True)
+            (framework / 'DmGame').write_bytes(b'framework')
+        shell = ShellLibrary(games=[
+            ShellGame(title_id, 'Deleted', str(game_framework)),
+            ShellGame(other_id, 'Kept', str(other_framework)),
+        ])
+        shell.save(shell_root)
+        shared_ipa = shell_root / 'export' / 'NX2Apple.ipa'
+        shared_ipa.parent.mkdir()
+        shared_ipa.write_bytes(b'previous export')
+        source = self.dir / 'original.nsp'
+        source.write_bytes(b'source')
+        game = lib.LibraryGame(title_id, 'Deleted', ipa_path=str(shared_ipa), inputs={'base': [str(source)]})
+
+        plan = lib.GameDeletionPlan.plan(game, shell_root=str(shell_root))
+        self.assertEqual([(item.kind, item.paths) for item in plan.items],
+                         [('shellFramework', [str(game_framework)])])
+        trashed: list[str] = []
+
+        def trash(path: str) -> bool:   # the system's Trash stays out of the test
+            trashed.append(path)
+            shutil.rmtree(path)
+            return True
+
+        self.assertEqual(plan.run(trash=trash), [])
+        self.assertEqual(trashed, [str(game_framework)])
+        self.assertFalse(game_framework.exists())
+        self.assertTrue(other_framework.is_dir())
+        self.assertEqual([item.title_id for item in ShellLibrary.load(shell_root).games], [other_id])
+        self.assertTrue(shared_ipa.exists())
+        self.assertTrue(source.exists())
+
+        self.assertEqual(lib.GameDeletionPlan.plan(game, shell_root=str(shell_root)).items, [])
+        shell.add(ShellGame(title_id, 'Deleted', str(game_framework)))
+        shell.save(shell_root)
+        missing = lib.GameDeletionPlan.plan(game, shell_root=str(shell_root))
+        self.assertEqual([(item.kind, item.paths) for item in missing.items], [('shellFramework', [])])
+        self.assertEqual(missing.run(), [])
+        self.assertEqual([item.title_id for item in ShellLibrary.load(shell_root).games], [other_id])
+
     def test_discover_games_and_free_space(self) -> None:
         games_dir = self.dir / 'games_root'
         sub = games_dir / 'Celeste'
@@ -998,6 +1198,68 @@ class LibraryAndSpaceTests(unittest.TestCase):
         self.assertEqual(freed, 4096)
         self.assertEqual(failed, [])
         self.assertTrue((bf / 'run' / 'save.dat').is_file())
+
+    def test_game_deletion_trashes_selected_paths_and_removes_empty_build_folder(self) -> None:
+        import shutil
+
+        build = self.dir / 'game_build'
+        build.mkdir()
+        cache = build / 'cache'
+        cache.mkdir()
+        (cache / 'data').write_bytes(b'cache')
+        saves = build / 'run'
+        saves.mkdir()
+        (saves / 'save').write_bytes(b'save')
+        archive = self.dir / 'game.nsp'
+        archive.write_bytes(b'archive')
+        plan = lib.GameDeletionPlan('game', [
+            lib.GameDeletionItem('archive', [str(archive)]),
+            lib.GameDeletionItem('buildFolder', [str(cache)]),
+        ], lib.GameDeletionItem('saves', [str(saves)]))
+        trashed: list[str] = []
+
+        def trash(path: str) -> bool:
+            trashed.append(path)
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+            return True
+
+        self.assertEqual(plan.run(trash=trash), [])
+        self.assertEqual(trashed, [str(archive), str(cache)])
+        self.assertTrue((saves / 'save').exists())
+        self.assertTrue(build.exists())
+        self.assertEqual(plan.run(delete_saves=True, trash=trash), [])
+        self.assertEqual(trashed[-1], str(saves))
+        self.assertFalse(build.exists())
+
+    def test_game_deletion_reports_trash_failure_without_removing_path(self) -> None:
+        build = self.dir / 'game_build'
+        build.mkdir()
+        failed_path = build / 'cache'
+        failed_path.write_bytes(b'keep')
+        plan = lib.GameDeletionPlan('game', [lib.GameDeletionItem('buildFolder', [str(failed_path)])])
+
+        def unavailable(path: str) -> bool:
+            raise OSError(path)
+
+        self.assertEqual(plan.run(trash=lambda path: False), [str(failed_path)])
+        self.assertEqual(plan.run(trash=unavailable), [str(failed_path)])
+        self.assertTrue(failed_path.exists())
+        self.assertTrue(build.exists())
+
+    @unittest.skipUnless(importlib.util.find_spec('PySide6'), 'PySide6 is not installed')
+    def test_game_deletion_uses_the_system_trash_by_default(self) -> None:
+        from unittest import mock
+
+        kept = self.dir / 'kept.nsp'
+        kept.write_bytes(b'keep')
+        plan = lib.GameDeletionPlan('game', [lib.GameDeletionItem('archive', [str(kept)])])
+        with mock.patch('PySide6.QtCore.QFile.moveToTrash', return_value=False) as move:
+            self.assertEqual(plan.run(), [str(kept)])
+        move.assert_called_once_with(str(kept))
+        self.assertTrue(kept.exists())
 
     def test_switch2_fallback_banners(self) -> None:
         import json
@@ -1098,14 +1360,14 @@ class LibraryAndSpaceTests(unittest.TestCase):
         self.assertEqual(saved_g['lastTarget'], 'iPhone / iPad')
         self.assertEqual(saved_g['toolsCommit'], 'b2d46b86d03f')
 
-        # 2. Verify REQUIRED_DYLIB_SYMBOLS against real C/ObjC sources in engine/ and win/ios/Launcher.m
+        # 2. Verify REQUIRED_DYLIB_SYMBOLS against real C/ObjC sources in engine/, frontend-ios/Shell/App/ and win/ios/Launcher.m
         eng = ROOT / 'engine'
         marker_file = eng / 'dm' / 'ios' / 'framework' / 'DmGameMarker.m'
         glue_file = eng / 'dm' / 'ios' / 'framework' / 'ShellGlue.m'
-        main_file = eng / 'dm' / 'ios' / 'Shell' / 'ShellMain.m'
+        main_file = ROOT / 'frontend-ios' / 'Shell' / 'App' / 'ShellMain.m'
         boot_hdr_file = eng / 'dm' / 'ios' / 'Sources' / 'FrameworkBootstrap.h'
         for required_src in (marker_file, glue_file, main_file, boot_hdr_file):
-            self.assertTrue(required_src.is_file(), f'missing synced engine source: {required_src}')
+            self.assertTrue(required_src.is_file(), f'missing source: {required_src}')
         marker_src = marker_file.read_text(encoding='utf-8')
         glue_src = glue_file.read_text(encoding='utf-8')
         main_src = main_file.read_text(encoding='utf-8')
@@ -1206,6 +1468,48 @@ class LibraryAndSpaceTests(unittest.TestCase):
                 self.assertIn('v0', derived_g.builds())
                 self.assertEqual(derived_g.builds()['v0']['display'], '1.0.0')
 
+    def test_framework_only_game_reports_ready_for_ios_and_primary_reveal(self) -> None:
+        import json
+
+        tid = '0100535012974000'
+        state_dir = self.dir / 'fw_only_state'
+        shell_dir = self.dir / 'fw_only_shell'
+        fw_dir = shell_dir / 'frameworks' / f'DmGame{tid}.framework'
+        fw_dir.mkdir(parents=True, exist_ok=True)
+        (fw_dir / 'game.manifest.json').write_text(
+            json.dumps({'title_id': tid, 'framework_executable': f'DmGame{tid}'}),
+            encoding='utf-8',
+        )
+        (fw_dir / f'DmGame{tid}').write_bytes(b'bin')
+        (shell_dir / 'shell.json').write_text(
+            json.dumps({'games': [{'titleID': tid, 'name': 'Orbit Fixture', 'framework': str(fw_dir)}]}),
+            encoding='utf-8',
+        )
+
+        gl = lib.GameLibrary(state_dir=state_dir)
+        self.assertTrue(gl.sync_ios_shell_state(str(shell_dir)))
+        g = next(item for item in gl.games if item.title_id == tid)
+        self.assertFalse(g.has_ipa)
+        self.assertFalse(g.has_archive)
+        self.assertTrue(g.has_ios_app)
+        self.assertTrue(g.is_ready_for_ios)
+        self.assertEqual(g.primary_reveal_path, str(fw_dir))
+
+
+class DiagnosticsReportTests(unittest.TestCase):
+    def test_each_dependency_row_names_its_dependency(self) -> None:
+        """Copy diagnostics named no dependency: model.Dep has an id and no name, so every row read `- : [OK] ...` (#1183)."""
+        from types import SimpleNamespace
+        # model.Dep's fields (it imports PySide6): an id, no name, `ok` from its state
+        deps = [
+            SimpleNamespace(id='python', title_key='dep.python', ok=True, required=True, detail='C:/py/python.exe'),
+            SimpleNamespace(id='dotnet', title_key='dep.dotnet', ok=False, required=True, detail=''),
+        ]
+        report = feat.Diagnostics.format_report(app_version='1.0', repo_path='', deps=deps, last_log='')
+        self.assertIn('- python: [OK] ', report)
+        self.assertIn('- dotnet: [MISSING]', report)
+        self.assertNotIn('\n- : ', report)
+
 
 class ParityWindowTests(unittest.TestCase):
     @classmethod
@@ -1228,10 +1532,13 @@ class ParityWindowTests(unittest.TestCase):
         self._p_qsettings = mock.patch.object(
             model_mod, 'QSettings', side_effect=lambda *a, **kw: QSettings(ini_file, QSettings.IniFormat)
         )
+        self._p_check_deps = mock.patch.object(model_mod.Model, 'check_deps', lambda _self: None)
         self._p_state.start()
         self._p_qsettings.start()
+        self._p_check_deps.start()
 
     def tearDown(self) -> None:
+        self._p_check_deps.stop()
         self._p_qsettings.stop()
         self._p_state.stop()
         self._state_tmp.cleanup()
@@ -1243,6 +1550,25 @@ class ParityWindowTests(unittest.TestCase):
         m.deleteLater()
         self.app.sendPostedEvents(None, QEvent.DeferredDelete)
         self.app.processEvents()
+
+    def test_delete_dialog_describes_shared_app_install(self) -> None:
+        from PySide6.QtWidgets import QLabel
+        from nspb_qt.model import Model
+        from nspb_qt.sheets import DeleteGameDialog
+        from nspb_qt.win.shell_export import ShellGame, ShellLibrary
+
+        model = Model()
+        shell_root = Path(self._state_tmp.name) / 'shell'
+        model.settings.setValue('shellRoot', str(shell_root))
+        title_id = '010082A0205AE000'
+        mirror = shell_root / 'frameworks' / f'DmGame{title_id}.framework'
+        ShellLibrary(games=[ShellGame(title_id, 'Deleted', str(mirror))]).save(shell_root)
+        dialog = DeleteGameDialog(model, lib.LibraryGame(title_id, 'Deleted'))
+        self.addCleanup(self._delete, model, dialog)
+
+        self.assertEqual([item.kind for item in dialog.plan.items], ['shellFramework'])
+        labels = [label.text() for label in dialog.findChildren(QLabel)]
+        self.assertIn(model.t('delete.part.shellFrameworkNote'), labels)
 
     def test_three_page_navigation_and_controls(self) -> None:
         from unittest import mock
@@ -1283,6 +1609,36 @@ class ParityWindowTests(unittest.TestCase):
         self.assertTrue(w.lang_btn.isHidden())
 
         w.close()
+
+    def test_unbuilt_hero_names_and_opens_the_selected_games_build(self) -> None:
+        from unittest import mock
+        from nspb_qt import library
+        from nspb_qt.model import Model
+        from nspb_qt.ui import MainWindow
+
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(library, 'default_state_dir', return_value=Path(directory)), \
+                mock.patch.object(library.ArtworkStore, 'request_banner_async'):
+            model = Model()
+            game = library.LibraryGame('0100ABCD00001000', 'Marble Orchard', inputs={'base': ['example.xci']})
+            model.library.games = [game]
+            window = MainWindow(model)
+            window._init_timer.stop()
+            self.addCleanup(self._delete, model, window)
+            window.show()
+            self.app.processEvents()
+            window._switch_page('library')
+            for language in Lang.all():
+                model.set_lang(language)
+                hero_label = window.hero.primary_btn.text()
+                self.assertEqual(hero_label, model.t('library.setUpBuild'))
+                self.assertNotEqual(hero_label, model.t('library.newBuild'))
+                self.assertFalse(hasattr(window, 'new_build_btn'))
+                seg_labels = [lbl for _k, lbl in window.nav_seg._items]
+                self.assertIn(model.t('nav.builds'), seg_labels)
+            window.hero.primary_btn.click()
+            self.assertEqual(window._current_page, 'builds')
+            self.assertEqual(model.base_path, 'example.xci')
 
     def test_ios26_sdk_compat_headers_in_common_flags(self) -> None:
         from nspb_qt.win import build_app
@@ -1394,9 +1750,10 @@ class ParityWindowTests(unittest.TestCase):
 
             # 5 & 7. Segmented control non-overlapping segments with gap >= 5px
             rects = w.ipa_kind_seg._segment_rects()
-            self.assertEqual(len(rects), 2)
-            r0, r1 = rects[0][2], rects[1][2]
+            self.assertEqual(len(rects), 3)
+            r0, r1, r2 = rects[0][2], rects[1][2], rects[2][2]
             self.assertGreaterEqual(r1.left() - r0.right(), 5.0)
+            self.assertGreaterEqual(r2.left() - r1.right(), 5.0)
 
             # 6. Step 1 & Step 3 reveal buttons + Copy game data button enabled when archive exists,
             # while redundant buttons on the Start Build row stay hidden
@@ -1663,12 +2020,16 @@ class ParityWindowTests(unittest.TestCase):
 
             def checked_se_run(cmd, *a, **kw):
                 cmd_list = [str(c) for c in cmd]
-                if any(c.endswith('make_ext_font.py') for c in cmd_list):
+                if any('make_shared_fonts' in c for c in cmd_list):
                     ext_font_calls.append(cmd_list)
-                    # make_ext_font.py must receive both the output path and the letter font path
-                    if len(cmd_list) < 4 or cmd_list[3] != str(letter_font):
-                        return subprocess.CompletedProcess(cmd_list, 1, '', 'missing letter font argument')
-                    Path(cmd_list[2]).write_bytes(b'EXT_TTF_BYTES')
+                    # make_shared_fonts.build must receive out_dir, std_font, and letter_font
+                    if len(cmd_list) < 7 or cmd_list[5] != str(std_font) or cmd_list[6] != str(letter_font):
+                        return subprocess.CompletedProcess(cmd_list, 1, '', 'missing font argument')
+                    out_dir = Path(cmd_list[4])
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    for fname in ('standard.ttf', 'chinese_simplified.ttf', 'chinese_simplified_ext.ttf',
+                                  'chinese_traditional.ttf', 'korean.ttf', 'nintendo_ext.ttf'):
+                        (out_dir / fname).write_bytes(b'FONT_TTF_BYTES')
                     return subprocess.CompletedProcess(cmd_list, 0, 'ok\n', '')
                 return real_se_run(cmd, *a, **kw)
 
@@ -1689,8 +2050,8 @@ class ParityWindowTests(unittest.TestCase):
                         break
                     time.sleep(0.05)
 
-            self.assertTrue(ext_font_calls, '_prepare_fonts must invoke make_ext_font.py')
-            self.assertEqual(ext_font_calls[0][3], str(letter_font))
+            self.assertTrue(ext_font_calls, '_prepare_fonts must invoke make_shared_fonts')
+            self.assertEqual(ext_font_calls[0][6], str(letter_font))
 
             build_cmds = [(c, e) for c, e in seen_cmds if '--progress' in c]
             self.assertEqual(len(build_cmds), 1)
@@ -1736,23 +2097,32 @@ class ParityWindowTests(unittest.TestCase):
             w._drive_folder = str(drive_ui)
             g1_item = next(g for g in m.library.games if g.title_id == tid1)
             g2_item = next(g for g in m.library.games if g.title_id == tid2)
+            def wait_drive_copy() -> None:
+                deadline = time.monotonic() + 5.0
+                while getattr(m, 'drive_copying', False) and time.monotonic() < deadline:
+                    self.app.processEvents()
+                    time.sleep(0.01)
+                self.app.processEvents()
+
             m.load_game_from_library(g1_item)
             w._copy_archive_to_drive()
-            self.assertEqual((drive_ui / tid1 / 'romfs.img').read_bytes(), b'DMROMFS1_game1')
+            wait_drive_copy()
+            self.assertEqual((drive_ui / 'Super Mario Bros. Wonder' / 'Super Mario Bros. Wonder.img').read_bytes(), b'DMROMFS1_game1')
             m.load_game_from_library(g2_item)
             w._copy_archive_to_drive()
-            self.assertEqual((drive_ui / tid2 / 'romfs.img').read_bytes(), b'DMROMFS1_game2')
-            self.assertEqual((drive_ui / tid1 / 'romfs.img').read_bytes(), b'DMROMFS1_game1')
+            wait_drive_copy()
+            self.assertEqual((drive_ui / 'Breath of the Wild' / 'Breath of the Wild.img').read_bytes(), b'DMROMFS1_game2')
+            self.assertEqual((drive_ui / 'Super Mario Bros. Wonder' / 'Super Mario Bros. Wonder.img').read_bytes(), b'DMROMFS1_game1')
 
             with zipfile.ZipFile(ipa2) as zf:
                 names = set(zf.namelist())
                 self.assertIn('Payload/DmShell.app/DmShell', names)
                 self.assertIn(f'Payload/DmShell.app/Frameworks/DmGame{tid1}.framework/DmGame{tid1}', names)
                 self.assertIn(f'Payload/DmShell.app/Frameworks/DmGame{tid2}.framework/DmGame{tid2}', names)
-                self.assertIn('Payload/DmShell.app/dm/font/standard.ttf', names)
-                self.assertIn('Payload/DmShell.app/dm/font/nintendo_ext.ttf', names)
-                self.assertEqual(zf.read('Payload/DmShell.app/dm/font/standard.ttf'), b'STD_TTF_BYTES')
-                self.assertEqual(zf.read('Payload/DmShell.app/dm/font/nintendo_ext.ttf'), b'EXT_TTF_BYTES')
+                for fname in ('standard.ttf', 'chinese_simplified.ttf', 'chinese_simplified_ext.ttf',
+                              'chinese_traditional.ttf', 'korean.ttf', 'nintendo_ext.ttf'):
+                    self.assertIn(f'Payload/DmShell.app/dm/font/{fname}', names)
+                    self.assertEqual(zf.read(f'Payload/DmShell.app/dm/font/{fname}'), b'FONT_TTF_BYTES')
                 # Verify Unix executable permission bits (0755) on DmShell and both framework binaries
                 for exec_entry in (
                     'Payload/DmShell.app/DmShell',
@@ -1862,6 +2232,524 @@ class ParityWindowTests(unittest.TestCase):
         self.assertIn('tools/build_shell_template.py', wf)
         self.assertIn('--hidden-import nspb_qt.win.shell_export', wf)
         self.assertIn('--add-data "shell_template${PATHSEP}shell_template"', wf)
+
+    def test_real_onboarding_dialog_step2_live_progress_and_button_lock(self) -> None:
+        """Instantiate the real OnboardingDialog with a real Model and verify live signal-driven
+        progress updates, in-place QProgressBar updates, button locking, and signal disconnect on close.
+        """
+        from unittest import mock
+        from nspb_qt.model import Dep, DepState, Model
+        from nspb_qt.sheets import OnboardingDialog
+
+        with mock.patch.object(Model, 'check_deps', lambda self: None):
+            m = Model()
+        py_dep = Dep('python', 'dep.python', 'dep.python.hint', DepState.MISSING, install=['__win__:python'])
+        dn_dep = Dep('dotnet', 'dep.dotnet', 'dep.dotnet.hint', DepState.MISSING, install=['__win__:dotnet'])
+        llvm_dep = Dep('llvm', 'dep.llvm', 'dep.llvm.hint', DepState.MISSING, install=['__win__:llvm'])
+        lld_dep = Dep('lld', 'dep.lld', 'dep.lld.hint', DepState.MISSING, install=[])
+        sdk_dep = Dep('ios_sdk', 'dep.iossdk', 'dep.iossdk.hint', DepState.MISSING, install=['__win__:ios_sdk'])
+        m.deps = [py_dep, dn_dep, llvm_dep, lld_dep, sdk_dep]
+        m.deps_checked = True
+
+        dlg = OnboardingDialog(m)
+        self.addCleanup(self._delete, m, dlg)
+        dlg.next_btn.click()
+        self.app.processEvents()
+
+        self.assertTrue(dlg.next_btn.isEnabled())
+        self.assertTrue(dlg.back_btn.isEnabled())
+        self.assertTrue(dlg.later_btn.isEnabled())
+        self.assertTrue(dlg.task_pill.isHidden())
+        self.assertTrue(dlg.overall_pct_lbl.isHidden())
+
+        # Start install-all step 1/4 and emit real progress signal via _set_dep_progress
+        m._install_all_running = True
+        m.install_all_step = 1
+        m.install_all_total = 4
+        py_dep.installing = True
+        dn_dep.queue_index = 2
+        llvm_dep.queue_index = 3
+        sdk_dep.queue_index = 4
+        m._set_dep_progress(
+            py_dep,
+            m.t('dep.stage.pyDownload', 45),
+            m.t('dep.detail.pyDownload', '3.12.8', 12, 26, 45),
+            45,
+            item_overall_pct=18,
+            force=True,
+        )
+        self.app.processEvents()
+
+        self.assertFalse(dlg.next_btn.isEnabled())
+        self.assertFalse(dlg.back_btn.isEnabled())
+        self.assertTrue(dlg.later_btn.isEnabled())
+        self.assertFalse(dlg.task_pill.isHidden())
+        self.assertFalse(dlg.overall_pct_lbl.isHidden())
+        bar1 = dlg._step1_widgets['rows']['python']['bar']
+        self.assertEqual(bar1.value(), 45)
+        self.assertFalse(dlg._step1_widgets['ibtn'].isEnabled())
+
+        # Advance Python to pip packages at 83% and verify in-place QProgressBar update
+        m._set_dep_progress(
+            py_dep,
+            m.t('dep.stage.pyPkgs', 83),
+            m.t('dep.detail.pyPkgs', 5, 6, 'backports.zstd'),
+            83,
+            item_overall_pct=88,
+        )
+        self.app.processEvents()
+        self.assertIs(dlg._step1_widgets['rows']['python']['bar'], bar1)
+        self.assertEqual(bar1.value(), 83)
+
+        # Multi-row expansion (wrapped error on LLVM + active progress bar on iOS SDK):
+        # body_host sits inside a QScrollArea, no row's status or detail label is vertically
+        # clipped, dialog height is capped at 90% of screen height on huge errors, idle CPU is
+        # zero (no LayoutRequest loop), and the user can still shrink the window back to 480px.
+        import time
+        from PySide6.QtWidgets import QScrollArea
+
+        py_dep.installing = False
+        py_dep.state = DepState.OK
+        dn_dep.state = DepState.OK
+        dn_dep.queue_index = 0
+        llvm_dep.queue_index = 0
+        llvm_dep.last_error = (
+            'DownloadError: connection timed out while fetching '
+            'llvm-mingw-20261020-ucrt-x86_64.zip'
+        )
+        llvm_dep.fix_hint = 'dep.fix.network'
+        sdk_dep.queue_index = 0
+        sdk_dep.installing = True
+        dlg.show()
+        self.app.processEvents()
+        m._set_dep_progress(
+            sdk_dep,
+            m.t('dep.stage.download', 15),
+            m.t('dep.detail.download', 'iPhoneOS27.2.sdk.zip', 8, 52, 15),
+            15,
+            item_overall_pct=8,
+            force=True,
+        )
+        self.app.processEvents()
+        for r_id, rw in dlg._step1_widgets['rows'].items():
+            st_lbl = rw['status']
+            self.assertGreaterEqual(
+                st_lbl.height(), st_lbl.sizeHint().height(),
+                f'{r_id} status label clipped: {st_lbl.height()} < {st_lbl.sizeHint().height()}',
+            )
+            dl_lbl = rw['detail']
+            if dl_lbl is not None:
+                self.assertGreaterEqual(
+                    dl_lbl.height(), dl_lbl.heightForWidth(dl_lbl.width()),
+                    f'{r_id} detail label clipped: {dl_lbl.height()} < {dl_lbl.heightForWidth(dl_lbl.width())}',
+                )
+
+        self.assertIsInstance(dlg.body_scroll, QScrollArea)
+        self.assertIs(dlg.body_scroll.widget(), dlg.body_host)
+
+        # Verify zero idle fit calls (no LayoutRequest -> updateGeometry spin loop)
+        fit_calls = [0]
+        orig_fit = dlg._fit_dialog_height
+
+        def counted_fit(*a, **k):
+            fit_calls[0] += 1
+            return orig_fit(*a, **k)
+
+        dlg._fit_dialog_height = counted_fit
+        try:
+            t0 = time.time()
+            while time.time() - t0 < 0.2:
+                self.app.processEvents()
+            self.assertEqual(fit_calls[0], 0, 'idle event loop must not trigger _fit_dialog_height')
+        finally:
+            dlg._fit_dialog_height = orig_fit
+
+        # Huge multi-line error must cap dialog height at <= 90% of available screen height and scroll
+        llvm_dep.last_error = 'DownloadError: ' + ('very long error text that wraps across lines ' * 50)
+        dlg._step1_sig = None
+        dlg._render_step()
+        self.app.processEvents()
+        scr = dlg.screen() or self.app.primaryScreen()
+        max_h = int(scr.availableGeometry().height() * 0.9) if scr is not None else 720
+        self.assertLessEqual(dlg.height(), max_h)
+        self.assertGreater(dlg.body_scroll.verticalScrollBar().maximum(), 0)
+        for r_id, rw in dlg._step1_widgets['rows'].items():
+            dl_lbl = rw['detail']
+            if dl_lbl is not None:
+                self.assertGreaterEqual(dl_lbl.height(), dl_lbl.heightForWidth(dl_lbl.width()))
+
+        # User can manually shrink the dialog back down to minimumHeight (480)
+        dlg.resize(640, 480)
+        self.app.processEvents()
+        self.assertEqual(dlg.height(), 480)
+
+        # Finish all installs -> buttons re-enable
+        for d in m.deps:
+            d.installing = False
+            d.state = DepState.OK
+            d.queue_index = 0
+        m._install_all_running = False
+        m.depsChanged.emit()
+        self.app.processEvents()
+        self.assertTrue(dlg.next_btn.isEnabled())
+        self.assertTrue(dlg.back_btn.isEnabled())
+
+        # Close dialog via done(0) and verify depsChanged no longer calls _render_step
+        dlg.done(0)
+        with mock.patch.object(dlg, '_render_step') as spy_render:
+            m.depsChanged.emit()
+            self.app.processEvents()
+            spy_render.assert_not_called()
+
+    def test_mainwindow_refresh_deps_in_place_and_background_gc_safety(self) -> None:
+        """Verify MainWindow._refresh_deps updates rows in place during 0%..100% progress
+        (never destroying/rebuilding QWidgets on 1% ticks), OnboardingDialog._clear_body keeps
+        C++ ownership (ownedByPython == False), and background thread progress + GC never crashes.
+        """
+        import gc
+        import threading
+        import shiboken6
+        from unittest import mock
+        from nspb_qt.model import Dep, DepState, Model
+        from nspb_qt.sheets import OnboardingDialog
+        from nspb_qt.ui import MainWindow
+
+        with mock.patch.object(Model, 'check_deps', lambda self: None):
+            m = Model()
+
+        llvm_dep = Dep('llvm', 'dep.llvm', 'dep.llvm.hint', DepState.MISSING, install=['__win__:llvm'])
+        sdk_dep = Dep('ios_sdk', 'dep.iossdk', 'dep.iossdk.hint', DepState.MISSING,
+                      install=['__win__:ios_sdk'], pick_key='ios_sdk')
+        m.deps = [llvm_dep, sdk_dep]
+        m.deps_checked = True
+
+        with mock.patch.object(MainWindow, '_maybe_show_onboarding', lambda self: None):
+            w = MainWindow(m)
+        dlg = OnboardingDialog(m)
+        self.addCleanup(dlg.deleteLater)
+        self.addCleanup(self._delete, m, w)
+        dlg.next_btn.click()
+        self.app.processEvents()
+
+        # Start LLVM install at 0% (transitions sub label to mono and sets initial _deps_sig)
+        llvm_dep.installing = True
+        m._set_dep_progress(
+            llvm_dep,
+            m.t('dep.stage.download', 0),
+            m.t('dep.detail.download', 'llvm-mingw.zip', 0, 182, 0),
+            0,
+            force=True,
+        )
+        self.app.processEvents()
+
+        initial_frame = w._dep_row_widgets['llvm']['frame']
+        initial_sub = w._dep_row_widgets['llvm']['sub']
+        initial_btn = w._dep_row_widgets['llvm']['install_btn']
+        self.assertIsNotNone(initial_frame)
+        self.assertIsNotNone(initial_btn)
+
+        # Simulate background download 0% -> 100% and unpack 0% -> 100% with forced GC on worker thread
+        dl_cb = m._stage_progress_logger(llvm_dep, 'Download', 'llvm-mingw.zip', phase='download')
+        up_cb = m._stage_progress_logger(llvm_dep, 'Unpack', 'llvm-mingw.zip', phase='unpack')
+        errors: list[Exception] = []
+
+        def worker() -> None:
+            try:
+                total = 182 * 1048576
+                for pct in (0, 1, 25, 50, 75, 100):
+                    dl_cb(pct * total // 100, total)
+                # Simulate opening a 16,000-entry zip that triggers cyclic GC on the worker thread
+                _ = [{i: (i, str(i))} for i in range(2000)]
+                gc.collect()
+                for pct in (0, 0, 0, 10, 50, 100, 100):
+                    up_cb(pct * total // 100, total)
+                gc.collect()
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+
+        th = threading.Thread(target=worker)
+        th.start()
+        while th.is_alive():
+            self.app.processEvents()
+            th.join(timeout=0.01)
+        self.app.processEvents()
+        self.assertEqual(errors, [])
+
+        # Widgets in MainWindow were updated in-place, never destroyed or recreated during progress
+        self.assertIs(w._dep_row_widgets['llvm']['frame'], initial_frame)
+        self.assertIs(w._dep_row_widgets['llvm']['sub'], initial_sub)
+        self.assertIs(w._dep_row_widgets['llvm']['install_btn'], initial_btn)
+        self.assertIn('100%', initial_sub.text())
+        self.assertIn('100%', initial_btn.text())
+
+        # Verify OnboardingDialog._clear_body keeps C++ ownership (ownedByPython == False)
+        body_item = dlg.body_layout.itemAt(0)
+        self.assertIsNotNone(body_item)
+        grp_widget = body_item.widget()
+        self.assertIsNotNone(grp_widget)
+        dlg._clear_body()
+        self.assertFalse(
+            shiboken6.ownedByPython(grp_widget),
+            '_clear_body must not transfer QWidget ownership back to Python GC via setParent(None)',
+        )
+
+    def test_hero_banner_bottom_edge_fades_cleanly_without_bright_seam(self) -> None:
+        """Verify HeroBannerWidget leaves no 1px bright artwork seam at its bottom edge across fractional HiDPI scales."""
+        from PySide6.QtCore import QEvent
+        from PySide6.QtGui import QColor, QImage, QPixmap
+        from nspb_qt.widgets import HeroBannerWidget
+
+        hero = HeroBannerWidget()
+        try:
+            pm = QPixmap(1920, 1080)
+            pm.fill(QColor(255, 255, 255))
+            hero._pixmap = pm
+
+            for height in (610, 611):
+                hero.resize(1478, height)
+                for dpr in (1.0, 1.25, 1.5, 1.75, 2.0):
+                    pw = int(hero.width() * dpr) + 4
+                    ph = int(hero.height() * dpr) + 4
+                    img = QImage(pw, ph, QImage.Format_ARGB32_Premultiplied)
+                    img.setDevicePixelRatio(dpr)
+                    img.fill(QColor(0, 0, 0))
+                    hero.render(img)
+                    bottom_y = int(round(hero.height() * dpr))
+                    tail = [
+                        max(
+                            QColor(img.pixel(pw // 2, y)).red(),
+                            QColor(img.pixel(pw // 2, y)).green(),
+                            QColor(img.pixel(pw // 2, y)).blue(),
+                        )
+                        for y in range(max(0, bottom_y - 4), min(ph, bottom_y + 2))
+                    ]
+                    self.assertLessEqual(
+                        max(tail),
+                        4,
+                        f'Bright bottom seam leaked at height={height}, dpr={dpr}: tail={tail}',
+                    )
+        finally:
+            hero.deleteLater()
+            self.app.sendPostedEvents(None, QEvent.DeferredDelete)
+            self.app.processEvents()
+
+    def test_windows_defender_exclusions_ui_and_pre_build_prompt_across_all_languages(self) -> None:
+        """Verify Settings -> Build Tools Defender row, OnboardingDialog Step 3 Defender card,
+        and DefenderPromptDialog pre-build flow across all 7 languages.
+        """
+        import time
+        from unittest import mock
+        from nspb_qt.model import Dep, DepState, Model
+        from nspb_qt.sheets import DefenderPromptDialog, OnboardingDialog
+        from nspb_qt.ui import MainWindow
+        from nspb_qt.win import defender as wdef, toolchain as tc
+
+        root = Path(self._state_tmp.name)
+        fake_tools = root / 'NS Port Builder' / 'tools'
+        fake_tools.mkdir(parents=True)
+        games_dir = root / 'SwitchGames'
+        games_dir.mkdir()
+        wdef._STATE_CACHE = None
+
+        with mock.patch.dict(os.environ, {'NSPB_SHOW_DEFENDER_ROW': '1'}, clear=False), \
+             mock.patch.object(tc, 'tools_dir', return_value=fake_tools), \
+             mock.patch.object(MainWindow, '_maybe_show_onboarding', lambda self: None):
+            m = Model()
+            m.deps = [Dep('python', 'dep.python', 'dep.python.hint', DepState.OK)]
+            m.deps_checked = True
+            m.library.games_folder = str(games_dir)
+            m.base_path = str(games_dir / 'Celeste [0100F7B00BB5C000][v0].nsp')
+            m.keys_path = str(games_dir / 'prod.keys')
+
+            w = MainWindow(m)
+            self.addCleanup(self._delete, m, w)
+            w._switch_page('settings')
+            w.show()
+            self.app.processEvents()
+
+            # 1. Settings -> Build Tools Defender row shows concise counts (no raw folder paths) across all 7 languages
+            self.assertFalse(w.defender_row_widget.isHidden())
+            self.assertFalse(w.defender_div.isHidden())
+            _st, folders, procs = m.defender_info()
+            for lg in Lang.all():
+                m.set_lang(lg)
+                self.app.processEvents()
+                self.assertEqual(w.defender_title_lbl.text(), m.t('defender.title'))
+                self.assertEqual(w.defender_badge_lbl.text(), m.t('defender.status.needed'))
+                self.assertEqual(w.defender_note_lbl.text(), m.t('defender.note'))
+                self.assertEqual(w.defender_btn.text(), m.t('defender.addBtn'))
+                self.assertEqual(w.defender_summary_lbl.text(), m.t('defender.summary', len(folders), len(procs)))
+                self.assertNotIn(str(games_dir), w.defender_summary_lbl.text())
+
+            # 2. OnboardingDialog Step 3 stays clean without a Defender card (prompt happens only when starting a build or in Settings)
+            m.set_lang(Lang('zh'))
+            dlg = OnboardingDialog(m)
+            self.addCleanup(dlg.deleteLater)
+            dlg.step = 3
+            dlg._render_step()
+            self.app.processEvents()
+            self.assertEqual(dlg.body_layout.count(), 2)  # Games card + stretch only
+
+            # 3. Pre-build prompt: user cancels UAC -> build does NOT start
+            started: list[bool] = []
+            with mock.patch.object(m, 'start_build', side_effect=lambda *_a, **_kw: started.append(True)):
+                def choose_add(prompt_self):
+                    prompt_self.choice = 'add'
+                    return 1
+
+                with mock.patch.object(DefenderPromptDialog, 'exec', choose_add), \
+                     mock.patch.object(
+                         wdef,
+                         'apply_exclusions',
+                         return_value=wdef.DefenderResult(ok=False, cancelled=True),
+                     ):
+                    w._build_clicked()
+                    for _ in range(50):
+                        self.app.processEvents()
+                        if not m.defender_busy:
+                            break
+                        time.sleep(0.01)
+                self.assertEqual(started, [], 'cancelling UAC must abort the build')
+                self.assertEqual(m.defender_status_msg, m.t('defender.msg.cancelled'))
+
+                # 4. Pre-build prompt: user clicks Add & Build and confirms UAC -> exclusions silently recorded & build starts
+                def fake_apply_ok(paths, procs, **_kw):
+                    wdef.save_recorded_state(paths, procs)
+                    return wdef.DefenderResult(ok=True, added_paths=list(paths), added_processes=list(procs))
+
+                with mock.patch.object(DefenderPromptDialog, 'exec', choose_add), \
+                     mock.patch.object(wdef, 'apply_exclusions', side_effect=fake_apply_ok):
+                    w._build_clicked()
+                    for _ in range(50):
+                        self.app.processEvents()
+                        if started:
+                            break
+                        time.sleep(0.01)
+                self.assertEqual(started, [True], 'confirming UAC in Add & Build must start the build')
+                self.assertEqual(w.defender_badge_lbl.text(), m.t('defender.status.ready'))
+                self.assertEqual(w.defender_btn.text(), m.t('defender.updateBtn'))
+                self.assertFalse(w.defender_remove_btn.isHidden(), 'remove button must be visible when exclusions are ready')
+
+                # 5. Subsequent build with ready exclusions starts immediately without prompting
+                started.clear()
+                with mock.patch.object(DefenderPromptDialog, 'exec', side_effect=AssertionError('must not prompt')):
+                    w._build_clicked()
+                self.assertEqual(started, [True])
+
+                # 6. Changing output folder marks status partial, prompts again on build, and accumulates into silent ledger
+                new_out = root / 'CustomBuildsOut'
+                new_out.mkdir()
+                m.out_dir = str(new_out)
+                w._refresh_inputs()
+                self.assertEqual(w.defender_badge_lbl.text(), m.t('defender.status.partial'))
+                self.assertTrue(m.should_prompt_defender_before_build())
+
+                started.clear()
+                with mock.patch.object(DefenderPromptDialog, 'exec', choose_add), \
+                     mock.patch.object(wdef, 'apply_exclusions', side_effect=fake_apply_ok):
+                    w._build_clicked()
+                    for _ in range(50):
+                        self.app.processEvents()
+                        if started:
+                            break
+                        time.sleep(0.01)
+                self.assertEqual(started, [True])
+                self.assertEqual(w.defender_badge_lbl.text(), m.t('defender.status.ready'))
+
+                # 7. Remove confirmation dialog displays all silently recorded historical folders before clearing
+                rem_dlg = DefenderPromptDialog(m, mode='remove', parent=w)
+                self.addCleanup(rem_dlg.deleteLater)
+                self.assertTrue(rem_dlg.dont_ask_switch.isHidden())
+                self.assertEqual(rem_dlg.windowTitle(), m.t('defender.removePrompt.title'))
+                self.assertEqual(rem_dlg.add_btn.text(), m.t('defender.removePrompt.confirm').replace('&', '&&'))
+                self.assertIn(str(games_dir), rem_dlg.folder_list_lbl.text())
+                self.assertIn(str(new_out), rem_dlg.folder_list_lbl.text())
+
+                def choose_remove(prompt_self):
+                    self.assertEqual(prompt_self.mode, 'remove')
+                    self.assertIn(str(games_dir), prompt_self.folder_list_lbl.text())
+                    self.assertIn(str(new_out), prompt_self.folder_list_lbl.text())
+                    prompt_self.choice = 'remove'
+                    return 1
+
+                def fake_remove_ok(**_kw):
+                    wdef.clear_recorded_state()
+                    return wdef.DefenderResult(ok=True)
+
+                with mock.patch.object(DefenderPromptDialog, 'exec', choose_remove), \
+                     mock.patch.object(wdef, 'remove_exclusions', side_effect=fake_remove_ok):
+                    w._on_defender_remove_clicked()
+                    for _ in range(50):
+                        self.app.processEvents()
+                        if not m.defender_busy and w.defender_badge_lbl.text() == m.t('defender.status.needed'):
+                            break
+                        time.sleep(0.01)
+                    self.app.processEvents()
+                self.assertEqual(w.defender_badge_lbl.text(), m.t('defender.status.needed'))
+                self.assertTrue(w.defender_remove_btn.isHidden())
+
+                # 8. Even after "Don't ask again" is enabled, user can still manually enable exclusions in Settings
+                p_dlg = DefenderPromptDialog(m, parent=w)
+                self.addCleanup(p_dlg.deleteLater)
+                p_dlg.dont_ask_switch.setChecked(True)
+                p_dlg._on_skip()
+                self.assertEqual(p_dlg.choice, 'skip')
+                self.assertTrue(m.settings_value('defenderPromptDismissed', False))
+                self.assertFalse(m.should_prompt_defender_before_build())
+
+                with mock.patch.object(DefenderPromptDialog, 'exec', choose_add), \
+                     mock.patch.object(wdef, 'apply_exclusions', side_effect=fake_apply_ok):
+                    w._on_defender_clicked()
+                    for _ in range(50):
+                        self.app.processEvents()
+                        if not m.defender_busy and w.defender_badge_lbl.text() == m.t('defender.status.ready'):
+                            break
+                        time.sleep(0.01)
+                self.assertEqual(w.defender_badge_lbl.text(), m.t('defender.status.ready'))
+
+    def test_framework_only_hero_shows_ready_for_ios_and_reveals_framework(self) -> None:
+        import json
+        from unittest import mock
+        from nspb_qt import library as lib_mod, platform_util as pu
+        from nspb_qt.model import Model
+        from nspb_qt.ui import MainWindow
+
+        tid = '0100535012974000'
+        state_dir = Path(self._state_tmp.name) / 'state'
+        shell_dir = state_dir / 'shell'
+        fw_dir = shell_dir / 'frameworks' / f'DmGame{tid}.framework'
+        fw_dir.mkdir(parents=True, exist_ok=True)
+        (fw_dir / 'game.manifest.json').write_text(
+            json.dumps({'title_id': tid, 'framework_executable': f'DmGame{tid}'}),
+            encoding='utf-8',
+        )
+        (fw_dir / f'DmGame{tid}').write_bytes(b'bin')
+        (shell_dir / 'shell.json').write_text(
+            json.dumps({'games': [{'titleID': tid, 'name': 'Orbit Fixture', 'framework': str(fw_dir)}]}),
+            encoding='utf-8',
+        )
+
+        with mock.patch.object(lib_mod.ArtworkStore, 'request_banner_async'):
+            m = Model()
+            m.settings.setValue('shellRoot', str(shell_dir))
+            w = MainWindow(m)
+            w._init_timer.stop()
+            self.addCleanup(self._delete, m, w)
+            w.resize(1080, 760)
+            w.show()
+            w._switch_page('library')
+            self.app.processEvents()
+
+            revealed: list[str] = []
+            with mock.patch.object(pu, 'reveal', side_effect=revealed.append):
+                for code in ('en', 'zh'):
+                    m.set_lang(Lang(code))
+                    self.app.processEvents()
+                    self.assertEqual(w.hero.status_lbl.text(), m.t('library.readyIOS').upper())
+                    self.assertEqual(w.hero.primary_btn.text(), m.t('install.reveal'))
+                    w.hero.primary_btn.click()
+                    self.app.processEvents()
+            self.assertEqual(revealed, [str(fw_dir), str(fw_dir)])
 
 
 if __name__ == '__main__':

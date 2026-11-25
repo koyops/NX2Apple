@@ -49,7 +49,7 @@ import Testing
         let rows = [SettingRow(id: "pad.swapAB", label: "Swap A and B", kind: .choice([]), value: "follow", fromShell: true),
                     SettingRow(id: "pad.A", label: "A", kind: .choice([]), value: "follow", fromShell: true),
                     SettingRow(id: "pad.B", label: "B", kind: .choice([]), value: "follow", fromShell: true)]
-        #expect(PadMappingRows.summary(rows, game: true) == "Same as all games")
+        #expect(PadMappingRows.summary(rows, game: true) == "Default")
         var custom = rows
         custom[1].fromShell = false
         #expect(PadMappingRows.summary(custom, game: true) == "Custom")
@@ -161,10 +161,32 @@ import Testing
         let path = try #require(ShellStrings.bundle.path(forResource: "zh-Hans", ofType: "lproj"))
         let zh = try #require(Bundle(path: path))
         let english = PadMap.groups.map(\.title) + PadMap.buttons.map(PadMap.place)
-            + ["Button mapping", "Swap A and B", "Same as all games", "Reset", "Changed", "Button test", "Hold B to close", "Close"]
+            + ["Button mapping", "Swap A and B", "Default", "Reset", "Changed", "Button test", "Hold B to close", "Close"]
         for text in english {
             let chinese = zh.localizedString(forKey: text, value: "", table: nil)
             #expect(chinese.unicodeScalars.contains { $0.value >= 0x4E00 }, "\(text): \(chinese)")
         }
+    }
+}
+
+/// #637: the mapping page puts the whole drawing on the left from 700 x 400, else above the rows at most 180 high.
+@Suite struct PadMappingArrangementTests {
+    @Test func wideAndTallEnoughPutsTheDrawingOnTheLeftAt42PercentCappedAt360() {
+        #expect(PadMappingArrangement.resolve(CGSize(width: 700, height: 400)) == .sideBySide(drawingWidth: 294))
+        #expect(PadMappingArrangement.resolve(CGSize(width: 1000, height: 700)) == .sideBySide(drawingWidth: 360))
+        #expect(PadMappingArrangement.resolve(CGSize(width: 1366, height: 1024)) == .sideBySide(drawingWidth: 360))
+    }
+
+    @Test func theRowsKeepAtLeast320() {
+        for width in stride(from: CGFloat(700), through: 1400, by: 25) {
+            guard case .sideBySide(let drawing) = PadMappingArrangement.resolve(CGSize(width: width, height: 500)) else { Issue.record("width \(width)"); return }
+            #expect(width - drawing >= 320, "width \(width)")
+        }
+    }
+
+    @Test func narrowerOrShorterStacksTheDrawingAboveTheRows() {
+        #expect(PadMappingArrangement.resolve(CGSize(width: 699, height: 800)) == .stacked(drawingHeight: 180))
+        #expect(PadMappingArrangement.resolve(CGSize(width: 900, height: 399)) == .stacked(drawingHeight: 180))
+        #expect(PadMappingArrangement.resolve(CGSize(width: 393, height: 852)) == .stacked(drawingHeight: 180))
     }
 }

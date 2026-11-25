@@ -5,6 +5,8 @@ import SwiftUI
 enum ShellSettingsRows {
     static let gameID = "shell"
     static let hud = "shell.hud"
+    static let showFPS = "shell.showFPS"
+    static let audioMix = "shell.audioMix"
     static let touchSize = "shell.touchSize"
     static let touchStick = "shell.touchStick"
     static let targetPrefix = "shs.row."
@@ -14,7 +16,18 @@ enum ShellSettingsRows {
                    kind: .toggle(on: "1", off: "0"), value: store.performanceHUD == true ? "1" : "0")
     }
 
-    /// The touch controls' size for every game. The preview above the row shows it.
+    static func showFPSRow(_ store: ShellSettingsStore) -> SettingRow {
+        SettingRow(id: showFPS, label: ShellStrings.text("Frame-rate counter"), note: ShellStrings.text("Used by games that have no choice of their own."),
+                   kind: .toggle(on: "1", off: "0"), value: store.showFPS == true ? "1" : "0")
+    }
+
+    static func audioMixRow(_ store: ShellSettingsStore) -> SettingRow {
+        SettingRow(id: audioMix, label: ShellStrings.text("Play with other audio"),
+                   note: ShellStrings.text("Allow other apps to keep playing audio alongside games."),
+                   kind: .toggle(on: "1", off: "0"), value: store.audioMix ? "1" : "0")
+    }
+
+    /// The shell-wide default size for touch controls. The preview above the row shows it.
     static func touchSizeRow(_ store: ShellSettingsStore) -> SettingRow {
         SettingRow(id: touchSize, label: ShellStrings.text("Size"),
                    kind: .choice([SettingOption("small", ShellStrings.text("Small")), SettingOption("medium", ShellStrings.text("Medium")),
@@ -22,7 +35,7 @@ enum ShellSettingsRows {
                    value: store.touchSize)
     }
 
-    /// Where the left stick sits in every game. The buttons on the right keep their place.
+    /// The shell-wide default for the left stick's place. The buttons on the right keep their base placement.
     static func touchStickRow(_ store: ShellSettingsStore) -> SettingRow {
         SettingRow(id: touchStick, label: ShellStrings.text("Left stick"),
                    kind: .choice([SettingOption("corner", ShellStrings.text("Corner")), SettingOption("higher", ShellStrings.text("Higher")),
@@ -30,14 +43,15 @@ enum ShellSettingsRows {
                    value: store.touchStick)
     }
 
-    /// Under the preview: the rows are for every game, and the engine keeps the controls apart on a screen too small for a
-    /// choice. A note of its own, not the rows', so the segments keep the card's width.
-    static var touchNote: String { ShellStrings.text("For every game. On a screen too small for a choice, the controls stay closer to where they were.") }
+    /// Under the preview and in the editor options: these are shell-wide defaults that game settings or configuration files can override.
+    static var touchNote: String { ShellStrings.text("Games and configuration files can override these defaults.") }
 
     /// A change of one of the rows, from the row itself or from the list of choices.
     static func apply(_ id: String, value: String, to store: ShellSettingsStore) {
         switch id {
         case hud: store.storePerformanceHUD(value == "1")
+        case showFPS: store.storeShowFPS(value == "1")
+        case audioMix: store.storeAudioMix(value == "1")
         case touchSize: store.storeTouchSize(value)
         case touchStick: store.storeTouchStick(value)
         default: break
@@ -45,92 +59,518 @@ enum ShellSettingsRows {
     }
 }
 
-/// The shell's own settings: the game-data folder, the cloud-saves folder, the touch controls and the default performance
-/// overlay. A game's own choices win over these, and these win over the built-in defaults. It looks like a game's
-/// settings and takes a controller the same way, as a panel over the library.
+/// Native grouped settings for shell-wide defaults; per-game choices retain precedence.
 struct ShellSettingsView: View {
+    @Environment(\.shellNativeBars) private var nativeBars
     var store: ShellSettingsStore = .current
     var actions: ShellActions
+    var sideloadCertificate: SideloadCertificateSummary? = nil
+    var onOpenActivityLog: (() -> Void)? = nil
     var onClose: () -> Void
+    var onModalPresentedChange: ((Bool) -> Void)? = nil
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.shellFocus) private var focus
     /// Counts the changes in the defaults, so the rows read the store again.
     @State private var revision = 0
+    @State private var pendingCertFileName: String?
+    @State private var certPromptPresented = false
+    @State private var certPassword = ""
+    @State private var certPasswordVisible = false
+    @State private var certPromptError: String?
+    @State private var certImportError: String?
+    @State private var certBusy = false
+    @State private var confirmingClearData = false
+    @State private var confirmingClearCloud = false
+    @State private var confirmingRemoveCert = false
+    @FocusState private var certPasswordFocused: Bool
 
     var body: some View {
         let _ = revision
-        GeometryReader { geometry in
-            ScrollViewReader { proxy in
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 30) {
-                        HStack(alignment: .center) {
-                            Text(ShellStrings.text("Settings")).shellType(ShellType.pageTitle)
-                                .lineLimit(1).minimumScaleFactor(0.7).accessibilityAddTraits(.isHeader)
-                            Spacer(minLength: 8)
-                            Button(action: onClose) { Text(ShellStrings.text("Done")) }
-                                .buttonStyle(ChipButtonStyle())
+        ScrollViewReader { proxy in
+            Form {
+                if !nativeBars {
+                    Section {
+                        LabeledContent(ShellStrings.text("Settings")) {
+                            Button(ShellStrings.text("Close"), action: onClose)
                                 .accessibilityIdentifier("shellSettings.close")
-                                .shellTarget("shs.close", radius: 22, action: onClose)
-                        }.id("shs.top")
-                        SettingsGroup(title: ShellStrings.text("Game data")) {
-                            SourceRow(symbol: "folder", title: store.dataFolderName ?? ShellStrings.text("No folder chosen"),
-                                      note: ShellStrings.text("Games look for their data here. Keep one romfs.img per game in any folder inside. Each game is found by the image itself, so the folder names do not matter. Each game can also have a folder of its own.")) {
-                                Button(ShellStrings.text("Choose folder…")) { actions.onPickShellData() }
-                                    .buttonStyle(ShellButtonStyle(fills: true)).accessibilityIdentifier("shellSettings.data")
-                                    .shellTarget("shs.data") { actions.onPickShellData() }
-                                if store.dataFolderName != nil {
-                                    Button(ShellStrings.text("Remove")) { actions.onClearShellData() }
-                                        .buttonStyle(ShellButtonStyle(fills: true)).accessibilityIdentifier("shellSettings.data.remove")
-                                        .shellTarget("shs.data.remove") { actions.onClearShellData() }
-                                }
-                            }
+                                .shellTarget("shs.close", action: onClose)
                         }
-                        SettingsGroup(title: ShellStrings.text("Cloud saves")) {
-                            SourceRow(symbol: store.cloudSavesFolderName == nil ? "icloud.slash" : "icloud",
-                                      title: store.cloudSavesFolderName ?? ShellStrings.text("Off"),
-                                      note: ShellStrings.text("Games without a folder of their own save here. Choose the same iCloud Drive folder you use on your Mac.")) {
-                                Button(ShellStrings.text("Choose folder…")) { actions.onPickShellCloud() }
-                                    .buttonStyle(ShellButtonStyle(fills: true)).accessibilityIdentifier("shellSettings.cloud")
-                                    .shellTarget("shs.cloud") { actions.onPickShellCloud() }
-                                if store.cloudSavesFolderName != nil {
-                                    Button(ShellStrings.text("Turn off")) { actions.onClearShellCloud() }
-                                        .buttonStyle(ShellButtonStyle(fills: true)).accessibilityIdentifier("shellSettings.cloud.off")
-                                        .accessibilityLabel(ShellStrings.text("Turn off cloud saves"))
-                                        .shellTarget("shs.cloud.off") { actions.onClearShellCloud() }
-                                }
-                            }
-                        }
-                        SettingsGroup(title: ShellStrings.text("Touch controls")) {
-                            TouchControlsPreview(size: store.touchSize, stick: store.touchStick, layout: store.touchLayout)
-                            TouchControlsNote()
-                            ForEach([ShellSettingsRows.touchSizeRow(store), ShellSettingsRows.touchStickRow(store)]) { row in
-                                SettingControl(gameID: ShellSettingsRows.gameID, row: row, targetPrefix: ShellSettingsRows.targetPrefix) {
-                                    ShellSettingsRows.apply(row.id, value: $0, to: store)
-                                }.equatable()
-                            }
-                            TouchArrangeRow(arranged: !store.touchLayout.isEmpty)
-                        }
-                        SettingsGroup(title: ShellStrings.text("Interface")) {
-                            let hud = ShellSettingsRows.hudRow(store)
-                            SettingControl(gameID: ShellSettingsRows.gameID, row: hud, targetPrefix: ShellSettingsRows.targetPrefix) {
-                                ShellSettingsRows.apply(hud.id, value: $0, to: store)
-                            }.equatable()
-                        }
-                    }
-                    .padding(24).padding(.bottom, geometry.safeAreaInsets.bottom).frame(maxWidth: 640)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    }.id("shs.top")
                 }
-                .scrollIndicators(.hidden)
-                .ignoresSafeArea(edges: .bottom)
-                .onChange(of: focus.id) { _, id in
-                    guard let id, id.hasPrefix("shs.") else { return }
-                    withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) {
-                        proxy.scrollTo(id == "shs.close" ? "shs.top" : id, anchor: id == "shs.close" ? .top : .center)
+
+                if let onOpenActivityLog {
+                    Section {
+                        Button(action: onOpenActivityLog) {
+                            LabeledContent {
+                                Image(systemName: "chevron.right")
+                                    .font(.footnote.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                            } label: {
+                                Label(ShellStrings.text("Activity log"), systemImage: "chart.bar.xaxis")
+                                    .labelStyle(SettingsRowLabelStyle())
+                            }
+                        }
+                        .accessibilityIdentifier("shellSettings.activityLog")
+                        .shellTarget("shs.activityLog", action: onOpenActivityLog)
+                    } footer: {
+                        Text(ShellStrings.text("See play time, sessions and active days across your games."))
                     }
+                }
+
+                Section {
+                    Button(action: actions.onPickShellData) {
+                        LabeledContent {
+                            Text(store.dataFolderName ?? ShellStrings.text("Choose folder…"))
+                                .lineLimit(1).truncationMode(.middle)
+                        } label: {
+                            Label(ShellStrings.text("Game data"), systemImage: "folder")
+                                .labelStyle(SettingsRowLabelStyle())
+                        }
+                    }
+                    .accessibilityIdentifier("shellSettings.data")
+                    .shellTarget("shs.data", action: actions.onPickShellData)
+                    if store.dataFolderName != nil {
+                        Button(ShellStrings.text("Remove"), role: .destructive) {
+                            confirmingClearData = true
+                        }
+                        .accessibilityIdentifier("shellSettings.data.remove")
+                        .shellTarget("shs.data.remove") { confirmingClearData = true }
+                    }
+                } footer: {
+                    Text(ShellStrings.text("Games look for their data here. Keep one romfs.img per game in any folder inside. Each game is found by the image itself, so the folder names do not matter. Each game can also have a folder of its own."))
+                }
+
+                Section {
+                    Button(action: actions.onPickShellCloud) {
+                        LabeledContent {
+                            Text(store.cloudSavesFolderName ?? ShellStrings.text("Choose folder…"))
+                                .lineLimit(1).truncationMode(.middle)
+                        } label: {
+                            Label(ShellStrings.text(store.cloudSavesFolderName == nil ? "Enable Cloud saves" : "Cloud saves to"), systemImage: "icloud")
+                                .labelStyle(SettingsRowLabelStyle())
+                        }
+                    }
+                    .accessibilityIdentifier("shellSettings.cloud")
+                    .shellTarget("shs.cloud", action: actions.onPickShellCloud)
+                    if store.cloudSavesFolderName != nil {
+                        Button(ShellStrings.text("Turn off"), role: .destructive) {
+                            confirmingClearCloud = true
+                        }
+                        .accessibilityIdentifier("shellSettings.cloud.off")
+                        .accessibilityLabel(ShellStrings.text("Turn off cloud saves"))
+                        .shellTarget("shs.cloud.off") { confirmingClearCloud = true }
+                    }
+                } footer: {
+                    Text(ShellStrings.text("Games without a folder of their own save here. Choose the same iCloud Drive folder you use on your Mac."))
+                }
+
+                Section {
+                    TouchArrangeRow(arranged: !store.touchLayout.isEmpty)
+                        .id("shs.arrange")
+                }
+
+                if actions.supportsSideloadCertificate || sideloadCertificate != nil {
+                    sideloadCertificateSection
+                }
+
+                Section {
+                    Toggle(isOn: Binding(get: { store.audioMix }, set: { on in
+                        store.storeAudioMix(on)
+                        revision += 1
+                    })) {
+                        Label(ShellStrings.text("Play with other audio"), systemImage: "speaker.wave.2")
+                            .labelStyle(SettingsRowLabelStyle())
+                    }
+                    .toggleStyle(NativeCreamToggleStyle())
+                    .accessibilityIdentifier("setting.shell.audioMix")
+                    .shellTarget("shs.row.\(ShellSettingsRows.audioMix)") {
+                        store.storeAudioMix(!store.audioMix)
+                        revision += 1
+                    }
+                } header: {
+                    Text(ShellStrings.text("Sound"))
+                } footer: {
+                    Text(ShellStrings.text("Allow other apps to keep playing audio alongside games."))
+                }
+
+                Section {
+                    Toggle(isOn: Binding(get: { store.performanceHUD == true }, set: { store.storePerformanceHUD($0); revision += 1 })) {
+                        Label(ShellStrings.text("Performance overlay"), systemImage: "speedometer")
+                                .labelStyle(SettingsRowLabelStyle())
+                    }
+                    .toggleStyle(NativeCreamToggleStyle())
+                    .accessibilityIdentifier("setting.shell.hud")
+                    .shellTarget("shs.row.\(ShellSettingsRows.hud)") {
+                        store.storePerformanceHUD(store.performanceHUD != true)
+                        revision += 1
+                    }
+                    Toggle(isOn: Binding(get: { store.showFPS == true }, set: { store.storeShowFPS($0); revision += 1 })) {
+                        Label(ShellStrings.text("Frame-rate counter"), systemImage: "number")
+                            .labelStyle(SettingsRowLabelStyle())
+                    }
+                    .toggleStyle(NativeCreamToggleStyle())
+                    .accessibilityIdentifier("setting.shell.showFPS")
+                    .shellTarget("shs.row.\(ShellSettingsRows.showFPS)") {
+                        store.storeShowFPS(store.showFPS != true)
+                        revision += 1
+                    }
+                } header: {
+                    Text(ShellStrings.text("Interface"))
+                } footer: {
+                    Text(ShellStrings.text("Used by games that have no choice of their own."))
+                }
+            }
+            .formStyle(.grouped)
+            .labelStyle(SettingsRowLabelStyle())
+            .scrollContentBackground(.hidden)
+            .background(ShellPalette.background)
+            .onChange(of: focus.id) { _, id in
+                guard let id, id.hasPrefix("shs.") else { return }
+                withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) {
+                    proxy.scrollTo(id == "shs.close" ? "shs.top" : id, anchor: id == "shs.close" ? .top : .center)
                 }
             }
         }
-        .foregroundStyle(.white).preferredColorScheme(.dark)
+        .tint(ShellPalette.cream)
+        .preferredColorScheme(.dark)
         .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in revision += 1 }
+        .onChange(of: certPromptPresented || certImportError != nil || confirmingClearData || confirmingClearCloud || confirmingRemoveCert) { _, presented in
+            onModalPresentedChange?(presented)
+        }
+        .onDisappear {
+            onModalPresentedChange?(false)
+        }
+        .sheet(isPresented: $certPromptPresented, onDismiss: handleCertificateSheetDismiss) {
+            certificatePasswordSheet
+        }
+        .confirmationDialog(
+            ShellStrings.text("Remove game data folder?"),
+            isPresented: $confirmingClearData,
+            titleVisibility: .visible
+        ) {
+            Button(ShellStrings.text("Remove"), role: .destructive) {
+                actions.onClearShellData()
+            }
+            .accessibilityIdentifier("shellSettings.data.removeConfirm")
+            Button(ShellStrings.text("Cancel"), role: .cancel) { }
+        } message: {
+            Text(ShellStrings.text("Games using this shared folder will no longer find their data until you choose a folder again. Your files on disk are not deleted."))
+        }
+        .confirmationDialog(
+            ShellStrings.text("Turn off cloud saves?"),
+            isPresented: $confirmingClearCloud,
+            titleVisibility: .visible
+        ) {
+            Button(ShellStrings.text("Turn off"), role: .destructive) {
+                actions.onClearShellCloud()
+            }
+            .accessibilityIdentifier("shellSettings.cloud.offConfirm")
+            Button(ShellStrings.text("Cancel"), role: .cancel) { }
+        } message: {
+            Text(ShellStrings.text("Games without a folder of their own will stop syncing saves with iCloud Drive. Existing save files are kept."))
+        }
+        .confirmationDialog(
+            ShellStrings.text("Remove signing certificate?"),
+            isPresented: $confirmingRemoveCert,
+            titleVisibility: .visible
+        ) {
+            Button(ShellStrings.text("Remove certificate"), role: .destructive) {
+                actions.onRemoveSideloadCertificate?()
+            }
+            .accessibilityIdentifier("shellSettings.sideloadCert.removeConfirm")
+            Button(ShellStrings.text("Cancel"), role: .cancel) { }
+        } message: {
+            Text(ShellStrings.text("Unsigned game frameworks will not be signed automatically on launch until you import another .p12 certificate."))
+        }
+        .alert(
+            Text(verbatim: ShellStrings.text("Certificate import failed")),
+            isPresented: Binding(
+                get: { certImportError != nil },
+                set: { if !$0 { certImportError = nil } }
+            )
+        ) {
+            Button(ShellStrings.text("Close")) { certImportError = nil }
+        } message: {
+            Text(verbatim: certImportError ?? "")
+        }
+    }
+
+    private var certificatePasswordSheet: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    HStack(spacing: 8) {
+                        Group {
+                            if certPasswordVisible {
+                                TextField(ShellStrings.text("Certificate password"), text: $certPassword)
+                                    #if os(iOS)
+                                    .textInputAutocapitalization(.never)
+                                    .autocorrectionDisabled()
+                                    #endif
+                            } else {
+                                SecureField(ShellStrings.text("Certificate password"), text: $certPassword)
+                                    #if os(iOS)
+                                    .textInputAutocapitalization(.never)
+                                    .autocorrectionDisabled()
+                                    #endif
+                            }
+                        }
+                        .focused($certPasswordFocused)
+                        .submitLabel(.done)
+                        .onSubmit { confirmCertificatePassword() }
+                        .disabled(certBusy)
+                        .accessibilityIdentifier("shellSettings.sideloadCert.passwordField")
+
+                        Button {
+                            let wasFocused = certPasswordFocused
+                            certPasswordVisible.toggle()
+                            if wasFocused {
+                                Task { @MainActor in
+                                    certPasswordFocused = true
+                                }
+                            }
+                        } label: {
+                            Image(systemName: certPasswordVisible ? "eye.slash" : "eye")
+                                .foregroundStyle(.white.opacity(0.75))
+                                .frame(minWidth: 44, minHeight: 44)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(certBusy)
+                        .accessibilityLabel(ShellStrings.text(certPasswordVisible ? "Hide password" : "Show password"))
+                        .accessibilityIdentifier("shellSettings.sideloadCert.passwordToggle")
+                    }
+                } header: {
+                    if let fileName = pendingCertFileName {
+                        Text(verbatim: ShellStrings.text("Enter the password for \(fileName). Leave it blank if the certificate has no password."))
+                            .textCase(nil)
+                    }
+                } footer: {
+                    if let certPromptError, !certPromptError.isEmpty {
+                        Text(verbatim: certPromptError)
+                            .foregroundStyle(.red)
+                            .accessibilityIdentifier("shellSettings.sideloadCert.passwordError")
+                    }
+                }
+            }
+            .formStyle(.grouped)
+            .scrollContentBackground(.hidden)
+            .background(ShellPalette.background)
+            .navigationTitle(Text(verbatim: ShellStrings.text("Enter certificate password")))
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button(ShellStrings.text("Cancel"), role: .cancel) {
+                        cancelCertificatePasswordPrompt()
+                    }
+                    .disabled(certBusy)
+                    .accessibilityIdentifier("shellSettings.sideloadCert.passwordCancel")
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button {
+                        confirmCertificatePassword()
+                    } label: {
+                        if certBusy {
+                            ProgressView()
+                                .tint(ShellPalette.cream)
+                        } else {
+                            Text(ShellStrings.text("Import"))
+                        }
+                    }
+                    .disabled(certBusy)
+                    .accessibilityIdentifier("shellSettings.sideloadCert.passwordConfirm")
+                }
+            }
+        }
+        .tint(ShellPalette.cream)
+        .preferredColorScheme(.dark)
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
+        .presentationBackground(ShellPalette.background)
+        .interactiveDismissDisabled(certBusy)
+        .onAppear {
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(150))
+                if certPromptPresented {
+                    certPasswordFocused = true
+                }
+                try? await Task.sleep(for: .milliseconds(250))
+                if certPromptPresented && !certPasswordFocused {
+                    certPasswordFocused = true
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var sideloadCertificateSection: some View {
+        Section {
+            if let cert = sideloadCertificate {
+                LabeledContent {
+                    Text(cert.commonName.isEmpty ? cert.fingerprintHex.prefix(16).uppercased() : cert.commonName)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.trailing)
+                } label: {
+                    Label(ShellStrings.text("Certificate"), systemImage: "checkmark.seal")
+                        .labelStyle(SettingsRowLabelStyle())
+                }
+                .accessibilityIdentifier("shellSettings.sideloadCert.name")
+
+                if !cert.teamID.isEmpty {
+                    LabeledContent(ShellStrings.text("Signing team"), value: cert.teamID)
+                        .accessibilityIdentifier("shellSettings.sideloadCert.team")
+                }
+
+                if let expiresAt = cert.expiresAt {
+                    LabeledContent {
+                        HStack(spacing: 6) {
+                            Text(Self.formatCertificateDate(expiresAt))
+                                .foregroundStyle(cert.isExpired ? .red : .secondary)
+                            if cert.isExpired {
+                                Text(ShellStrings.text("Expired"))
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.red)
+                            }
+                        }
+                    } label: {
+                        Text(ShellStrings.text("Valid until"))
+                    }
+                    .accessibilityIdentifier("shellSettings.sideloadCert.expiry")
+                }
+
+                if actions.supportsSideloadCertificate {
+                    Button(action: startCertificateImport) {
+                        Label(ShellStrings.text("Replace certificate"), systemImage: "arrow.triangle.2.circlepath")
+                            .labelStyle(SettingsRowLabelStyle())
+                    }
+                    .disabled(certBusy)
+                    .accessibilityIdentifier("shellSettings.sideloadCert.replace")
+                    .shellTarget("shs.sideloadCert.replace", action: startCertificateImport)
+                }
+
+                if actions.onRemoveSideloadCertificate != nil {
+                    Button(ShellStrings.text("Remove certificate"), role: .destructive) {
+                        confirmingRemoveCert = true
+                    }
+                    .disabled(certBusy)
+                    .accessibilityIdentifier("shellSettings.sideloadCert.remove")
+                    .shellTarget("shs.sideloadCert.remove") { confirmingRemoveCert = true }
+                }
+            } else {
+                LabeledContent {
+                    Text(ShellStrings.text("Not configured"))
+                        .foregroundStyle(.secondary)
+                } label: {
+                    Label(ShellStrings.text("Certificate status"), systemImage: "signature")
+                        .labelStyle(SettingsRowLabelStyle())
+                }
+                .accessibilityIdentifier("shellSettings.sideloadCert.status")
+
+                if actions.supportsSideloadCertificate {
+                    Button(action: startCertificateImport) {
+                        Label(ShellStrings.text("Import .p12 certificate"), systemImage: "doc.badge.plus")
+                            .labelStyle(SettingsRowLabelStyle())
+                    }
+                    .disabled(certBusy)
+                    .accessibilityIdentifier("shellSettings.sideloadCert.import")
+                    .shellTarget("shs.sideloadCert.import", action: startCertificateImport)
+                }
+            }
+        } header: {
+            Text(ShellStrings.text("Sideload signing certificate"))
+        } footer: {
+            Text(ShellStrings.text("When NX2Apple is installed through SideStore, AltStore, or another sideload tool with a development profile, import the same .p12 certificate used to sign the app here so game frameworks in Frameworks are signed with the matching certificate on launch. Distribution or mismatched certificates cannot load from Frameworks and require reinstalling from your computer. Installs directly from Xcode on a Mac do not need this."))
+        }
+    }
+
+    private func startCertificateImport() {
+        guard !certBusy, let pickFile = actions.onPickSideloadCertificateFile else { return }
+        certBusy = true
+        Task {
+            let outcome = await pickFile()
+            certBusy = false
+            switch outcome {
+            case .picked(let fileName):
+                certPassword = ""
+                certPasswordVisible = false
+                certPromptError = nil
+                pendingCertFileName = fileName
+                certPromptPresented = true
+            case .cancelled:
+                break
+            case .failed(let message):
+                certImportError = message
+            }
+        }
+    }
+
+    private func confirmCertificatePassword() {
+        guard !certBusy, let confirm = actions.onConfirmSideloadCertificatePassword else {
+            cancelCertificatePasswordPrompt()
+            return
+        }
+        let password = certPassword
+        certPromptError = nil
+        certBusy = true
+        Task {
+            let failure = await confirm(password)
+            certBusy = false
+            if let failure, !failure.isEmpty {
+                certPromptError = failure
+                certPasswordFocused = true
+            } else {
+                certPassword = ""
+                certPasswordVisible = false
+                pendingCertFileName = nil
+                certPromptError = nil
+                certPromptPresented = false
+            }
+        }
+    }
+
+    private func handleCertificateSheetDismiss() {
+        certPasswordFocused = false
+        if pendingCertFileName != nil {
+            cancelCertificatePasswordPrompt()
+        }
+    }
+
+    private func cancelCertificatePasswordPrompt() {
+        certPasswordFocused = false
+        certPassword = ""
+        certPasswordVisible = false
+        certPromptError = nil
+        pendingCertFileName = nil
+        certPromptPresented = false
+        actions.onCancelSideloadCertificateImport?()
+    }
+
+    private static func formatCertificateDate(_ date: Date) -> String {
+        let locale: Locale
+        if let code = ShellStrings.captureBundle?.bundleURL.deletingPathExtension().lastPathComponent, !code.isEmpty {
+            locale = Locale(identifier: code)
+        } else {
+            locale = .autoupdatingCurrent
+        }
+        return date.formatted(Date.FormatStyle(date: .abbreviated, time: .omitted, locale: locale))
+    }
+}
+
+struct SettingsRowLabelStyle: LabelStyle {
+    @ScaledMetric(relativeTo: .body) private var iconSize = 30
+
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(spacing: 12) {
+            configuration.icon
+                .font(.body.weight(.semibold))
+                .foregroundStyle(.black)
+                .frame(width: iconSize, height: iconSize)
+                .background(ShellPalette.cream, in: RoundedRectangle(cornerRadius: iconSize * 0.23))
+                .accessibilityHidden(true)
+            configuration.title
+                .foregroundStyle(.primary)
+        }
     }
 }

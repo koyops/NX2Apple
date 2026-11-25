@@ -57,6 +57,18 @@ final class OnboardingTests: IsolatedDefaultsTestCase {
         XCTAssertFalse(s.canAdvance)
     }
 
+    func testXcodeCannotAdvanceWhileAdditionalSupportTransferIsActive() {
+        var state = OnboardingState()
+        state.step = .xcode; state.xcode = .ready
+        state.background = Dictionary(uniqueKeysWithValues: OnboardingBackgroundTask.allCases.map { ($0, .done) })
+        state.engineTransfer = .init(fraction: 0.9, detail: "Downloading")
+        XCTAssertFalse(state.canAdvance)
+        state.next(); XCTAssertEqual(state.step, .xcode)
+        state.engineTransfer = nil
+        XCTAssertTrue(state.canAdvance)
+        state.next(); XCTAssertEqual(state.step, .keys)
+    }
+
     func testKeysAndGamesNeverAdvanceBeforeValidation() {
         var s = OnboardingState()
         s.step = .keys
@@ -66,9 +78,12 @@ final class OnboardingTests: IsolatedDefaultsTestCase {
             s.next(); XCTAssertEqual(s.step, .keys)
         }
         s.keys = .found(URL(fileURLWithPath: "/Demo/prod.keys"))
+        XCTAssertEqual(s.primary, .waiting)
+        XCTAssertFalse(s.primaryEnabled)
+        XCTAssertFalse(s.canAdvance, "A found file must verify before explicit confirmation")
+        s.keys = .valid
         XCTAssertEqual(s.primary, .confirmKeys)
         XCTAssertTrue(s.primaryEnabled)
-        XCTAssertFalse(s.canAdvance, "Confirming a found file still needs validation")
         s.step = .games
         for value: OnboardingState.Games in [.empty, .scanning, .none, .found([])] {
             s.games = value
@@ -141,6 +156,19 @@ final class OnboardingTests: IsolatedDefaultsTestCase {
         }
     }
 
+    @MainActor func testDemoCanSkipKeysForDecryptedGamesAndResume() {
+        var state = OnboardingState()
+        state.step = .keys
+        state.keys = .found(URL(fileURLWithPath: "/Demo/prod.keys"))
+        state.games = .found([OnboardingGame(id: "sample", title: "Sample", version: "", needsKeys: false)])
+        let demo = MockOnboardingDriver(state: state, animated: false)
+        demo.skipKeys()
+        XCTAssertEqual(demo.state.step, .games)
+        demo.skipForLater(); demo.resume(); demo.next()
+        XCTAssertEqual(demo.state.step, .done)
+        XCTAssertEqual(demo.state.keys, .skipped)
+    }
+
     func testAllOnboardingStringsHaveBothLanguages() {
         let keys = L10n.table.keys.filter { $0.hasPrefix("onboarding.") }
         XCTAssertGreaterThan(keys.count, 80)
@@ -180,7 +208,7 @@ final class OnboardingTests: IsolatedDefaultsTestCase {
                 s.platform = .selected(.both)
                 s.xcode = .settingUp
                 s.setup = [.selected: .done, .license: .done, .firstLaunch: .done, .metal: .running(0.65), .ios: .queued]
-                s.background = [.python: .done, .dotnet: .running(0.5), .tools: .queued]
+                s.background = [.python: .done, .tools: .queued]
                 s.keys = .found(URL(fileURLWithPath: "/Demo/Switch/prod.keys"))
                 s.games = .found([.init(id: "a", title: "Super Mario Odyssey", version: "1.0.0"),
                                   .init(id: "b", title: "Balatro", version: "1.0.0")])
@@ -200,7 +228,7 @@ final class OnboardingTests: IsolatedDefaultsTestCase {
                 window.orderOut(nil)
             }
         }
-        // The Xcode step keeps one card size across its states: capture each to compare.
+        // Closed setup summaries keep their row size across status changes.
         let failure = OnboardingFailure(message: "The Metal Toolchain could not be downloaded.", details: "HTTP 503")
         let states: [(String, OnboardingState.Xcode)] = [("checking", .checking), ("missing", .missing), ("downloading", .downloading),
             ("needsSetup", .needsSetup), ("settingUp", .settingUp), ("ready", .ready), ("failed", .failed(failure))]
@@ -208,7 +236,7 @@ final class OnboardingTests: IsolatedDefaultsTestCase {
             var s = OnboardingState()
             s.step = .xcode; s.platform = .selected(.both); s.xcode = xcode
             s.setup = [.selected: .done, .license: .done, .firstLaunch: .done, .metal: .running(0.65), .ios: .running(0.2)]
-            s.background = [.python: .done, .dotnet: .running(0.5), .tools: .queued]
+            s.background = [.python: .done, .tools: .queued]
             let driver = MockOnboardingDriver(state: s, lang: .en, animated: false)
             let host = NSHostingView(rootView: OnboardingView(driver: driver, lang: .en))
             let window = OffscreenWindow(size: NSSize(width: 900, height: 680), styleMask: [.titled, .closable, .resizable])
@@ -228,7 +256,7 @@ final class OnboardingTests: IsolatedDefaultsTestCase {
                 var s = MockOnboardingDriver.sampleState
                 s.step = step; s.platform = .selected(.mac); s.xcode = .ready
                 s.setup = [.selected: .done, .license: .done, .firstLaunch: .done, .metal: .done]
-                s.background = [.python: .done, .dotnet: .done, .tools: .done]
+                s.background = [.python: .done, .tools: .done]
                 s.osTooOldForNVN = true; s.xcodeTooOldForNVN = true
                 let driver = MockOnboardingDriver(state: s, lang: lang, animated: false)
                 let host = NSHostingView(rootView: OnboardingView(driver: driver, lang: lang))

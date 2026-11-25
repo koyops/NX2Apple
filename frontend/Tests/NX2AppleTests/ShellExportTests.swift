@@ -37,8 +37,9 @@ import NXModel
         // not the install's derived data: the signed app of an install, a reinstall and a re-sign stays where it is
         XCTAssertNotEqual(ShellInstall.exportDerivedData(root: root), ShellInstall.derivedData(root: root))
         let build = ShellInstall.exportBuildCommand(xcrun: "/x", root: root, bundleID: "org.nxnative.shell")
-        XCTAssertEqual(build, ["/x", "xcodebuild", "-project", root + "/project/DmShell.xcodeproj", "-scheme", "DmShell", "-configuration", "Release",
-                               "-destination", "generic/platform=iOS", "-derivedDataPath", root + "/export/derived-data",
+        XCTAssertEqual(build, ["/x", "xcodebuild", "-project", root + "/project/DmShell.xcodeproj", "-target", "DmShell", "-configuration", "Release", "-sdk", "iphoneos",
+                               "SYMROOT=" + root + "/export/derived-data/Build/Products",
+                               "OBJROOT=" + root + "/export/derived-data/Build/Intermediates.noindex",
                                "PRODUCT_BUNDLE_IDENTIFIER=org.nxnative.shell", "CODE_SIGNING_ALLOWED=NO", "CODE_SIGNING_REQUIRED=NO",
                                "CODE_SIGN_IDENTITY=", "build"])
         // no team, no device, no provisioning
@@ -72,7 +73,8 @@ import NXModel
             if os.path.exists('\(state)/xcode-fails'):
                 print('error: Build input file cannot be found: DmShell.m', flush=True)
                 sys.exit(65)
-            app = val('-derivedDataPath') + '/Build/Products/Release-iphoneos/DmShell.app'
+            symroot = next((v.split('=', 1)[1] for v in a if v.startswith('SYMROOT=')), None)
+            app = (symroot or val('-derivedDataPath') + '/Build/Products') + '/Release-iphoneos/DmShell.app'
             os.makedirs(app + '/Frameworks/DmGame\(titleID).framework', exist_ok=True)
             if not os.path.exists(app + '/DmShell'):
                 open(app + '/DmShell', 'w').write('not a real executable')
@@ -117,7 +119,7 @@ import NXModel
     /// A checkout with a stand-in build_shell.sh: it records its environment and writes the project with its entitlements file.
     private func makeRepo(entitlements: Bool = true) throws -> String {
         let repo = path("repo")
-        try write(repo + "/dm/ios/tools/build_shell.sh", """
+        try write(repo + "/frontend-ios/Shell/build_shell.sh", """
         #!/bin/bash
         [ "$1" = "--prepare-xcode" ] || { echo "FAIL: no --prepare-xcode"; exit 1; }
         mkdir -p "$SHELL_DIR/DmShell.xcodeproj" "$SHELL_DIR/Gen"
@@ -182,7 +184,7 @@ import NXModel
         XCTAssertTrue(names.allSatisfy { $0.hasPrefix("Payload/") && !$0.contains("__MACOSX") }, names.joined(separator: "\n"))
 
         let xcodebuild = try XCTUnwrap(calls.first { $0.hasPrefix("xcodebuild") })
-        XCTAssertTrue(xcodebuild.contains("CODE_SIGNING_ALLOWED=NO") && xcodebuild.contains("-destination generic/platform=iOS"), xcodebuild)
+        XCTAssertTrue(xcodebuild.contains("CODE_SIGNING_ALLOWED=NO") && xcodebuild.contains("-target DmShell") && xcodebuild.contains("-sdk iphoneos"), xcodebuild)
         XCTAssertFalse(xcodebuild.contains("DEVELOPMENT_TEAM") || xcodebuild.contains("-allowProvisioningUpdates"), xcodebuild)
         XCTAssertFalse(calls.contains { $0.hasPrefix("devicectl") }, "no device is asked")
         XCTAssertFalse(fm.fileExists(atPath: ShellInstall.derivedData(root: f.root)), "the install's derived data stays untouched")
@@ -569,6 +571,22 @@ import NXModel
         XCTAssertFalse(calls.contains { $0.hasPrefix("xcodebuild") }, "nothing is built or signed")
     }
 
+    func testTheCopyBarStaysIndeterminateUntilBytesAreDone() throws {
+        let f = try makeFixture()
+        let archive = try makeArchive()
+        try listApps([("org.nxnative.shell.ABC123", "NX2Apple")])
+        var stages: [ShellStage] = []
+        var i = sender(f)
+        i.stage = { stages.append($0) }
+        XCTAssertTrue(i.sendData(titleID: titleID, archive: archive).ok)
+        let running = stages.filter { $0.id == ShellInstaller.copyStageID && $0.state == .running && !$0.detail.isEmpty }
+        XCTAssertEqual(running.count, 2)
+        XCTAssertNil(running[0].percent, "the first file has no finished bytes, so 0% would read as a stall")
+        let second = try XCTUnwrap(running[1].percent)
+        XCTAssertGreaterThan(second, 0)
+        XCTAssertLessThan(second, 100)
+    }
+
     func testSendingAnUnchangedImageKeepsTheSendCompletionMessage() throws {
         let f = try makeFixture()
         let archive = try makeArchive()
@@ -870,17 +888,23 @@ import NXModel
         model.exportedIPAPath = path("export/NX2Apple.ipa")
         let folder = path("drive")
         try fm.createDirectory(atPath: folder, withIntermediateDirectories: true)
+        let driveReady = expectation(description: "drive checked")
+        let driveToken = model.$drive.dropFirst().compactMap { $0 }.prefix(1).sink { _ in
+            driveReady.fulfill()
+        }
         model.chooseFolder = { folder }
         model.chooseDriveFolder()
+        wait(for: [driveReady], timeout: 10)
+        driveToken.cancel()
         XCTAssertEqual(stores.deviceStore.driveFolder, folder)
         XCTAssertEqual(model.drive?.needed, 14)
         XCTAssertNil(model.drive?.problem)
         XCTAssertTrue(model.canCopyToDrive)
         let copied = expectation(description: "Copied")
-        let token = model.$send.sink { if case .copied = $0 { copied.fulfill() } }
+        let token = model.$send.filter { if case .copied = $0 { return true }; return false }.prefix(1).sink { _ in copied.fulfill() }
         model.copyToDrive()
         wait(for: [copied], timeout: 30)
-        withExtendedLifetime(token) {}
+        token.cancel()
         XCTAssertEqual(try String(contentsOfFile: folder + "/" + titleID + "/romfs.img"), "0123456789")
         XCTAssertFalse(model.running)
         // a FAT32 drive keeps the button inert
@@ -890,7 +914,7 @@ import NXModel
     }
 
     func testEveryLanguageHasTheExportTexts() {
-        let keys = ["shell.exportBuildStage", "shell.exportDone", "shell.exportFailed", "shell.exportPackStage", "shell.modeTitle", "shell.modeInstall",
+        let keys = ["shell.exportBuildStage", "shell.exportDone", "shell.exportFailed", "shell.exportPackStage", "shell.modeInstall",
                     "shell.modeExport", "shell.step1Title", "shell.step1Sub", "shell.step1Button", "shell.step1Done", "shell.showInFinder", "shell.step2Title",
                     "shell.step2Sub", "shell.step3Title", "shell.step3Sub", "shell.whereDevice", "shell.whereDrive", "shell.sendButton", "shell.sendStage",
                     "shell.sendProgress", "shell.sendDone", "shell.sendNoApp", "shell.sendSeveral", "shell.sendRefused", "shell.sendFinder",
@@ -970,7 +994,9 @@ import NXModel
         withExtendedLifetime(token) {}
 
         let script = try String(contentsOfFile: state + "/script.txt")
-        XCTAssertEqual(try String(contentsOfFile: state + "/build-env.txt"), "DM_PROF_TEX_BC_CPU=1\n")
+        let env = try String(contentsOfFile: state + "/build-env.txt")
+        XCTAssertEqual(env, GameMenuText.envFile(bcOnCPU: true, model.t))
+        XCTAssertTrue(env.hasPrefix("DM_PROF_TEX_BC_CPU=1\nDM_GAME_MENU_TEXT="), env)
         XCTAssertTrue(script.contains("--shell-framework \(temporary.path)/out/\(titleID)_build/shell-framework"), script)
         XCTAssertFalse(script.contains("--team-id"), script)
         XCTAssertEqual(model.exportedIPAPath, ShellInstall.ipaPath(root: f.root))
@@ -980,8 +1006,8 @@ import NXModel
         XCTAssertNotEqual(model.doneNote, model.t("shell.needsDevice"))
         XCTAssertEqual(model.doneNote, String(format: model.t("shell.exportDone"), model.exportedIPAPath))
         XCTAssertFalse(calls.contains { $0.hasPrefix("devicectl") })
-        XCTAssertTrue(fm.fileExists(atPath: model.archivePath + "/romfs.img"), "the game data is packed beside the IPA, not in it")
-        XCTAssertFalse(try entries(ofZip: model.exportedIPAPath).contains { $0.hasSuffix("romfs.img") })
+        XCTAssertTrue(fm.fileExists(atPath: model.archivePath + "/Test.img"), "the game data is packed beside the IPA, not in it")
+        XCTAssertFalse(try entries(ofZip: model.exportedIPAPath).contains { $0.hasSuffix("Test.img") || $0.hasSuffix("romfs.img") })
     }
 
     /// One game's own IPA (#540): the script runs without `--shell-framework`, packs the game data into the IPA it names, and the
@@ -1053,6 +1079,89 @@ import NXModel
         XCTAssertEqual(OneGameIPA.path(folder: "/O", titleID: "0100"), "/O/0100.ipa")
     }
 
+    @MainActor func testExportGameFrameworkWritesStandaloneFrameworkWithoutBuildingShellIPA() throws {
+        let f = try makeFixture()
+        testDefaults.set(f.root, forKey: "shellRoot")
+        testDefaults.removeObject(forKey: DeviceStore.frameworkKey)
+        let stores = LauncherStores(xcrun: f.xcrun, defaults: testDefaults); let model = stores.build
+        XCTAssertFalse(stores.deviceStore.exportFramework, "framework export stays off by default")
+
+        stores.deviceStore.exportOneGame = true
+        stores.deviceStore.exportFramework = true
+        XCTAssertFalse(stores.deviceStore.exportOneGame, "exportFramework clears exportOneGame")
+        XCTAssertTrue(stores.deviceStore.exportFramework)
+        stores.deviceStore.exportOneGame = true
+        XCTAssertFalse(stores.deviceStore.exportFramework, "exportOneGame clears exportFramework")
+        stores.deviceStore.exportFramework = true
+
+        stores.repo.path = f.repo
+        model.target = "ios"
+        model.outDir = path("out")
+        stores.dependencies.pythonPath = "/usr/bin/python3"
+        stores.dependencies.dotnetPath = "/usr/bin/true"
+        stores.dependencies.checked = true
+        stores.dependencies.deps = [Dep(id: "test", name: "test", hint: "", present: true, installCmd: [])]
+        stores.deviceStore.installDevice = ""
+        stores.deviceStore.signingTeam = ""
+        stores.deviceStore.exportIPA = true
+        XCTAssertTrue(model.exportsFramework)
+        XCTAssertFalse(model.exportsOneGame)
+
+        try write(f.repo + "/dm/tools/nx_extract/Program.cs", "")
+        for tool in RepoLayout.requiredTools.filter({ $0 != RepoLayout.buildScript }) { try write(f.repo + "/" + tool, "") }
+        try write(f.repo + "/scripts/build_ipa_from_nsp.py", """
+        # '--work-dir'
+        import sys, json, pathlib, plistlib
+        args = sys.argv[1:]
+        open('\(state)/script.txt', 'w').write(' '.join(args))
+        sf = pathlib.Path(args[args.index('--shell-framework') + 1])
+        fw = sf / 'DmGame\(titleID).framework'
+        fw.mkdir(parents=True, exist_ok=True)
+        (fw / 'DmGame\(titleID)').write_bytes(b'macho')
+        with open(fw / 'Info.plist', 'wb') as pf:
+            plistlib.dump({'CFBundleExecutable': 'DmGame\(titleID)', 'DMTitleID': '\(titleID)'}, pf)
+        print(json.dumps(dict(ev='stage', k=1, n=1, name='framework')), flush=True)
+        print(json.dumps(dict(ev='stage_end', k=1, name='framework', ok=True, summary='', elapsed=1)), flush=True)
+        """)
+        let base = temporary.appendingPathComponent("Test [\(titleID)].nsp"), keys = temporary.appendingPathComponent("prod.keys")
+        try Data([0]).write(to: base); try Data().write(to: keys)
+        model.slots[0].paths = [base.path]; model.slots[3].paths = [keys.path]
+
+        let finished = expectation(description: "FrameworkExported")
+        let token = model.$done.filter { $0 }.prefix(1).sink { _ in finished.fulfill() }
+        model.startBuild()
+        wait(for: [finished], timeout: 30)
+        withExtendedLifetime(token) {}
+
+        let script = try String(contentsOfFile: state + "/script.txt")
+        XCTAssertTrue(script.contains("--shell-framework "), script)
+        let dest = path("out", "DmGame\(titleID).framework")
+        XCTAssertEqual(model.exportedIPAPath, dest)
+        XCTAssertEqual(model.doneNote, String(format: model.t("shell.frameworkExportDone"), dest))
+        XCTAssertTrue(fm.fileExists(atPath: dest + "/Info.plist"))
+        XCTAssertTrue(fm.fileExists(atPath: dest + "/DmGame\(titleID)"))
+        XCTAssertFalse(model.running)
+        XCTAssertFalse(fm.fileExists(atPath: ShellLibrary.stateFile(root: f.root)), "the shared app is not touched")
+        XCTAssertTrue(calls.isEmpty, "no xcodebuild for a shared app and no device")
+
+        let libGame = LibraryGame(titleID: titleID, name: "Test", inputs: ["base": [base.path]], outputDirectory: path("out"))
+        let entry = RefreshQueueBuilder.makeEntry(
+            game: libGame,
+            target: BuildTarget.ios,
+            fastRefresh: true,
+            batch: UUID(),
+            stores: stores,
+            libraryFolder: path("out")
+        )
+        XCTAssertFalse(entry.packageAfter)
+        XCTAssertEqual(entry.exportIPA, true)
+        XCTAssertEqual(entry.exportFramework, true)
+
+        let exportedGame = LibraryGame(titleID: titleID, name: "Test", ipaPath: dest)
+        XCTAssertTrue(exportedGame.hasIOSBuild)
+        XCTAssertFalse(exportedGame.isOlderIOSBuild, "standalone .framework export must not be labelled legacy olderIOS")
+    }
+
     /// The choice is saved and a build without it still asks for a device and a team.
     @MainActor func testTheChoiceIsSavedAndWithoutItTheDeviceIsStillNeeded() throws {
         let stores = LauncherStores(defaults: testDefaults); let model = stores.build
@@ -1071,5 +1180,187 @@ import NXModel
         stores.deviceStore.exportIPA = true
         model.target = BuildTarget.mac
         XCTAssertFalse(model.exportsShell)
+    }
+
+    @MainActor func testSaveIPARunsOffMainActorAndPacksLooseShadersWhenExceedingEntryLimit() throws {
+        final class ThreadRecordingRunner: ProcessRunner {
+            let base = SystemProcessRunner()
+            let lock = NSLock()
+            var streamOnMainThread: [Bool] = []
+            var commands: [[String]] = []
+
+            func capture(_ launch: ProcessLaunch) -> ProcessResult { base.capture(launch) }
+            func stream(_ launch: ProcessLaunch, line: @escaping (String) -> Void) -> Bool { base.stream(launch, line: line) }
+            func streamLines(_ launch: ProcessLaunch, started: @escaping (RunningProcess) -> Void, line: @escaping (String) -> Void) -> ProcessResult {
+                lock.lock()
+                streamOnMainThread.append(Thread.isMainThread)
+                commands.append([launch.executable] + launch.arguments)
+                lock.unlock()
+                return base.streamLines(launch, started: started, line: line)
+            }
+            func start(_ launch: ProcessLaunch, onOutput: @escaping (Data) -> Void, onExit: @escaping (Int32) -> Void) throws -> RunningProcess {
+                try base.start(launch, onOutput: onOutput, onExit: onExit)
+            }
+        }
+
+        let app = path("signed/DmShell.app")
+        let gameFw = "Frameworks/DmGame\(titleID).framework"
+        try write(app + "/DmShell", "signed-binary")
+        try write(app + "/Info.plist", "<plist/>")
+        try write(app + "/" + gameFw + "/DmGame\(titleID)", "game-binary")
+        try write(app + "/" + gameFw + "/msl/b-test/shader.json", "{\"s\":1}")
+        try Data([1, 2, 3, 4]).write(to: URL(fileURLWithPath: app + "/" + gameFw + "/msl/b-test/shader.metallib"))
+        try write(app + "/Frameworks/GraphicsSupport.framework/msl/keep.bin", "third-party")
+
+        let beforeStaging = Set(((try? fm.contentsOfDirectory(atPath: fm.temporaryDirectory.path)) ?? []).filter { $0.hasPrefix("nspb-ipa-") })
+
+        let runner = ThreadRecordingRunner()
+        let stores = LauncherStores(runner: runner, defaults: testDefaults)
+        let model = stores.build
+        model.installedAppPath = app
+
+        let ipa = URL(fileURLWithPath: path("out/Signed.ipa"))
+        let saved = expectation(description: "saveIPA finished")
+        model.saveIPA(to: ipa, entryLimit: 12) {
+            saved.fulfill()
+        }
+        XCTAssertTrue(model.running, "saveIPA dispatches heavy staging work asynchronously and returns at once")
+        wait(for: [saved], timeout: 30)
+
+        XCTAssertFalse(model.running)
+        XCTAssertEqual(model.stages.first(where: { $0.id == 1005 })?.state, .done)
+        XCTAssertTrue(fm.fileExists(atPath: ipa.path))
+        XCTAssertFalse(runner.streamOnMainThread.isEmpty)
+        XCTAssertTrue(runner.streamOnMainThread.allSatisfy { !$0 }, "archive tools must run off the main thread: \(runner.streamOnMainThread)")
+        XCTAssertTrue(runner.commands.contains { $0.first == "/usr/bin/aa" }, "expected shader archive packing via aa")
+
+        let zipEntries = try entries(ofZip: ipa.path)
+        XCTAssertFalse(zipEntries.contains { $0.contains("\(gameFw)/msl/") }, zipEntries.joined(separator: "\n"))
+        XCTAssertEqual(zipEntries.filter { $0.hasPrefix("Payload/DmShell.app/\(gameFw)/msl-") && $0.hasSuffix(".aar") }.count, 1)
+        XCTAssertTrue(zipEntries.contains("Payload/DmShell.app/Frameworks/GraphicsSupport.framework/msl/keep.bin"))
+        XCTAssertTrue(fm.fileExists(atPath: app + "/" + gameFw + "/msl/b-test/shader.json"), "installed app keeps its original loose shaders")
+
+        let afterStaging = Set(((try? fm.contentsOfDirectory(atPath: fm.temporaryDirectory.path)) ?? []).filter { $0.hasPrefix("nspb-ipa-") })
+        XCTAssertTrue(afterStaging.subtracting(beforeStaging).isEmpty, "temporary IPA staging directories must be cleaned up")
+    }
+
+    @MainActor func testSaveIPARefusesArchiveAboveEntryLimitAndCleansTemporaryStaging() throws {
+        let app = path("oversized/DmShell.app")
+        try write(app + "/DmShell", "signed-binary")
+        for index in 0..<8 {
+            try write(app + "/Resources/f\(index).dat", "data-\(index)")
+        }
+
+        let beforeStaging = Set(((try? fm.contentsOfDirectory(atPath: fm.temporaryDirectory.path)) ?? []).filter { $0.hasPrefix("nspb-ipa-") })
+
+        let stores = LauncherStores(defaults: testDefaults)
+        let model = stores.build
+        model.installedAppPath = app
+
+        let ipa = URL(fileURLWithPath: path("out/Oversized.ipa"))
+        let finished = expectation(description: "saveIPA refused oversized bundle")
+        model.saveIPA(to: ipa, entryLimit: 5) {
+            finished.fulfill()
+        }
+        wait(for: [finished], timeout: 30)
+
+        XCTAssertFalse(model.running)
+        XCTAssertEqual(model.stages.first(where: { $0.id == 1005 })?.state, .failed)
+        XCTAssertFalse(fm.fileExists(atPath: ipa.path), "must never emit a corrupt ZIP32 IPA above the entry limit")
+        XCTAssertTrue(model.doneNote.contains("ZIP32"), model.doneNote)
+
+        let afterStaging = Set(((try? fm.contentsOfDirectory(atPath: fm.temporaryDirectory.path)) ?? []).filter { $0.hasPrefix("nspb-ipa-") })
+        XCTAssertTrue(afterStaging.subtracting(beforeStaging).isEmpty, "temporary IPA staging directory must be removed on failure")
+    }
+
+    func testStrippedFrameworkPackExportAndNamedDriveCopySkipExternalMsl() throws {
+        let f = try makeFixture()
+        let app = URL(fileURLWithPath: ShellInstall.exportAppPath(root: f.root))
+        let fwName = "DmGame\(titleID).framework"
+        let appFw = app.appendingPathComponent("Frameworks/\(fwName)")
+        try write(app.appendingPathComponent("DmShell").path, "shell-bin")
+        try write(app.appendingPathComponent("Info.plist").path, "<plist/>")
+        try write(appFw.appendingPathComponent("DmGame\(titleID)").path, "game-bin")
+        try write(appFw.appendingPathComponent("game.manifest.json").path, #"{"loader":"FH","name":"Big Shader Game"}"#)
+        try fm.createDirectory(at: appFw, withIntermediateDirectories: true)
+
+        let mirrorFw = URL(fileURLWithPath: ShellInstall.mirroredFramework(root: f.root, titleID: titleID))
+        try fm.createDirectory(at: mirrorFw.appendingPathComponent("msl/b-chain"), withIntermediateDirectories: true)
+        try Data(repeating: 0x5A, count: 64).write(to: mirrorFw.appendingPathComponent("msl/b-chain/shaders.img"))
+
+        let library = ShellLibrary(games: [.init(titleID: titleID, name: "Big Shader Game", framework: mirrorFw.path)])
+        let outcome = installer(f).packExport(app: app, library: library)
+        XCTAssertTrue(outcome.ok, outcome.message)
+
+        let zipEntries = try entries(ofZip: outcome.ipaPath)
+        XCTAssertFalse(zipEntries.contains { $0.contains("\(fwName)/msl/") }, zipEntries.joined(separator: "\n"))
+        XCTAssertFalse(zipEntries.contains { $0.hasSuffix("external-msl.json") }, zipEntries.joined(separator: "\n"))
+
+        // Archive and DriveCopy omit msl/ merge and store under the sanitized game folder/image name.
+        let archive = path("games/Big Shader Game")
+        try write(archive + "/Big Shader Game.img", "ROMFS")
+        let transfer = ShellInstall.transferSources(archive: archive, shellRoot: f.root, titleID: titleID)
+        XCTAssertEqual(transfer.sizes["Big Shader Game.img"], 5)
+        XCTAssertNil(transfer.sizes["msl/b-chain/shaders.img"])
+
+        let driveRoot = path("usb")
+        let usbDest = DriveCopy.destination(folder: driveRoot, name: "Big Shader Game", titleID: titleID)
+        XCTAssertEqual(usbDest, driveRoot + "/Big Shader Game")
+        let driveTransfer = DriveCopy.transferFiles(archive: archive, name: "Big Shader Game", titleID: titleID, destination: usbDest)
+        try DriveCopy.copy(archive: archive, files: driveTransfer.sizes, origins: driveTransfer.origins,
+                           to: usbDest, name: "Big Shader Game", titleID: titleID, progress: { _, _ in })
+        XCTAssertEqual(try String(contentsOfFile: usbDest + "/Big Shader Game.img", encoding: .utf8), "ROMFS")
+        XCTAssertFalse(fm.fileExists(atPath: usbDest + "/msl"))
+    }
+
+    @MainActor func testSelectGamesBatchSendAndBatchDriveCopy() throws {
+        let idA = "0100000000010000", idB = "0100000000020000"
+        let archA = path("archA/Alpha"), archB = path("archB/Beta")
+        try write(archA + "/Alpha.img", "GAME-A")
+        try write(archB + "/Beta.img", "GAME-B-DATA")
+
+        let shellRoot = path("shell-batch")
+        testDefaults.set(shellRoot, forKey: "shellRoot")
+        let mirrorA = URL(fileURLWithPath: ShellInstall.mirroredFramework(root: shellRoot, titleID: idA))
+        try fm.createDirectory(at: mirrorA.appendingPathComponent("msl/b-1"), withIntermediateDirectories: true)
+        try Data("EXT-SHADER".utf8).write(to: mirrorA.appendingPathComponent("msl/b-1/s.img"))
+
+        let stores = LauncherStores(defaults: testDefaults)
+        let model = stores.build
+        model.target = BuildTarget.ios
+        stores.deviceStore.exportIPA = true
+        stores.deviceStore.installDevice = "DEV-1"
+        stores.deviceStore.devices = [AppleDevice(id: "DEV-1", name: "iPhone", model: "iPhone", os: "27.0", reachable: true, transport: "wired")]
+        let driveRoot = path("usb-batch")
+        try fm.createDirectory(atPath: driveRoot, withIntermediateDirectories: true)
+        stores.deviceStore.driveFolder = driveRoot
+        model.exportedIPAPath = path("NX2Apple.ipa")
+        try write(model.exportedIPAPath, "ipa")
+        model.sharedAppDataSources = {
+            [
+                TransferSource(titleID: idA, name: "Alpha", archive: archA),
+                TransferSource(titleID: idB, name: "Beta", archive: archB),
+            ]
+        }
+
+        // Only checked game B goes into the device transfer queue when B alone is selected.
+        let mockTransfers = TransferQueueStore(file: nil, perform: { _, _, _ in })
+        model.transfers = mockTransfers
+        model.sendSelectedGameData(titleIDs: [idB])
+        XCTAssertEqual(mockTransfers.entries.map(\.titleID), [idB])
+
+        // Batch drive copy copies both A (using trailer-based archive image only, no msl/) and B sequentially.
+        XCTAssertEqual(model.transferSourceBytes(TransferSource(titleID: idA, name: "Alpha", archive: archA)), 6)
+        model.copySelectedToDrive(titleIDs: [idA, idB])
+        let copiedDone = expectation(description: "batch drive copy finished")
+        var cancellable: AnyCancellable?
+        cancellable = model.$send.sink { state in
+            if case .copied = state { copiedDone.fulfill() }
+        }
+        wait(for: [copiedDone], timeout: 10)
+        _ = cancellable
+        XCTAssertEqual(try String(contentsOfFile: driveRoot + "/Alpha/Alpha.img", encoding: .utf8), "GAME-A")
+        XCTAssertFalse(fm.fileExists(atPath: driveRoot + "/Alpha/msl"))
+        XCTAssertEqual(try String(contentsOfFile: driveRoot + "/Beta/Beta.img", encoding: .utf8), "GAME-B-DATA")
     }
 }

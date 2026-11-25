@@ -8,12 +8,14 @@ from typing import TYPE_CHECKING
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QApplication,
     QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
@@ -197,7 +199,7 @@ class DeleteGameDialog(QDialog):
         self.setMinimumSize(520, 380)
         self.setStyleSheet(style.STYLESHEET)
 
-        self.plan = lib.GameDeletionPlan.plan(game, measure=True)
+        self.plan = lib.GameDeletionPlan.plan(game, measure=True, shell_root=self.m.shell_cache_path)
         self.delete_saves = False
 
         lay = QVBoxLayout(self)
@@ -242,7 +244,16 @@ class DeleteGameDialog(QDialog):
                 rl.setContentsMargins(18, 12, 18, 12)
                 t_lbl = QLabel(part_labels.get(it.kind, it.kind))
                 t_lbl.setObjectName('rowTitle')
-                rl.addWidget(t_lbl, 1)
+                if it.kind == 'shellFramework':
+                    title_col = QVBoxLayout()
+                    title_col.addWidget(t_lbl)
+                    detail = QLabel(self.m.t('delete.part.shellFrameworkNote'))
+                    detail.setObjectName('muted')
+                    detail.setWordWrap(True)
+                    title_col.addWidget(detail)
+                    rl.addLayout(title_col, 1)
+                else:
+                    rl.addWidget(t_lbl, 1)
                 s_lbl = QLabel(lib.format_bytes(it.bytes))
                 s_lbl.setObjectName('mono')
                 rl.addWidget(s_lbl)
@@ -498,33 +509,59 @@ class OnboardingDialog(QDialog):
         super().__init__(parent)
         self.m = model
         self.step = 0
-        self.setWindowTitle('NX2Apple Setup')
+        self._step1_sig: tuple | None = None
+        self._step1_widgets: dict = {}
+        self.setWindowTitle(self.m.t('onboarding.welcome.title'))
         self.setMinimumSize(640, 480)
+        self.resize(640, 560)
         self.setStyleSheet(style.STYLESHEET)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(32, 28, 32, 24)
         lay.setSpacing(16)
 
+        top_row = QHBoxLayout()
         self.step_badge = QLabel('')
         self.step_badge.setObjectName('muted')
-        lay.addWidget(self.step_badge)
+        top_row.addWidget(self.step_badge)
+        top_row.addStretch(1)
+        self.task_pill = QLabel('')
+        self.task_pill.setStyleSheet(
+            f'color: {style.ACCENT}; background: rgba(255, 240, 214, 0.10); '
+            'border: 1px solid rgba(255, 240, 214, 0.22); border-radius: 10px; '
+            'padding: 3px 10px; font-size: 11.5px; font-weight: 600;'
+        )
+        self.task_pill.hide()
+        top_row.addWidget(self.task_pill)
+        lay.addLayout(top_row)
 
         self.head_title = QLabel('')
         self.head_title.setStyleSheet('font-size: 28px; font-weight: 800;')
         self.head_title.setWordWrap(True)
         lay.addWidget(self.head_title)
 
+        note_row = QHBoxLayout()
         self.head_note = QLabel('')
         self.head_note.setObjectName('pageNote')
         self.head_note.setWordWrap(True)
-        lay.addWidget(self.head_note)
+        note_row.addWidget(self.head_note, 1)
+        self.overall_pct_lbl = QLabel('')
+        self.overall_pct_lbl.setObjectName('mono')
+        self.overall_pct_lbl.setStyleSheet(f'color: {style.ACCENT}; font-size: 12px; font-weight: 700;')
+        self.overall_pct_lbl.hide()
+        note_row.addWidget(self.overall_pct_lbl)
+        lay.addLayout(note_row)
 
+        self.body_scroll = QScrollArea()
+        self.body_scroll.setWidgetResizable(True)
+        self.body_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.body_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.body_host = QWidget()
         self.body_layout = QVBoxLayout(self.body_host)
         self.body_layout.setContentsMargins(0, 8, 0, 8)
         self.body_layout.setSpacing(12)
-        lay.addWidget(self.body_host, 1)
+        self.body_scroll.setWidget(self.body_host)
+        lay.addWidget(self.body_scroll, 1)
 
         foot = QHBoxLayout()
         self.later_btn = QPushButton(self.m.t('onboarding.later'))
@@ -547,22 +584,70 @@ class OnboardingDialog(QDialog):
         self.m.repoChanged.connect(self._render_step)
         self._render_step()
 
+    def done(self, result: int) -> None:
+        try:
+            self.m.depsChanged.disconnect(self._render_step)
+        except (RuntimeError, TypeError):
+            pass
+        try:
+            self.m.repoChanged.disconnect(self._render_step)
+        except (RuntimeError, TypeError):
+            pass
+        super().done(result)
+
     def _on_later(self) -> None:
         self.m.settings_set('onboardingComplete', True)
         self.reject()
 
     def _clear_body(self) -> None:
+        self._step1_sig = None
+        self._step1_widgets = {}
         while self.body_layout.count():
             it = self.body_layout.takeAt(0)
-            if it.widget():
-                it.widget().deleteLater()
+            w = it.widget()
+            if w is not None:
+                w.hide()
+                w.deleteLater()
+
+    def _step1_row_meta(self, d, llvm_dep, any_busy: bool) -> tuple[str, str, str, str, str, int | None]:
+        """Compute (dot_color, status_text, status_color, detail_text, detail_color, pct) for step 2."""
+        if d.ok:
+            return (style.GREEN, self.m.t('onboarding.ready'), style.GREEN, '', '', None)
+        if getattr(d, 'installing', False):
+            stage = getattr(d, 'install_stage', '') or self.m.t('dep.installing')
+            detail = getattr(d, 'install_detail', '')
+            pct_raw = getattr(d, 'install_pct', None)
+            pct = max(0, min(100, int(pct_raw))) if pct_raw is not None else 0
+            return (style.AMBER, stage, style.ACCENT, detail, style.MUTED, pct)
+        if d.id == 'lld' and llvm_dep is not None and not llvm_dep.ok:
+            if getattr(llvm_dep, 'installing', False):
+                return (style.AMBER, self.m.t('onboarding.progress.waitingLlvm'), style.MUTED, '', '', None)
+            if getattr(llvm_dep, 'queue_index', 0) > 0 or any_busy:
+                return (style.NEUTRAL_DOT, self.m.t('onboarding.progress.withLlvm'), style.MUTED, '', '', None)
+        q_idx = int(getattr(d, 'queue_index', 0) or 0)
+        if q_idx > 0:
+            return (style.NEUTRAL_DOT, self.m.t('onboarding.progress.queuePos', q_idx), style.MUTED, '', '', None)
+        dot = style.AMBER if not d.required else style.RED
+        err = getattr(d, 'last_error', '')
+        fix = getattr(d, 'fix_hint', '')
+        detail = (err + (' — ' + self.m.t(fix) if fix else '')) if err else ''
+        return (dot, self.m.t('onboarding.failed'), '', detail, style.AMBER if detail else '', None)
 
     def _render_step(self) -> None:
-        self._clear_body()
         self.step_badge.setText(self.m.t('onboarding.stepCount', self.step + 1, 4))
         self.back_btn.setVisible(self.step > 0)
+        any_busy = (
+            any(getattr(d, 'installing', False) for d in self.m.deps)
+            or bool(getattr(self.m, '_install_all_running', False))
+        )
+        if self.step != 1:
+            self.task_pill.hide()
+            self.overall_pct_lbl.hide()
+            self.next_btn.setEnabled(True)
+            self.back_btn.setEnabled(True)
 
         if self.step == 0:
+            self._clear_body()
             self.head_title.setText(self.m.t('onboarding.welcome.title'))
             self.head_note.setText(self.m.t('onboarding.welcome.note'))
             self.next_btn.setText(self.m.t('onboarding.start'))
@@ -603,30 +688,141 @@ class OnboardingDialog(QDialog):
             self.head_title.setText(self.m.t('onboarding.background.title'))
             self.head_note.setText(self.m.t('dep.title'))
             self.next_btn.setText(self.m.t('onboarding.continue'))
+            self.next_btn.setEnabled(not any_busy)
+            self.back_btn.setEnabled(not any_busy)
+
+            active_dep = next((x for x in self.m.deps if getattr(x, 'installing', False)), None)
+            if getattr(self.m, '_install_all_running', False) and getattr(self.m, 'install_all_total', 0) > 0:
+                curr_step = max(1, int(self.m.install_all_step or 1))
+                total_tasks = max(curr_step, int(self.m.install_all_total or 1))
+                overall_pct = max(0, min(100, int(getattr(self.m, 'install_all_pct', 0) or 0)))
+            elif any_busy:
+                curr_step = 1
+                total_tasks = 1
+                overall_pct = max(0, min(100, int(getattr(active_dep, 'install_pct', 0) or 0)))
+            else:
+                curr_step = total_tasks = overall_pct = 0
+
+            if any_busy:
+                self.task_pill.setText(self.m.t('onboarding.progress.taskBadge', curr_step, total_tasks))
+                self.task_pill.show()
+                self.overall_pct_lbl.setText(self.m.t('onboarding.progress.overallPct', overall_pct))
+                self.overall_pct_lbl.show()
+            else:
+                self.task_pill.hide()
+                self.overall_pct_lbl.hide()
+
+            visible_deps = list(self.m.deps)
+
+            llvm_dep = next((x for x in self.m.deps if x.id == 'llvm'), None)
+            metas = [self._step1_row_meta(d, llvm_dep, any_busy) for d in visible_deps]
+            show_ibtn = any_busy or any(not d.ok and d.install for d in self.m.deps)
+            if any_busy:
+                active_stage = (
+                    (getattr(active_dep, 'install_stage', '') if active_dep else '')
+                    or self.m.t('dep.installing')
+                )
+                ibtn_text = self.m.t('onboarding.progress.installingBtn', curr_step, total_tasks, active_stage)
+            else:
+                ibtn_text = self.m.t('dep.installAll')
+
+            sig = (
+                1,
+                any_busy,
+                show_ibtn,
+                tuple(
+                    (d.id, m[0], bool(m[3]), m[5] is not None)
+                    for d, m in zip(visible_deps, metas)
+                ),
+            )
+            if sig == self._step1_sig and self._step1_widgets:
+                row_map = self._step1_widgets.get('rows', {})
+                for d, meta in zip(visible_deps, metas):
+                    w = row_map.get(d.id)
+                    if not w:
+                        continue
+                    _dot, st_text, st_color, dt_text, dt_color, pct_val = meta
+                    w['status'].setText(st_text)
+                    w['status'].setStyleSheet(
+                        f'color: {st_color}; font-size: 12px; font-weight: 600;' if st_color else ''
+                    )
+                    if w.get('detail') is not None and dt_text:
+                        w['detail'].setText(dt_text)
+                        w['detail'].setStyleSheet(f'color: {dt_color}; font-size: 11.5px;' if dt_color else '')
+                    if w.get('bar') is not None and pct_val is not None:
+                        w['bar'].setValue(pct_val)
+                ibtn_w = self._step1_widgets.get('ibtn')
+                if ibtn_w is not None:
+                    ibtn_w.setText(ibtn_text)
+                    ibtn_w.setEnabled(not any_busy)
+                return
+
+            self._clear_body()
+            self._step1_sig = sig
+            row_widgets: dict = {}
 
             grp = CardGroup()
-            for idx, d in enumerate(self.m.deps[:5]):
+            for idx, (d, meta) in enumerate(zip(visible_deps, metas)):
                 if idx > 0:
                     grp.add_divider()
+                dot_color, st_text, st_color, dt_text, dt_color, pct_val = meta
                 r = QWidget()
-                rl = QHBoxLayout(r)
-                rl.setContentsMargins(18, 10, 18, 10)
-                rl.addWidget(StatusDot(style.GREEN if d.ok else (style.AMBER if not d.required else style.RED)))
+                v = QVBoxLayout(r)
+                v.setContentsMargins(18, 10, 18, 10)
+                v.setSpacing(6)
+
+                rl = QHBoxLayout()
+                rl.setSpacing(10)
+                dot_w = StatusDot(dot_color)
+                rl.addWidget(dot_w)
                 tl = QLabel(self.m.t(d.title_key))
                 tl.setObjectName('rowTitle')
                 rl.addWidget(tl, 1)
-                st = QLabel(self.m.t('onboarding.ready') if d.ok else self.m.t('onboarding.failed'))
+                st = QLabel(st_text)
                 st.setObjectName('muted')
+                if st_color:
+                    st.setStyleSheet(f'color: {st_color}; font-size: 12px; font-weight: 600;')
                 rl.addWidget(st)
+                v.addLayout(rl)
+
+                dl = None
+                if dt_text:
+                    dl_wrap = QHBoxLayout()
+                    dl_wrap.setContentsMargins(18, 0, 0, 2)
+                    dl = QLabel(dt_text)
+                    dl.setObjectName('mono')
+                    dl.setWordWrap(True)
+                    if dt_color:
+                        dl.setStyleSheet(f'color: {dt_color}; font-size: 11.5px;')
+                    dl_wrap.addWidget(dl)
+                    v.addLayout(dl_wrap)
+
+                bar = None
+                if pct_val is not None:
+                    bar_wrap = QHBoxLayout()
+                    bar_wrap.setContentsMargins(18, 2, 0, 2)
+                    bar = QProgressBar()
+                    bar.setRange(0, 100)
+                    bar.setValue(pct_val)
+                    bar.setTextVisible(False)
+                    bar_wrap.addWidget(bar)
+                    v.addLayout(bar_wrap)
+
+                row_widgets[d.id] = {'dot': dot_w, 'title': tl, 'status': st, 'detail': dl, 'bar': bar}
                 grp.add_row(r)
             self.body_layout.addWidget(grp)
 
-            if any(not d.ok and d.install for d in self.m.deps):
-                ibtn = QPushButton(self.m.t('dep.installAll'))
+            ibtn = None
+            if show_ibtn:
+                ibtn = QPushButton(ibtn_text)
+                ibtn.setEnabled(not any_busy)
                 ibtn.clicked.connect(self.m.install_all_missing)
                 self.body_layout.addWidget(ibtn)
 
+            self._step1_widgets = {'rows': row_widgets, 'ibtn': ibtn}
+
         elif self.step == 2:
+            self._clear_body()
             self.head_title.setText(self.m.t('onboarding.keys.title'))
             self.head_note.setText(self.m.t('onboarding.keys.note'))
             self.next_btn.setText(self.m.t('onboarding.continue'))
@@ -653,6 +849,7 @@ class OnboardingDialog(QDialog):
             self.body_layout.addWidget(grp)
 
         elif self.step == 3:
+            self._clear_body()
             self.head_title.setText(self.m.t('onboarding.games.title'))
             self.head_note.setText(self.m.t('onboarding.games.note'))
             self.next_btn.setText(self.m.t('onboarding.openLibrary'))
@@ -678,6 +875,29 @@ class OnboardingDialog(QDialog):
             self.body_layout.addWidget(grp)
 
         self.body_layout.addStretch(1)
+        self._fit_dialog_height()
+
+    def _fit_dialog_height(self) -> None:
+        if self.body_host.isVisible():
+            for i in range(self.body_layout.count()):
+                w = self.body_layout.itemAt(i).widget()
+                if w is not None:
+                    w.show()
+        self.body_layout.activate()
+        scr = self.screen() or QApplication.primaryScreen()
+        max_h = int(scr.availableGeometry().height() * 0.9) if scr is not None else 720
+        avail_w = max(self.body_host.width(), self.width() - 64, 520)
+        body_h = self.body_host.heightForWidth(avail_w)
+        if body_h <= 0:
+            body_h = self.body_host.sizeHint().height()
+        chrome_h = self.height() - self.body_scroll.height()
+        if chrome_h < 180:
+            chrome_h = 220
+        target_h = min(max_h, max(self.height(), chrome_h + body_h + 8))
+        if target_h > self.height() and target_h >= self.minimumHeight():
+            self.resize(self.width(), target_h)
+        elif self.height() > max_h and max_h >= self.minimumHeight():
+            self.resize(self.width(), max_h)
 
     def _pick_keys(self) -> None:
         f, _ = QFileDialog.getOpenFileName(self, self.m.t('data.keys'), '', 'Keys (prod.keys *.keys *);;All files (*)')
@@ -707,3 +927,348 @@ class OnboardingDialog(QDialog):
         else:
             self.m.settings_set('onboardingComplete', True)
             self.accept()
+
+
+class DefenderPromptDialog(QDialog):
+    """Confirmation dialog showing the exact folders, toolchain binaries, and security note before UAC."""
+
+    def __init__(
+        self,
+        model: 'Model',
+        *,
+        title_id: str | None = None,
+        mode: str = 'build',
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.m = model
+        self.title_id = title_id
+        self.mode = mode
+        self.choice = 'cancel'
+        is_remove = mode == 'remove'
+        title_key = 'defender.removePrompt.title' if is_remove else 'defender.prompt.title'
+        body_key = 'defender.removePrompt.body' if is_remove else 'defender.prompt.body'
+        self.setWindowTitle(self.m.t(title_key))
+        self.setMinimumSize(620, 440)
+        self.setStyleSheet(style.STYLESHEET)
+
+        if is_remove:
+            rec_fn = getattr(self.m, 'defender_recorded_info', None)
+            if callable(rec_fn):
+                folders, procs = rec_fn()
+            else:
+                folders, procs = [], []
+            if not folders and not procs:
+                _state, folders, procs = self.m.defender_info(title_id=title_id)
+        else:
+            _state, folders, procs = self.m.defender_info(title_id=title_id)
+        self.folders = list(folders)
+        self.procs = list(procs)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(28, 24, 28, 22)
+        lay.setSpacing(14)
+
+        title = QLabel(self.m.t(title_key))
+        title.setStyleSheet('font-size: 22px; font-weight: 800;')
+        title.setWordWrap(True)
+        lay.addWidget(title)
+
+        body = QLabel(self.m.t(body_key))
+        body.setObjectName('muted')
+        body.setWordWrap(True)
+        lay.addWidget(body)
+
+        grp = CardGroup()
+        r_dirs = QWidget()
+        v_dirs = QVBoxLayout(r_dirs)
+        v_dirs.setContentsMargins(18, 12, 18, 12)
+        v_dirs.setSpacing(4)
+        fh = QLabel(self.m.t('defender.prompt.foldersHeader'))
+        fh.setObjectName('rowTitle')
+        v_dirs.addWidget(fh)
+        dir_scroll = QScrollArea()
+        dir_scroll.setWidgetResizable(True)
+        dir_scroll.setFrameShape(QFrame.NoFrame)
+        dir_scroll.setStyleSheet('background: transparent; border: none;')
+        dir_scroll.setMaximumHeight(110)
+        dir_host = QWidget()
+        dir_host.setStyleSheet('background: transparent;')
+        dir_host_lay = QVBoxLayout(dir_host)
+        dir_host_lay.setContentsMargins(0, 0, 4, 0)
+        dir_host_lay.setSpacing(2)
+        self.folder_list_lbl = QLabel('\n'.join(f'• {f}' for f in self.folders))
+        self.folder_list_lbl.setObjectName('mono')
+        self.folder_list_lbl.setWordWrap(True)
+        dir_host_lay.addWidget(self.folder_list_lbl)
+        dir_scroll.setWidget(dir_host)
+        v_dirs.addWidget(dir_scroll)
+        grp.add_row(r_dirs)
+        grp.add_divider()
+
+        r_procs = QWidget()
+        v_procs = QVBoxLayout(r_procs)
+        v_procs.setContentsMargins(18, 12, 18, 12)
+        v_procs.setSpacing(4)
+        ph = QLabel(self.m.t('defender.prompt.procsHeader'))
+        ph.setObjectName('rowTitle')
+        v_procs.addWidget(ph)
+        proc_scroll = QScrollArea()
+        proc_scroll.setWidgetResizable(True)
+        proc_scroll.setFrameShape(QFrame.NoFrame)
+        proc_scroll.setStyleSheet('background: transparent; border: none;')
+        proc_scroll.setMaximumHeight(110)
+        proc_host = QWidget()
+        proc_host.setStyleSheet('background: transparent;')
+        proc_host_lay = QVBoxLayout(proc_host)
+        proc_host_lay.setContentsMargins(0, 0, 4, 0)
+        proc_host_lay.setSpacing(2)
+        self.proc_list_lbl = QLabel('\n'.join(f'• {p}' for p in self.procs))
+        self.proc_list_lbl.setObjectName('mono')
+        self.proc_list_lbl.setWordWrap(True)
+        proc_host_lay.addWidget(self.proc_list_lbl)
+        proc_scroll.setWidget(proc_host)
+        v_procs.addWidget(proc_scroll)
+        grp.add_row(r_procs)
+        grp.add_divider()
+
+        r_sec = QWidget()
+        v_sec = QVBoxLayout(r_sec)
+        v_sec.setContentsMargins(18, 10, 18, 10)
+        v_sec.setSpacing(2)
+        self.security_note_lbl = QLabel(self.m.t('defender.prompt.securityNote'))
+        self.security_note_lbl.setObjectName('muted')
+        self.security_note_lbl.setWordWrap(True)
+        v_sec.addWidget(self.security_note_lbl)
+        grp.add_row(r_sec)
+        lay.addWidget(grp)
+
+        dont_ask_row = QHBoxLayout()
+        dont_ask_row.setContentsMargins(2, 2, 2, 0)
+        dont_ask_row.setSpacing(10)
+        self.dont_ask_switch = LauncherSwitch(False)
+        dont_ask_row.addWidget(self.dont_ask_switch)
+        self.dont_ask_lbl = QLabel(self.m.t('defender.prompt.dontAskAgain'))
+        self.dont_ask_lbl.setObjectName('muted')
+        self.dont_ask_lbl.setWordWrap(True)
+        dont_ask_row.addWidget(self.dont_ask_lbl, 1)
+        if mode in ('manual', 'remove'):
+            self.dont_ask_switch.hide()
+            self.dont_ask_lbl.hide()
+        lay.addLayout(dont_ask_row)
+
+        lay.addStretch(1)
+
+        foot = QHBoxLayout()
+        foot.setSpacing(10)
+        foot.addStretch(1)
+
+        skip_label = self.m.t('fail.confirm.cancel' if mode in ('manual', 'remove') else 'defender.prompt.skipOnce')
+        self.skip_btn = QPushButton(skip_label.replace('&', '&&'))
+        self.skip_btn.clicked.connect(self._on_cancel if mode in ('manual', 'remove') else self._on_skip)
+        foot.addWidget(self.skip_btn)
+
+        if is_remove:
+            add_label = self.m.t('defender.removePrompt.confirm')
+        elif mode == 'manual':
+            add_label = self.m.t('defender.prompt.confirmApply')
+        else:
+            add_label = self.m.t('defender.prompt.addAndBuild')
+        self.add_btn = QPushButton(add_label.replace('&', '&&'))
+        self.add_btn.setObjectName('danger' if is_remove else 'creamPill')
+        self.add_btn.clicked.connect(self._on_remove if is_remove else self._on_add)
+        foot.addWidget(self.add_btn)
+        lay.addLayout(foot)
+
+        lay.activate()
+        hint_h = max(480, self.sizeHint().height() + 12)
+        self.resize(680, hint_h)
+
+    def _save_dont_ask(self) -> None:
+        if self.mode == 'build' and self.dont_ask_switch.isChecked():
+            self.m.settings_set('defenderPromptDismissed', True)
+
+    def _on_cancel(self) -> None:
+        self.choice = 'cancel'
+        self.reject()
+
+    def _on_skip(self) -> None:
+        self._save_dont_ask()
+        self.choice = 'skip'
+        self.accept()
+
+    def _on_add(self) -> None:
+        self._save_dont_ask()
+        self.choice = 'add'
+        self.accept()
+
+    def _on_remove(self) -> None:
+        self.choice = 'remove'
+        self.accept()
+
+
+class DriveSelectDialog(QDialog):
+    """Multi-game checklist dialog for copying packed game data to an external drive (#1080)."""
+
+    def __init__(
+        self,
+        model: 'Model',
+        dest_root: str,
+        sources: list[tuple[str, str, str, int]],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.m = model
+        self.dest_root = dest_root
+        self.sources = list(sources)
+        self.selected_ids: set[str] = {tid.upper() for tid, _name, _arch, _sz in self.sources}
+        self._switches: dict[str, LauncherSwitch] = {}
+
+        self.setWindowTitle(self.m.t('shell.selectGamesTitle'))
+        self.setMinimumSize(620, 440)
+        self.setStyleSheet(style.STYLESHEET)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(26, 24, 26, 20)
+        lay.setSpacing(14)
+
+        head = QHBoxLayout()
+        head_col = QVBoxLayout()
+        head_col.setSpacing(4)
+        title = QLabel(self.m.t('shell.selectGamesTitle'))
+        title.setStyleSheet('font-size: 22px; font-weight: 800;')
+        note = QLabel(self.m.t('shell.selectGamesDriveNote'))
+        note.setObjectName('muted')
+        note.setWordWrap(True)
+        head_col.addWidget(title)
+        head_col.addWidget(note)
+        head.addLayout(head_col, 1)
+
+        self.toggle_all_btn = QPushButton('')
+        self.toggle_all_btn.clicked.connect(self._on_toggle_all)
+        head.addWidget(self.toggle_all_btn)
+        lay.addLayout(head)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        body = QWidget()
+        body_lay = QVBoxLayout(body)
+        body_lay.setContentsMargins(0, 0, 0, 0)
+        body_lay.setSpacing(0)
+
+        group = CardGroup()
+        for idx, (tid, name, _arch, total_bytes) in enumerate(self.sources):
+            if idx > 0:
+                group.add_divider()
+            row = QWidget()
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(18, 12, 18, 12)
+            rl.setSpacing(12)
+
+            sw = LauncherSwitch(checked=True)
+            sw.toggled.connect(lambda checked, key=tid.upper(): self._on_item_toggled(key, checked))
+            self._switches[tid.upper()] = sw
+            rl.addWidget(sw)
+
+            col = QVBoxLayout()
+            col.setSpacing(2)
+            g_lbl = QLabel(name)
+            g_lbl.setObjectName('rowTitle')
+            tid_lbl = QLabel(tid.upper())
+            tid_lbl.setObjectName('mono')
+            col.addWidget(g_lbl)
+            col.addWidget(tid_lbl)
+            rl.addLayout(col, 1)
+
+            sz_lbl = QLabel(lib.format_bytes(total_bytes))
+            sz_lbl.setObjectName('muted')
+            rl.addWidget(sz_lbl)
+            group.add_row(row)
+
+        body_lay.addWidget(group)
+        body_lay.addStretch(1)
+        scroll.setWidget(body)
+        lay.addWidget(scroll, 1)
+
+        self.space_lbl = QLabel('')
+        self.space_lbl.setWordWrap(True)
+        lay.addWidget(self.space_lbl)
+
+        foot = QHBoxLayout()
+        foot.addStretch(1)
+        self.cancel_btn = QPushButton(self.m.t('saves.cancel'))
+        self.cancel_btn.clicked.connect(self.reject)
+        foot.addWidget(self.cancel_btn)
+
+        self.confirm_btn = QPushButton(self.m.t('shell.copySelectedConfirm'))
+        self.confirm_btn.setObjectName('creamPill')
+        self.confirm_btn.clicked.connect(self.accept)
+        foot.addWidget(self.confirm_btn)
+        lay.addLayout(foot)
+
+        self._refresh_state()
+
+    def chosen_items(self) -> list[tuple[str, str]]:
+        return [
+            (tid.upper(), arch)
+            for tid, _name, arch, _sz in self.sources
+            if tid.upper() in self.selected_ids
+        ]
+
+    def _on_item_toggled(self, tid: str, checked: bool) -> None:
+        if checked:
+            self.selected_ids.add(tid)
+        else:
+            self.selected_ids.discard(tid)
+        self._refresh_state()
+
+    def _on_toggle_all(self) -> None:
+        select_all = len(self.selected_ids) < len(self.sources)
+        self.selected_ids = (
+            {tid.upper() for tid, _n, _a, _s in self.sources} if select_all else set()
+        )
+        for tid, sw in self._switches.items():
+            sw.blockSignals(True)
+            sw.setChecked(tid in self.selected_ids)
+            sw.blockSignals(False)
+            sw.update()
+        self._refresh_state()
+
+    def _refresh_state(self) -> None:
+        all_on = bool(self.sources) and len(self.selected_ids) == len(self.sources)
+        self.toggle_all_btn.setText(
+            self.m.t('shell.clearSelection' if all_on else 'shell.selectAll')
+        )
+        chosen = self.chosen_items()
+        if not chosen:
+            self.space_lbl.setText('')
+            self.confirm_btn.setEnabled(False)
+            return
+        needed, err = lib.DriveCopy.preflight_batch_copy(
+            chosen,
+            self.dest_root,
+            shell_root=self.m.shell_cache_path,
+            t_func=self.m.t,
+        )
+        if err is not None:
+            self.space_lbl.setStyleSheet(f'color: {style.DANGER}; font-size: 9.5pt;')
+            self.space_lbl.setText(err)
+            self.confirm_btn.setEnabled(False)
+            return
+        free = lib.DriveCopy.free_space(self.dest_root)
+        fs_name = lib.DriveCopy.filesystem_type(self.dest_root).upper() or 'DISK'
+        self.space_lbl.setStyleSheet('')
+        self.space_lbl.setObjectName('muted')
+        self.space_lbl.style().unpolish(self.space_lbl)
+        self.space_lbl.style().polish(self.space_lbl)
+        self.space_lbl.setText(
+            self.m.t(
+                'shell.driveNote',
+                lib.format_bytes(needed),
+                lib.format_bytes(free),
+                fs_name,
+                self.m.t('ios.ui.gameData'),
+            )
+        )
+        self.confirm_btn.setEnabled(True)

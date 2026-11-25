@@ -1,0 +1,355 @@
+import AppKit
+import SwiftUI
+import NXCore
+import NXModel
+import NXLauncher
+
+private struct HeroGlassButtonStyle: ButtonStyle {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.96 : 1)
+            .brightness(configuration.isPressed ? 0.08 : 0)
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
+
+/// The hero primary action and Mac / device launch lifecycle tracking.
+extension LauncherView {
+    static func needsImmediateGatekeeperHint(for game: LibraryGame) -> Bool {
+        game.isReady && game.lastPlayed == nil
+    }
+
+    func isLaunchingMacGame(_ game: LibraryGame) -> Bool {
+        launching && game.primary == .play && (launchingGameID == nil || launchingGameID == game.id)
+    }
+
+    struct HeroPrimaryDescriptor {
+        let title: String
+        let symbol: String
+        let enabled: Bool
+    }
+
+    static func heroPrimaryDescriptor(
+        for game: LibraryGame,
+        macStarting: Bool,
+        launching: Bool,
+        running: Bool,
+        isBuilding: Bool,
+        isQueued: Bool,
+        canEnqueue: Bool,
+        deviceName: @autoclosure () -> String,
+        t: (String) -> String
+    ) -> HeroPrimaryDescriptor {
+        if macStarting {
+            return HeroPrimaryDescriptor(title: t("library.launching"), symbol: "play.fill", enabled: false)
+        }
+        switch game.primary {
+        case .play:
+            return HeroPrimaryDescriptor(title: t("library.play"), symbol: "play.fill", enabled: !launching)
+        case .openOnDevice:
+            return HeroPrimaryDescriptor(
+                title: String(format: t("dev.open"), deviceName()),
+                symbol: "iphone",
+                enabled: !launching
+            )
+        case .build:
+            if isBuilding {
+                return HeroPrimaryDescriptor(title: t("library.building"), symbol: "hammer.fill", enabled: false)
+            }
+            if isQueued {
+                return HeroPrimaryDescriptor(title: t("library.queued"), symbol: "hammer.fill", enabled: false)
+            }
+            if running {
+                let queueable = game.hasQueueableSources && canEnqueue
+                return HeroPrimaryDescriptor(
+                    title: t(queueable ? "library.addToBuildQueue" : "library.setUpBuild"),
+                    symbol: "hammer.fill",
+                    enabled: !launching && queueable
+                )
+            }
+            return HeroPrimaryDescriptor(title: t("library.setUpBuild"), symbol: "hammer.fill", enabled: !launching)
+        }
+    }
+
+    func heroPrimaryDescriptor(for game: LibraryGame) -> HeroPrimaryDescriptor {
+        Self.heroPrimaryDescriptor(
+            for: game,
+            macStarting: isLaunchingMacGame(game),
+            launching: launching,
+            running: m.running,
+            isBuilding: isBuildingGame(game),
+            isQueued: isQueuedGame(game),
+            canEnqueue: buildQueue.canEnqueue(game.titleID, target: effectiveLibraryQueueTarget(for: game)),
+            deviceName: devices.deviceName(game.installedDevice),
+            t: loc.t
+        )
+    }
+
+    @ViewBuilder func heroPrimary(_ game: LibraryGame) -> some View {
+        let macStarting = isLaunchingMacGame(game)
+        let descriptor = heroPrimaryDescriptor(for: game)
+        let actionEnabled = descriptor.enabled && artworkEditor == nil
+        let button = Button { primaryAction(game) } label: {
+            LauncherHeroActionLabel(title: descriptor.title, symbol: descriptor.symbol, loading: macStarting)
+        }
+        .buttonStyle(LauncherActionButtonStyle()).fixedSize(horizontal: false, vertical: true).launcherHover(enabled: actionEnabled)
+        .disabled(!actionEnabled)
+        .keyboardShortcut(keyboardCard == nil && libraryInputAvailable && actionEnabled ? KeyboardShortcut(.return, modifiers: []) : nil)
+        .padTarget("hero.play", scope: "main", focusColor: LauncherPalette.onCream, enabled: actionEnabled) {
+            if !profileHelpOpen && actionEnabled { primaryAction(game) }
+        }
+        button.id(game.id)
+    }
+
+    func heroActions(_ game: LibraryGame, compact: Bool) -> some View {
+        let showsRefresh = !(m.running && activeBuildID == game.id) && gameNeedsRefresh(game)
+        return LauncherGlassGroup(spacing: 12) {   // the hero's glass buttons blend as one group
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 12) {
+                    heroPrimary(game)
+                    heroEngineMenu(game)
+                    if showsRefresh { heroSingleRefreshButton(game, compact: compact) }
+                    heroDeviceActions(game)
+                    heroManage(game)
+                }.fixedSize(horizontal: true, vertical: false)
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(spacing: 12) { heroPrimary(game); heroEngineMenu(game); heroManage(game) }
+                    if showsRefresh { heroSingleRefreshButton(game, compact: compact) }
+                    heroDeviceActions(game)
+                }
+            }
+        }
+        .launcherGlassLayer()   // the hero's actions float over its artwork: glass (#1458)
+    }
+
+    private func heroManage(_ game: LibraryGame) -> some View {
+        heroUtilityButton("ellipsis", label: loc.t("library.manage"), id: "hero.manage") { manageOpenFor = game.id }
+            .anchorPreference(key: ManageAnchorKey.self, value: .bounds) { $0 }
+    }
+
+    func heroEngineMenuLabel(title: String, symbol: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: symbol)
+                .font(.system(size: 13.5, weight: .semibold))
+            Text(title)
+                .font(DS.Font.bodyStrong)
+                .lineLimit(1)
+            Image(systemName: "chevron.up.chevron.down")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundStyle(DS.Color.textSecondary)
+        }
+        .foregroundStyle(LauncherPalette.text)
+        .padding(.horizontal, 16)
+        .frame(height: LauncherHeroAction.height)
+        .contentShape(Capsule())
+        .launcherGlass(in: DSPill())
+    }
+
+    func heroUtilityButton(_ symbol: String, label: String, id: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol).font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(LauncherPalette.text)
+                .frame(width: LauncherHeroAction.height, height: LauncherHeroAction.height)
+                .contentShape(Circle())
+                .launcherGlass(in: DSPill())
+        }
+        .buttonStyle(.plain).launcherHover(enabled: artworkEditor == nil).accessibilityLabel(label)
+        .help(label).padTarget(id, scope: "main", activate: action)
+    }
+
+    @ViewBuilder private func heroDeviceActions(_ game: LibraryGame) -> some View {
+        if game.onDevice {
+            HStack(spacing: 12) {
+                if !game.isOlderIOSBuild {
+                    let isResigning = m.running && m.operation?.kind == .renewingSignature
+                    let expiry = signatureExpiry[game.id].map { AppSignature.describe($0, loc.t) } ?? loc.t("dev.expiryUnknown")
+                    heroSecondary(loc.t(isResigning ? "dev.resigning" : "dev.resign"), symbol: "checkmark.seal", id: "hero.resign",
+                                  enabled: !m.running, loading: isResigning,
+                                  help: expiry + "\n" + loc.t("dev.resignHelp")) { resign(game) }
+                }
+                if game.isReady {
+                    heroSecondary(loc.t("dev.openIOS"), symbol: "iphone", id: "hero.device", enabled: !launching,
+                                  help: devices.deviceName(game.installedDevice)) { openOnDevice(game) }
+                }
+            }
+        }
+    }
+
+    private func heroSecondary(_ title: String, symbol: String, id: String, enabled: Bool, loading: Bool = false, help: String,
+                               action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            LauncherHeroActionLabel(title: title, symbol: symbol, loading: loading)
+                .foregroundStyle(LauncherPalette.text)
+                .contentShape(Capsule())
+                .launcherGlass(in: DSPill())
+        }
+        .buttonStyle(HeroGlassButtonStyle()).fixedSize(horizontal: false, vertical: true).disabled(!enabled || artworkEditor != nil)
+        .opacity(loading ? 0.88 : (enabled && artworkEditor == nil ? 1 : 0.45))
+        .launcherHover(enabled: enabled && artworkEditor == nil).help(help)
+        .padTarget(id, scope: "main", enabled: enabled && artworkEditor == nil) { if enabled && artworkEditor == nil { action() } }
+    }
+
+    func openOnDevice(_ game: LibraryGame) {
+        guard !launching else { return }
+        launching = true
+        launchingGameID = game.id
+        showGatekeeperHint = false
+        m.openOnDevice(udid: game.installedDevice, app: game.iosAppPath) { error in
+            endGameLaunch()
+            if let error { launchError = error }
+            else { library.recordPlayed(game.id) }
+        }
+    }
+
+    func beginMacLaunch(_ game: LibraryGame) {
+        launchHintGeneration &+= 1
+        let generation = launchHintGeneration
+        launching = true
+        launchingGameID = game.id
+        if Self.needsImmediateGatekeeperHint(for: game) {
+            showGatekeeperHint = true
+        } else {
+            showGatekeeperHint = false
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 800_000_000)
+                if launching, launchHintGeneration == generation {
+                    showGatekeeperHint = true
+                }
+            }
+        }
+    }
+
+    func endGameLaunch() {
+        launchHintGeneration &+= 1
+        launching = false
+        launchingGameID = nil
+        showGatekeeperHint = false
+    }
+
+    func primaryAction(_ game: LibraryGame) {
+        if game.primary == .openOnDevice {
+            openOnDevice(game)
+            return
+        }
+        guard game.isReady else {
+            guard !isBuildingGame(game), !isQueuedGame(game) else { return }
+            if m.running {
+                guard game.hasQueueableSources,
+                      buildQueue.canEnqueue(game.titleID, target: effectiveLibraryQueueTarget(for: game)) else { return }
+                enqueueBuilds([game])
+                return
+            }
+            configureBuild(game)
+            return
+        }
+        do {
+            _ = try MacGameBundle.read(URL(fileURLWithPath: game.appPath))
+            beginMacLaunch(game)
+            mngMigration.beginIfNeeded(
+                titleID: game.titleID,
+                gameName: game.displayName(loc.lang),
+                appPath: game.appPath,
+                saveSettings: stores.saveSettings,
+                proceed: {
+                    let environment = macEnvironment(game)   // the cloud check of an engine with its own report runs with it (CloudSaveGate)
+                    cloudGate.begin(
+                        game,
+                        environment: environment,
+                        proceed: { startMacGame(game, environment: environment, cloudChoice: $0) },
+                        ended: { endGameLaunch() }
+                    )
+                },
+                cancelled: { endGameLaunch() }
+            )
+        } catch {
+            launchError = error.localizedDescription
+        }
+    }
+
+    private func macEnvironment(_ game: LibraryGame) -> [String: String] {
+        let currentGame = library.games.first(where: { $0.id == game.id }) ?? game
+        return GameStart.environment(
+            for: currentGame,
+            library: library,
+            controls: controls,
+            repo: stores.repo.path,
+            labels: loc.t,
+            lang: loc.lang,
+            player: stores.players.active,
+            saves: (stores.saveSettings.global, stores.saveSettings.game(currentGame.titleID)),
+            sticks: stores.sticks.settings
+        )
+    }
+
+    private func startMacGame(_ game: LibraryGame, environment: [String: String], cloudChoice: [String: String]) {
+        let currentGame = library.games.first(where: { $0.id == game.id }) ?? game
+        let configuration = NSWorkspace.OpenConfiguration()
+        let withRecording = environment
+            .merging(FrameTimes.recordingEnvironment(for: currentGame, library: library.folder)) { $1 }
+            .merging(cloudChoice) { $1 }
+        if !withRecording.isEmpty { configuration.environment = withRecording }
+        let generation = launchHintGeneration
+        MacGameMode.shared.prepareForLaunch(enabled: currentGame.macGameModeDesired, forApp: currentGame.appPath) { error in
+            MainActor.assumeIsolated {
+                guard launchHintGeneration == generation else { return }
+                if let error {
+                    endGameLaunch()
+                    launchError = error.localizedDescription
+                    return
+                }
+                let armedCheats = CheatFuseMonitor.shared.prepareAndArm(for: currentGame, shellRoot: stores.build.shellCachePath)
+                NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: currentGame.appPath), configuration: configuration) { app, error in
+                    let pid = app?.processIdentifier
+                    DispatchQueue.main.async {
+                        MainActor.assumeIsolated {
+                            if let error {
+                                CheatFuseMonitor.shared.abort(armedCheats)
+                                if launchHintGeneration == generation { endGameLaunch() }
+                                launchError = error.localizedDescription
+                                return
+                            }
+                            library.recordPlayed(currentGame.id)
+                            let startedTitleID = currentGame.titleID
+                            playSessions.started(titleID: startedTitleID, title: currentGame.displayName(loc.lang))
+                            if let pid {   // and the cloud's send an engine leaves to the launcher (SaveEngine)
+                                CheatFuseMonitor.shared.didStart(pid: pid, pending: armedCheats)
+                                let sessionStore = playSessions
+                                GameReturnWatcher.shared.didStart(pid: pid) {
+                                    sessionStore.ended(titleID: startedTitleID)
+                                    CheatFuseMonitor.shared.didExit(pid: pid)
+                                    CloudSaveSend.afterExit(app: currentGame.appPath, titleID: currentGame.titleID, environment: withRecording, engine: SaveEngines.forApp(currentGame.appPath, titleID: currentGame.titleID))
+                                }
+                            } else {
+                                CheatFuseMonitor.shared.abort(armedCheats)
+                            }
+                            if let app, !app.isFinishedLaunching, !app.isTerminated {
+                                Task { @MainActor in
+                                    let deadline = Date().addingTimeInterval(5.0)
+                                    while !app.isFinishedLaunching && !app.isTerminated && Date() < deadline {
+                                        try? await Task.sleep(nanoseconds: 150_000_000)
+                                        if launchHintGeneration != generation { return }
+                                    }
+                                    if launchHintGeneration == generation { endGameLaunch() }
+                                }
+                            } else if launchHintGeneration == generation {
+                                endGameLaunch()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    func checkTools() {
+        toolsAge.check(
+            games: library.games,
+            repo: stores.repo.path,
+            libraryFolder: library.folder,
+            seedRoot: stores.build.seedCacheRoot,
+            shellRoot: stores.build.shellCachePath
+        )
+    }
+}

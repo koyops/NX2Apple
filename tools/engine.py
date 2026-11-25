@@ -34,13 +34,14 @@ pin, which needs no network). `sync` is for developers, CI and checkouts: a rele
 Scratch worktrees go to $PATCHES_TMP (or --tmp), else the system's temporary folder.
 
 The engine tree (`tree`): what a player's launcher runs the build from, with no git. DIR gets the files of engine/ at its last sync
-(TREE_PATHS, the patches applied, dm/fork_patches.txt included), `.upstream-ref` and `.engine-id`, the engine's identity
+(TREE_PATHS, the patches applied, dm/fork_patches.txt included), `.upstream-ref`, `.upstream-date` (the pin's UTC commit date), and `.engine-id`, the engine's identity
 `<pin>-<first 12 hex of the series digest>`: the pin alone does not name a tree, since the series changes without the pin moving.
 The zip lists its entries sorted, with fixed timestamps and permissions (0755 or 0644), so the same tree gives the same bytes
 (for one zlib). tools/release_manifest.py publishes it.
 """
 import argparse
 import contextlib
+import datetime
 import hashlib
 import importlib
 import io
@@ -100,15 +101,18 @@ def pin(root):
 
 
 def stamp_key(root):
-    """The digest of what engine/ is built from: the pin, and each patch of the series by name and content, in order.
-    frontend/Sources/NXCore/EngineLayout.swift and frontend-qt/nspb_qt/engine.py compute the same, so the launchers can
-    tell a stale engine/ without starting Python."""
+    """The digest of what engine/ is built from: the pin, each patch of the series by name and content, in order, and
+    patches/fork_env_switches.tsv when present. frontend/Sources/NXCore/EngineLayout.swift and frontend-qt/nspb_qt/engine.py
+    compute the same, so the launchers can tell a stale engine/ without starting Python."""
     h = hashlib.sha256()
     h.update(b'pin ' + pin(root).encode() + b'\n')
     for name in P.read_series(root):
         f = root / 'patches' / name
         if not f.is_file(): raise Fail(f'listed in patches/series but missing: {name}')
-        h.update(b'patch ' + name.encode() + b'\n' + hashlib.sha256(f.read_bytes()).hexdigest().encode() + b'\n')
+        h.update(b'patch ' + name.encode() + b'\n' + hashlib.sha256(P.read_lf_bytes(f)).hexdigest().encode() + b'\n')
+    sw = root / P.FORK_ENV_SWITCHES
+    if sw.is_file():
+        h.update(b'switches ' + hashlib.sha256(P.read_lf_bytes(sw)).hexdigest().encode() + b'\n')
     return h.hexdigest()
 
 
@@ -119,7 +123,7 @@ def read_stamp(eng):
 
 
 def write_stamp(eng, root, head, key=None):
-    (eng / '.git' / STAMP).write_text(f'nx2apple-engine 1\npin {pin(root)}\nkey {key or stamp_key(root)}\nhead {head}\n', encoding='utf-8')
+    (eng / '.git' / STAMP).write_bytes(f'nx2apple-engine 1\npin {pin(root)}\nkey {key or stamp_key(root)}\nhead {head}\n'.encode('utf-8'))
 
 
 def is_repo(eng):
@@ -227,8 +231,15 @@ def build(root, eng, patches, sha):
         say('empty on the pin (upstream has them, `tools/engine.py bump` drops them): ' + ', '.join(p.file for p in landed))
     for out, tool in P.GENERATED:
         if (eng / tool).is_file():
+            if out == 'docs/env_switches.tsv':
+                P.merge_env_switches(root, eng)
             r = subprocess.run([sys.executable, '-X', 'utf8', str(eng / tool)], cwd=eng, capture_output=True, text=True, encoding='utf-8', errors='replace', check=False, env=P.clean_env())
             if r.returncode: raise Fail(f'{tool} failed on the patched tree: {(r.stderr.strip().splitlines() or [str(r.returncode)])[-1]}')
+            if out == 'docs/env_switches.tsv':
+                chk = subprocess.run([sys.executable, '-X', 'utf8', str(eng / tool), '--check'], cwd=eng, capture_output=True, text=True, encoding='utf-8', errors='replace', check=False, env=P.clean_env())
+                if chk.returncode:
+                    msg = (chk.stdout + '\n' + chk.stderr).strip().splitlines()
+                    raise Fail(f'{tool} --check failed (add new switches to {P.FORK_ENV_SWITCHES}): {msg[-1] if msg else chk.returncode}')
     (eng / P.FORK_PATCHES).write_text(P.fork_patch_list([p for p, _ in applied]), encoding='utf-8')
     git('add', '--force', '--', P.FORK_PATCHES, *(o for o, _ in P.GENERATED if (eng / o).exists()), cwd=eng)
     git(*IDENT, 'commit', '--quiet', '--allow-empty', '-m', GENERATED_SUBJECT, cwd=eng)
@@ -308,12 +319,23 @@ def cmd_hook(a):
 
 TREE_PATHS = ('dm', 'scripts', 'docs', 'ref', 'AGENTS.md', 'LICENSE')   # what a player's build reads, of what engine/ tracks
 ENGINE_ID_FILE = '.engine-id'
+UPSTREAM_DATE_FILE = '.upstream-date'
+ENGINE_FILES_FILE = '.engine-files'
 ZIP_TIME = (2020, 1, 1, 0, 0, 0)    # fixed, so the zip's bytes depend on the content only
 
 
 def engine_id(root):
     """`<pin>-<first 12 hex of the series digest>`: names a tree (the series changes without the pin moving). [0-9a-f-], 53 characters."""
     return f'{pin(root)}-{stamp_key(root)[:12]}'
+
+
+def upstream_date(eng, sha):
+    """Committer date of `sha` in `eng` as UTC text (`2026-10-30T18:12:44Z`), or None when unavailable."""
+    r = git('log', '-1', '--format=%ct', sha, cwd=eng, check=False)
+    ts = r.stdout.strip() if r.returncode == 0 else ''
+    if not re.fullmatch(r'-?\d+', ts):
+        return None
+    return datetime.datetime.fromtimestamp(int(ts), datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
 def extract_tree(eng, out):
@@ -339,6 +361,42 @@ def extract_tree(eng, out):
     proc.stdout.close()
     if proc.wait(): raise Fail(f'git archive failed: {proc.stderr.read().decode(errors="replace").strip()[-500:]}')
     return count
+
+
+def collect_tree_files(tree):
+    """Sorted POSIX relative paths of every managed file (or symlink) inside `tree`, excluding .git and .engine-files."""
+    root = Path(tree)
+    entries = []
+    for dirpath, dirnames, files in os.walk(root, followlinks=False):
+        kept = []
+        for d in sorted(dirnames):
+            if d in ('.git', '__pycache__'):
+                continue
+            full_d = os.path.join(dirpath, d)
+            if os.path.islink(full_d):
+                entries.append(Path(full_d).relative_to(root).as_posix())
+            else:
+                kept.append(d)
+        dirnames[:] = kept
+        for n in sorted(files):
+            if n == '.git' or n.endswith(('.pyc', '.pyo')):
+                continue
+            full_f = os.path.join(dirpath, n)
+            rel = Path(full_f).relative_to(root).as_posix()
+            if rel == ENGINE_FILES_FILE:
+                continue
+            entries.append(rel)
+    entries.sort()
+    return entries
+
+
+def write_files_manifest(tree):
+    """Write deterministic UTF-8 LF `.engine-files` inside `tree` listing all managed files."""
+    root = Path(tree)
+    entries = collect_tree_files(root)
+    payload = ('\n'.join(entries) + '\n') if entries else ''
+    (root / ENGINE_FILES_FILE).write_bytes(payload.encode('utf-8'))
+    return len(entries)
 
 
 def write_zip(tree, zpath):
@@ -383,15 +441,29 @@ def cmd_tree(a):
         shutil.rmtree(out)
     out.mkdir(parents=True, exist_ok=True)
     n = extract_tree(eng, out)
+    sha = pin(root)
     eid = engine_id(root)
-    (out / '.upstream-ref').write_text(pin(root) + '\n', encoding='utf-8')
-    (out / ENGINE_ID_FILE).write_text(eid + '\n', encoding='utf-8')
+    (out / '.upstream-ref').write_bytes((sha + '\n').encode('utf-8'))
+    (out / ENGINE_ID_FILE).write_bytes((eid + '\n').encode('utf-8'))
+    udate = upstream_date(eng, sha)
+    if udate:
+        (out / UPSTREAM_DATE_FILE).write_bytes((udate + '\n').encode('utf-8'))
     if not (out / P.FORK_PATCHES).is_file(): raise Fail(f'{P.FORK_PATCHES} is missing from engine/: sync again')
+    write_files_manifest(out)
     say(f'engine tree: {eid} ({n} files) in {out}')
     if a.zip:
         k = write_zip(out, a.zip)
         h = hashlib.sha256(Path(a.zip).read_bytes()).hexdigest()
         say(f'engine zip: {a.zip} ({k} entries, {Path(a.zip).stat().st_size} bytes, sha256 {h})')
+    return 0
+
+
+def cmd_tree_manifest(a):
+    out = Path(a.out).resolve()
+    if not out.is_dir() or not (out / ENGINE_ID_FILE).is_file():
+        raise Fail(f'{out} is not an engine tree made by `tools/engine.py tree`')
+    count = write_files_manifest(out)
+    say(f'engine tree manifest: {count} entries in {out / ENGINE_FILES_FILE}')
     return 0
 
 
@@ -417,6 +489,22 @@ def cmd_export(a):
     made = []
     for c in commits:
         if git('log', '-1', '--format=%s', c, cwd=eng).stdout.strip() == GENERATED_SUBJECT: continue
+        if (eng / 'docs/env_switches.tsv').is_file() and have_commit(eng, pin(root)):
+            up_tsv = git('show', f'{pin(root)}:docs/env_switches.tsv', cwd=eng, check=False).stdout
+            cur_tsv = git('show', f'{c}:docs/env_switches.tsv', cwd=eng, check=False).stdout
+            if up_tsv and cur_tsv:
+                up_rows = {l.split('\t', 1)[0]: l for l in up_tsv.splitlines()[1:] if l.strip()}
+                fork_tsv = root / P.FORK_ENV_SWITCHES
+                kept = {l.split('\t', 1)[0]: l for l in (fork_tsv.read_text(encoding='utf-8').splitlines()[1:] if fork_tsv.is_file() else []) if l.strip()}
+                changed = False
+                for l in cur_tsv.splitlines()[1:]:
+                    if not l.strip(): continue
+                    k = l.split('\t', 1)[0]
+                    if up_rows.get(k) != l and kept.get(k) != l:
+                        kept[k] = l; changed = True
+                if changed:
+                    fork_tsv.write_text('name\tclass\tmeaning\n' + ''.join(kept[k] + '\n' for k in sorted(kept)), encoding='utf-8')
+                    say(f'updated {P.FORK_ENV_SWITCHES}')
         text = git('format-patch', '--binary', '--zero-commit', '--no-signature', '--no-numbered', '--stdout', f'{c}^..{c}', '--', '.',
                    *(f':(exclude){o}' for o in sorted(skip)), cwd=eng, binary=True).stdout.decode(errors='surrogateescape')
         if not re.search(r'(?m)^diff --git ', text):
@@ -623,6 +711,7 @@ def main(argv=None):
     s = sub.add_parser('export'); s.add_argument('rev', nargs='?', help='a commit or a range in engine/ (default: everything after the last sync)')
     s.add_argument('--status', default='pending'); s.add_argument('--reason', default='TODO: why the fork carries this'); s.add_argument('--issue', default='TODO: LNPANDY/NX2Apple#<n>'); s.set_defaults(f=cmd_export)
     s = sub.add_parser('tree'); s.add_argument('--out', required=True, help='the folder for the tree (emptied when it is an earlier tree)'); s.add_argument('--zip', help='also write the deterministic zip of the tree'); s.set_defaults(f=cmd_tree)
+    s = sub.add_parser('tree-manifest'); s.add_argument('--out', required=True, help='refresh .engine-files inside an existing engine tree'); s.set_defaults(f=cmd_tree_manifest)
     sub.add_parser('status').set_defaults(f=cmd_status)
     sub.add_parser('check').set_defaults(f=cmd_check)
     s = sub.add_parser('bump'); s.add_argument('--to', required=True, help='the new upstream commit, or a branch such as main'); s.add_argument('--dry', action='store_true'); s.set_defaults(f=cmd_bump)

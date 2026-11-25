@@ -50,6 +50,7 @@ public struct TouchLayout: Equatable, Sendable {
         }
     }
 
+    /// No control moved.
     public var isEmpty: Bool { offsets.isEmpty }
     public func isEmpty(_ kind: Kind) -> Bool { offsets[kind] == nil }
     /// Every control of one layout back to its built-in place.

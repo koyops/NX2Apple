@@ -9,6 +9,12 @@ struct FakePicker: FolderPicker {
     func pickFolder() async -> URL? { url }
 }
 
+/// A picker that cannot be shown (no window to present from, as inside LiveContainer, #1049).
+struct UnavailablePicker: FolderPicker {
+    func pickFolder() async -> URL? { nil }
+    func pickFolderOutcome() async -> FolderPickOutcome { .unavailable }
+}
+
 /// Records launches and can fail them.
 final class RecordingLauncher: GameLauncher, @unchecked Sendable {
     private(set) var launched: [LaunchableGame] = []
@@ -68,6 +74,8 @@ final class Clock: @unchecked Sendable { var date: Date; init(_ d: Date) { date 
         await model.playNow(Fixtures.orbit)
         let hint = try #require(launcher.launched.last?.environment["DM_TOUCH_HINT"])
         #expect(hint == ShellHostModel.touchHint && !hint.isEmpty)
+        let padQuit = try #require(launcher.launched.last?.environment["DM_PAD_QUIT_HINT"])
+        #expect(padQuit == ShellHostModel.padQuitHint && padQuit.contains("{-}") && padQuit.contains("{+}"))
     }
 
     /// The quit prompt's words reach the engine with the game's name in the title, five lines in home_quit.h's order (patch 0068): the
@@ -84,10 +92,25 @@ final class Clock: @unchecked Sendable { var date: Date; init(_ d: Date) { date 
         #expect(lines.count == 5 && lines.allSatisfy { !$0.isEmpty } && lines[1].contains(name))
     }
 
-    /// #620: Exit Game closes the app and iOS does not let it start itself again, so the prompt's note says the player opens it again to get back.
-    @Test func theQuitPromptNoteSaysTheAppClosesAndMustBeOpenedAgain() {
+    /// #1129: the in-game menu's own words go to the engine with every launch, two lines in the engine's order (patch 0124).
+    @Test func theInGameMenuWordsGoWithEveryLaunch() async throws {
+        let box = try Sandbox()
+        try box.giveAppData()
+        let launcher = RecordingLauncher()
+        let model = ShellHostModel(config: box.config(), launcher: launcher, shellSettings: shellSettings())
+        await model.playNow(Fixtures.orbit)
+        let text = try #require(launcher.launched.last?.environment["DM_GAME_MENU_TEXT"])
+        #expect(text == ShellHostModel.gameMenuText)
+        let lines = text.components(separatedBy: "\n")
+        #expect(lines.count == 5 && lines.allSatisfy { !$0.isEmpty && !$0.contains(";") })
+        #expect(lines[4].contains("%@"))
+    }
+
+    /// BUG-23: Quit returns the player to the shell library rather than force-closing the whole app.
+    @Test func theQuitPromptNoteSaysYouReturnToYourGames() {
         let note = ShellHostModel.quitPromptText(gameName: "Orbit").components(separatedBy: "\n")[2]
-        #expect(note.contains("The app closes.") && note.contains("Open it again"), "\(note)")
+        #expect(note.contains("Unsaved progress will be lost.") && note.contains("You will return to your games."), "\(note)")
+        #expect(!note.contains("The app closes."))
     }
 
     /// The prompt's texts in every language: no semicolon, no line break (one text per line in DM_HOME_QUIT_TEXT), the title keeps the game's name.
@@ -117,6 +140,23 @@ final class Clock: @unchecked Sendable { var date: Date; init(_ d: Date) { date 
         }
     }
 
+    /// Every language's controller quit hint carries both {-} and {+} keycap placeholders, no semicolons/line breaks, and compact text width.
+    @Test func thePadQuitHintHasKeycapPlaceholdersInEveryLanguage() throws {
+        let l10n = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().appendingPathComponent("frontend/l10n")
+        let files = try FileManager.default.contentsOfDirectory(at: l10n, includingPropertiesForKeys: nil)
+            .filter { $0.pathExtension == "json" }
+        #expect(files.count >= 10, "Expected at least 10 l10n files, found \(files.count)")
+        for file in files {
+            let strings = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [String: Any])
+            let hint = try #require(strings["ios.host.padQuitHint"] as? String, "\(file.lastPathComponent) lacks ios.host.padQuitHint")
+            #expect(hint.contains("{-}") && hint.contains("{+}"), "\(file.lastPathComponent): \(hint)")
+            #expect(!hint.contains(";") && !hint.contains("；") && !hint.contains("\n"), "\(file.lastPathComponent): \(hint)")
+            let plain = hint.replacingOccurrences(of: "{-}", with: "").replacingOccurrences(of: "{+}", with: "")
+            #expect(plain.count <= 42, "\(file.lastPathComponent) too long (\(plain.count)): \(hint)")
+        }
+    }
+
     @Test func padOverridesPersistMergeAndReset() async throws {
         let box = try Sandbox()
         try box.giveAppData()
@@ -133,7 +173,7 @@ final class Clock: @unchecked Sendable { var date: Date; init(_ d: Date) { date 
         #expect(model.globalPadMap.swapAB)
         #expect(try !detail(model).hasModifiedSettings)
         // The game's row follows: the card shows what all games send there (B), from the shell's map.
-        if case .choice(let options) = try row("pad.A").kind { #expect(options.first?.id == "follow" && options.first?.label == "Same as all games") }
+        if case .choice(let options) = try row("pad.A").kind { #expect(options.first?.id == "follow" && options.first?.label == "Default") }
         #expect(try row("pad.A").value == "follow" && model.globalPadMap.output(for: "A") == "B")
         await model.playNow(Fixtures.orbit)
         #expect(launcher.launched.last?.environment["DM_PAD_MAP"] == "A=B,B=A")
@@ -303,6 +343,25 @@ final class Clock: @unchecked Sendable { var date: Date; init(_ d: Date) { date 
         #expect(model.notice?.contains("No game data for Orbit Fixture") == true)
     }
 
+    @Test func pickingInvalidGameDataFolderKeepsPreviousWorkingFolder() async throws {
+        let box = try Sandbox()
+        let good = box.root.appendingPathComponent("Good/Orbit", isDirectory: true)
+        try box.write("", to: good.appendingPathComponent("fixture.marker"))
+        let empty = box.root.appendingPathComponent("Empty", isDirectory: true)
+        try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
+
+        let goodModel = ShellHostModel(config: box.config(), picker: FakePicker(url: good))
+        await goodModel.pickGameDataNow(Fixtures.orbit)
+        #expect(try detail(goodModel).game.state == .playable)
+        #expect(try detail(goodModel).dataSource == "Orbit")
+
+        let badModel = ShellHostModel(config: box.config(), picker: FakePicker(url: empty))
+        await badModel.pickGameDataNow(Fixtures.orbit)
+        #expect(badModel.notice?.contains("No game data for Orbit Fixture") == true)
+        #expect(try detail(badModel).game.state == .playable)
+        #expect(try detail(badModel).dataSource == "Orbit")
+    }
+
     @Test func aCancelledPickChangesNothing() async throws {
         let box = try Sandbox()
         let model = ShellHostModel(config: box.config(), picker: FakePicker(url: nil))
@@ -345,7 +404,7 @@ final class Clock: @unchecked Sendable { var date: Date; init(_ d: Date) { date 
         #expect(orbit.dataNote.contains("no longer readable"))
     }
 
-    private func shellSettings() -> ShellSettingsStore { ShellSettingsStore(defaults: UserDefaults(suiteName: "t-shell-\(UUID().uuidString)")!) }
+    private func shellSettings() -> ShellSettingsStore { ShellSettingsStore(defaults: TestDefaults.make("t-shell")) }
 
     /// The orbit fixture with a performance overlay row of its own, like a game whose list has `DM_METAL_HUD`.
     private func giveOrbitAnOverlayRow(_ box: Sandbox) throws {
@@ -388,6 +447,40 @@ final class Clock: @unchecked Sendable { var date: Date; init(_ d: Date) { date 
         shell.storePerformanceHUD(false)
         await model.playNow(Fixtures.orbit)
         #expect(launcher.launched.last?.environment["DM_METAL_HUD"] == "0")
+    }
+
+    @Test func audioMixFollowsGameOverShellOverBuiltIn() async throws {
+        let box = try Sandbox()
+        try box.giveAppData()
+        let shell = shellSettings()
+        let launcher = RecordingLauncher()
+        let model = ShellHostModel(config: box.config(), launcher: launcher, shellSettings: shell)
+
+        // Built-in default stays off when both game and shell leave DM_AUDIO_MIX unset.
+        await model.playNow(Fixtures.orbit)
+        let offGame = try #require(launcher.launched.last)
+        #expect(offGame.environment["DM_AUDIO_MIX"] == nil)
+        #expect(EngineLaunchPlan.make(game: offGame, appResources: box.root, documents: box.root, envFileText: nil).environment["DM_AUDIO_MIX"] == nil)
+
+        // Shell setting applies DM_AUDIO_MIX=1 when game env leaves it alone.
+        shell.storeAudioMix(true)
+        await model.playNow(Fixtures.orbit)
+        let shellOnGame = try #require(launcher.launched.last)
+        #expect(shellOnGame.environment["DM_AUDIO_MIX"] == "1")
+        #expect(EngineLaunchPlan.make(game: shellOnGame, appResources: box.root, documents: box.root, envFileText: nil).environment["DM_AUDIO_MIX"] == "1")
+
+        // Game env.txt "0" overrides shell "1".
+        try FileManager.default.createDirectory(at: shellOnGame.appFolder, withIntermediateDirectories: true)
+        try "DM_AUDIO_MIX=0\n".write(to: shellOnGame.appFolder.appendingPathComponent("env.txt"), atomically: true, encoding: .utf8)
+        #expect(EngineLaunchPlan.make(game: shellOnGame, appResources: box.root, documents: box.root, envFileText: nil).environment["DM_AUDIO_MIX"] == "0")
+
+        // Game env.txt "1" overrides shell off.
+        shell.storeAudioMix(false)
+        await model.playNow(Fixtures.orbit)
+        let shellOffGame = try #require(launcher.launched.last)
+        #expect(shellOffGame.environment["DM_AUDIO_MIX"] == nil)
+        try "DM_AUDIO_MIX=1\n".write(to: shellOffGame.appFolder.appendingPathComponent("env.txt"), atomically: true, encoding: .utf8)
+        #expect(EngineLaunchPlan.make(game: shellOffGame, appResources: box.root, documents: box.root, envFileText: nil).environment["DM_AUDIO_MIX"] == "1")
     }
 
     @Test func aChangedShellOverlayChoiceUpdatesTheDetails() throws {
@@ -541,6 +634,19 @@ final class Clock: @unchecked Sendable { var date: Date; init(_ d: Date) { date 
         #expect(model.notice != nil && shell.dataFolderName == nil && shell.dataBookmark == nil)
         await ShellHostModel(config: box.config(), picker: FakePicker(url: nil), shellSettings: shell).pickShellCloudNow()
         #expect(shell.cloudSavesFolderName == nil)
+    }
+
+    @Test func aPickerThatCannotOpenSaysSoForEveryFolderChoiceAndACancelStaysQuiet() async throws {
+        let box = try Sandbox()
+        let model = ShellHostModel(config: box.config(), picker: UnavailablePicker())
+        await model.pickGameDataNow(Fixtures.orbit)
+        #expect(model.notice != nil)
+        model.notice = nil
+        await model.pickCloudSavesNow(Fixtures.orbit)
+        #expect(model.notice != nil)
+        model.notice = nil
+        await ShellHostModel(config: box.config(), picker: FakePicker(url: nil)).pickGameDataNow(Fixtures.orbit)
+        #expect(model.notice == nil)
     }
 
     @Test func showLogReadsTheGamesLogOrSaysThereIsNone() throws {
@@ -700,7 +806,13 @@ final class Clock: @unchecked Sendable { var date: Date; init(_ d: Date) { date 
         let ids = model.details.map(\.id)
         #expect(ids.first == Fixtures.orbit)
         let rank = model.details.map { d -> Int in
-            switch d.game.state { case .playable: 1; case .needsGameData: 2; case .needsAppUpdate: 3; case .broken: 4 }
+            switch d.game.state {
+            case .playable: return 1
+            case .joiningGameData: return 2
+            case .needsGameData, .needsDataUpdate: return 3
+            case .needsAppUpdate: return 4
+            case .broken: return 5
+            }
         }
         #expect(rank == rank.sorted())
         let broken = model.details.filter { if case .broken = $0.game.state { true } else { false } }.map(\.game.title)

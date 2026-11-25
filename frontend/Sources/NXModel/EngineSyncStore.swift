@@ -26,12 +26,18 @@ import NXCore
     @Published package var selection: EngineSelection
     /// A seed, a check or an install runs (the buttons of Settings disable).
     @Published package private(set) var busy = false
+    /// Live archive download fraction (0...1 when Content-Length is known) and MB summary while fetching an engine archive.
+    @Published package private(set) var downloadFraction: Double?
+    @Published package private(set) var downloadStatus = ""
     /// The line under the tools section of Settings.
     @Published package var status = ""
     /// A newer engine the launch check found while automatic updates are off: Settings offers it.
     @Published package private(set) var available: EngineUpdate.Engine?
     /// The channel the player picked and is asked to confirm (the switch can change the shader chain).
     @Published package var confirmingChannel: EngineChannel?
+    /// Whether Experimental is built on newer upstream code than Stable, as of the last check (LNPANDY/NX2Apple#1095). Settings hides the
+    /// switch to Experimental while it is not ahead, and offers the way back when the launcher is on it.
+    @Published package private(set) var experimentalStanding: ExperimentalStanding = .unknown
     /// An installed engine that waits for the running build to end before the build tools switch to it.
     package var pendingEngine: (engine: EngineUpdate.Engine, channel: EngineChannel)?
     /// The engine tree inside the app bundle. nil for a launcher built from the repository, which keeps its checkout and git.
@@ -43,6 +49,8 @@ import NXCore
 
     /// A sync runs: the launcher shows a status line with a spinner.
     @Published package private(set) var syncing = false
+    /// The state gallery (#1459) shows the syncing notice without running a sync.
+    package func showSyncingForGallery() { syncing = true }
     /// How the last sync stopped (no network or GitHub unreachable, or another stop), as a failure row with a retry button. nil: none.
     @Published package var failure: BuildFailure?
 
@@ -58,6 +66,7 @@ import NXCore
     private let transport: EngineTransport
     private let defaults: UserDefaults
     private let appVersion: String
+    private let publicKey: String
     private let setRepoPath: (String) -> Void
     private let buildRunning: () -> Bool
     private let autoUpdate: () -> Bool
@@ -73,6 +82,7 @@ import NXCore
                  engineStore: EngineStore = EngineStore(), transport: EngineTransport = URLSessionEngineTransport(),
                  bundle: URL? = EngineBundle.tree(in: Bundle.main.resourceURL), defaults: UserDefaults = .standard,
                  appVersion: String = AppUpdateStore.appVersion,
+                 publicKey: String = EngineManifest.publicKey,
                  setRepoPath: @escaping (String) -> Void = { _ in }, buildRunning: @escaping () -> Bool = { false },
                  autoUpdate: @escaping () -> Bool = { true }, log: @escaping (String) -> Void = { _ in }) {
         self.localizer = localizer
@@ -84,6 +94,7 @@ import NXCore
         self.bundle = bundle
         self.defaults = defaults
         self.appVersion = appVersion
+        self.publicKey = publicKey
         self.setRepoPath = setRepoPath
         self.buildRunning = buildRunning
         self.autoUpdate = autoUpdate
@@ -109,7 +120,17 @@ import NXCore
         guard EngineLayout.isStale(path) else { failure = nil; then?(true); return Task {} }
         syncWaiting = then.map { [$0] } ?? []
         syncing = true; failure = nil
-        let chosen = python.pythonPath, runner = self.runner, log = self.log
+        let rawChosen = python.pythonPath
+        let chosenUpstream = python.pythonUpstream
+        let chosen: String = {
+            guard !rawChosen.isEmpty,
+                  chosenUpstream == nil || chosenUpstream == .nxnative,
+                  !MacNativeGamesBuilder.isManagedUVPython(rawChosen) else {
+                return ""
+            }
+            return rawChosen
+        }()
+        let runner = self.runner, log = self.log
         log("$ python3 tools/engine.py sync\n")
         let tail = Tail()   // what failureKind reads when the sync stops
         return Task {
@@ -153,8 +174,36 @@ import NXCore
     package func prepareEngine() -> Task<Void, Never> {
         guard let bundled = bundle, !busy, let id = EngineStore.identity(of: bundled) else { return Task {} }
         let selected = selection.engineID
-        let appMovedOn = selection.channel == .stable && selected != id && selection.version != appVersion
-        if !appMovedOn, engineStore.isUsable(selected), let dir = engineStore.directory(for: selected) {
+        let bundledDate = EngineStore.upstreamDate(of: bundled)
+        let selectedDir = engineStore.isUsable(selected) ? engineStore.directory(for: selected) : nil
+        let selectedDate = selectedDir.flatMap { EngineStore.upstreamDate(of: $0) }
+        let appMovedOn: Bool
+        if selected == id || selectedDir == nil {
+            appMovedOn = selected != id
+        } else if selection.channel == .stable {
+            // Same appVersion (e.g. rcN -> rcN+1) moves onto the newer bundled engine unless the store
+            // already holds a strictly newer upstream commit date for this release.
+            if AppUpdate.isNewer(selection.version, than: appVersion) {
+                appMovedOn = false
+            } else if selection.version == appVersion,
+                      let s = EngineManifest.date(selectedDate),
+                      let b = EngineManifest.date(bundledDate),
+                      s > b {
+                appMovedOn = false
+            } else {
+                appMovedOn = true
+            }
+        } else {
+            // On experimental, switch offline to the bundled engine when it has a strictly newer upstream date.
+            if let s = EngineManifest.date(selectedDate),
+               let b = EngineManifest.date(bundledDate),
+               b > s {
+                appMovedOn = true
+            } else {
+                appMovedOn = false
+            }
+        }
+        if !appMovedOn, let dir = selectedDir {
             setRepoPath(dir.path)
             return checkForUpdate(automatic: true)
         }
@@ -196,7 +245,8 @@ import NXCore
 
     /// The channel picker: a different channel is confirmed first, because the switch can change the shader chain.
     package func requestChannel(_ channel: EngineChannel) {
-        guard selection.channel.switchWarningKey(to: channel) != nil, !busy, !buildRunning() else { return }
+        guard selection.channel.switchWarningKey(to: channel) != nil, !busy, !buildRunning(),
+              EngineChannelChoice.allowsSwitch(to: channel, from: selection.channel, standing: experimentalStanding) else { return }
         confirmingChannel = channel
     }
 
@@ -218,15 +268,69 @@ import NXCore
             return Task {}
         }
         busy = true
+        downloadFraction = nil
+        downloadStatus = ""
         if !quiet { status = t(channel == selection.channel ? "engine.checking" : "engine.switching") }
-        let store = engineStore, bundled = bundle, current = selection.engineID, transport = self.transport, version = appVersion
+        let store = engineStore
+        let bundled = bundle
+        let current = selection.engineID
+        let currentVersion = selection.version
+        let transport = self.transport
+        let version = appVersion
+        let key = publicKey
+        let onByteProgress: @Sendable (Int64, Int64?) -> Void = { [weak self] written, expected in
+            let formatted = EngineUpdate.formatDownloadProgress(written: written, expected: expected)
+            Task { @MainActor [weak self] in
+                guard let self, self.busy else { return }
+                self.downloadFraction = formatted.fraction
+                self.downloadStatus = formatted.text
+                if !quiet {
+                    self.status = String(format: self.t("engine.downloadingProgress"), formatted.text)
+                }
+            }
+        }
         return Task {
+            defer {
+                downloadFraction = nil
+                downloadStatus = ""
+                busy = false
+            }
+            var prefetchedStanding: ExperimentalStanding?
+            if selection.channel == .stable && channel == .experimental {
+                let standing = await Task.detached { EngineUpdate.standing(appVersion: version, bundled: bundled, publicKey: key, transport: transport) }.value
+                prefetchedStanding = standing
+                if standing == .notAhead {
+                    experimentalStanding = .notAhead
+                    if !quiet { status = t("engine.experimentalBehind") }
+                    return
+                }
+            }
             let outcome = await Task.detached {
-                EngineUpdate.run(channel: channel, appVersion: version, current: current, store: store,
-                                 bundled: bundled, install: install, transport: transport)
+                EngineUpdate.run(
+                    channel: channel,
+                    appVersion: version,
+                    current: current,
+                    currentVersion: currentVersion,
+                    store: store,
+                    bundled: bundled,
+                    publicKey: key,
+                    install: install,
+                    transport: transport,
+                    onProgress: onByteProgress
+                )
             }.value
-            busy = false
+            if case .failed = outcome {
+                applyOutcome(outcome, channel: channel, quiet: quiet)
+                return
+            }
+            let standing: ExperimentalStanding
+            if let prefetchedStanding {
+                standing = prefetchedStanding
+            } else {
+                standing = await Task.detached { EngineUpdate.standing(appVersion: version, bundled: bundled, publicKey: key, transport: transport) }.value
+            }
             applyOutcome(outcome, channel: channel, quiet: quiet)
+            experimentalStanding = standing
         }
     }
 
@@ -268,8 +372,8 @@ import NXCore
         selection.save(defaults)
         setRepoPath(dir.path)
         engineStore.prune(keeping: selection.kept)
-        if let change = EngineUpdate.chainChange(from: old, to: dir.path) {
-            status = String(format: t("engine.chainChanged"), engine.version, change.old, change.new)
+        if EngineUpdate.chainChange(from: old, to: dir.path) != nil {   // said in the player's terms, without the chain ids (#1458)
+            status = String(format: t("engine.chainChanged"), engine.version)
         } else {
             status = announce ? String(format: t("engine.installed"), engine.version) : ""
         }
@@ -282,9 +386,24 @@ import NXCore
         switchEngine(to: pending.engine, channel: pending.channel)
     }
 
-    /// What Settings shows for the engine: its version and the pin it was built from.
+    /// What the channel row of Settings lists and says.
+    package var channelChoice: EngineChannelChoice { EngineChannelChoice(selected: selection.channel, standing: experimentalStanding) }
+
+    /// Test seam and app wiring: the standing a check found.
+    package func setStanding(_ standing: ExperimentalStanding) { experimentalStanding = standing }
+
+    /// Test seam for verifying live archive download progress rendering in onboarding and settings views.
+    package func setDownloadProgress(busy: Bool, fraction: Double?, status: String) {
+        self.busy = busy
+        self.downloadFraction = fraction
+        self.downloadStatus = status
+    }
+
+    /// What Settings shows for the engine, in words: not set up, its version and whether a newer one is there (#1458).
     package var detail: String {
         guard !selection.engineID.isEmpty else { return t("engine.none") }
-        return String(format: t("engine.detail"), selection.version.isEmpty ? "?" : selection.version, String(selection.engineID.prefix(8)))
+        guard !selection.version.isEmpty else { return t("engine.state.set") }
+        if let available { return String(format: t("engine.state.update"), selection.version, available.version) }
+        return String(format: t("engine.state.current"), selection.version)
     }
 }

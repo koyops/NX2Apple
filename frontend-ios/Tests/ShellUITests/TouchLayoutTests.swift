@@ -159,9 +159,10 @@ import Testing
     }
 
     /// Whatever the editor keeps, the engine draws it as the editor showed it: every kept spot is one the geometry places.
-    @Test(arguments: [TouchLayout.Kind.twoD, .threeD])
+    @Test(arguments: [TouchLayout.Kind.twoD, .threeD, .twoDSplit, .threeDSplit])
     func randomEditsOnlyKeepPlacesTheEngineTakes(kind: TouchLayout.Kind) {
-        var e = editing(kind)
+        let phonePortrait = PadScreen(size: CGSize(width: 440, height: 956), insets: .init(top: 62, bottom: 34))
+        var e = editing(kind, screen: kind.split ? phonePortrait : .proMax)
         var rng: UInt32 = 414
         func next() -> Int { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return Int(rng % 1000) }
         let controls = TouchLayout.Control.allCases.filter { $0.drawn(full: kind.full) }
@@ -177,13 +178,104 @@ import Testing
         }
     }
 
+    @Test func ordinaryPhonePortraitDefaultsSitBelowPictureWithoutOverlap() {
+        let phones = [
+            PadScreen(size: CGSize(width: 440, height: 956), insets: .init(top: 62, bottom: 34)),
+            PadScreen(size: CGSize(width: 393, height: 852), insets: .init(top: 59, bottom: 34)),
+            PadScreen(size: CGSize(width: 375, height: 667), insets: .init(top: 20, bottom: 0)),
+        ]
+        for screen in phones {
+            for full in [false, true] {
+                for size in ["small", "medium", "large"] {
+                    for stick in ["corner", "higher", "inward"] {
+                        let g = PadGeo.make(screen, full: full, size: size, stick: stick)
+                        #expect(g.region.separated, "\(screen.size) must split picture and controls")
+                        #expect(g.portrait, "\(screen.size) must use portrait cluster layout")
+                        #expect(g.fits, "\(screen.size) full=\(full) size=\(size) stick=\(stick) must fit without overlap")
+                        for c in g.drawnControls {
+                            let box = g.box(of: c)!.box
+                            #expect(box.minY >= g.region.game.maxY - 0.5, "\(c) must sit below the game picture")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     @Test func theDeviceScreensFollowTheWindow() {
         let phone = TouchLayoutScreens.device(window: CGSize(width: 440, height: 956), insets: EdgeInsetsLike.portrait, isPad: false)
-        #expect(phone.sideways.size == CGSize(width: 956, height: 440) && phone.sideways.insets.left == 62 && phone.upright == nil)
+        #expect(phone.sideways.size == CGSize(width: 956, height: 440) && phone.sideways.insets.left == 62)
+        #expect(phone.upright?.size == CGSize(width: 440, height: 956) && phone.upright?.insets == PadScreen.Insets(top: 62, bottom: 34))
+        let phoneFromLandscape = TouchLayoutScreens.device(window: CGSize(width: 956, height: 440), insets: EdgeInsets(top: 0, leading: 62, bottom: 21, trailing: 62), isPad: false)
+        #expect(phoneFromLandscape.upright?.size == CGSize(width: 440, height: 956) && phoneFromLandscape.upright?.insets.top == 62)
         let pad = TouchLayoutScreens.device(window: CGSize(width: 1376, height: 1032), insets: .init(), isPad: true)
         #expect(pad.sideways.size.width == 1376 && pad.upright?.size == CGSize(width: 1032, height: 1376))
         let duo = TouchLayoutScreens.device(window: CGSize(width: 669, height: 951), insets: .init(top: 62, leading: 0, bottom: 34, trailing: 0), isPad: false)
         #expect(duo.upright?.topSafeOnly == true && duo.upright?.division != nil)
+    }
+
+    @Test func landscapeAndPortraitLayoutsSaveAndResetIndependently() throws {
+        var layout = TouchLayout()
+        layout[.twoD, .stick] = Offset(dx: 1, dy: -1)
+        layout[.threeD, .face] = Offset(dx: -2, dy: 0)
+        layout[.twoDSplit, .a] = Offset(dx: 0, dy: 2)
+        layout[.threeDSplit, .dpad] = Offset(dx: 2, dy: -1)
+
+        let decoded = try #require(TouchLayout(encoded: layout.encoded))
+        #expect(decoded == layout)
+        #expect(decoded[.threeD, .face] == Offset(dx: -2, dy: 0))
+        #expect(decoded[.threeDSplit, .dpad] == Offset(dx: 2, dy: -1))
+
+        var resetPortrait = decoded
+        resetPortrait.reset(.twoDSplit)
+        resetPortrait.reset(.threeDSplit)
+        #expect(resetPortrait.isEmpty(.twoDSplit) && resetPortrait.isEmpty(.threeDSplit))
+        #expect(resetPortrait[.twoD, .stick] == Offset(dx: 1, dy: -1))
+        #expect(resetPortrait[.threeD, .face] == Offset(dx: -2, dy: 0))
+    }
+
+    /// Xcode 26.6 Release builds time out type-checking when the 14-modifier chain and two inline ternaries sit inside the ForEach closure.
+    @Test func accessibilityElementsSplitsClosureAndTypesTernaries() throws {
+        let package = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let source = try String(contentsOf: package.appendingPathComponent("Sources/ShellUI/TouchLayoutEditorView.swift"), encoding: .utf8)
+        #expect(source.contains("ForEach(controls, id: \\.self) { c in accessibilityElement(c, g, k: k) }"))
+        #expect(source.contains("private func accessibilityElement(_ c: TouchLayout.Control, _ g: PadGeo, k: CGFloat) -> some View"))
+        #expect(source.contains("let value: String ="))
+        #expect(source.contains("let traits: AccessibilityTraits ="))
+    }
+
+    @Test func optionsButtonClampsInsideShortLandscapeAndSafeArea() {
+        let shortCanvas = CGSize(width: 568, height: 320)
+        let pos = TouchLayoutEditorView.optionsButtonPosition(
+            swap: CGPoint(x: 284, y: 10),
+            screenInsets: .init(top: 12, left: 44, bottom: 21, right: 44),
+            canvasSize: shortCanvas,
+            scale: 1
+        )
+        // 22pt half-height + 6pt margin + 12pt top inset = 40pt minimum Y
+        #expect(pos.y >= 40)
+        #expect(pos.y <= shortCanvas.height - 21 - 28)
+        #expect(pos.x >= 44 + 28 && pos.x <= shortCanvas.width - 44 - 28)
+    }
+
+    @Test func selectionToolbarAvoidsOptionsButton() {
+        let canvas = CGSize(width: 852, height: 393)
+        let optionsCenter = CGPoint(x: 426, y: 34)
+        let box = CGRect(x: 396, y: 74, width: 60, height: 60)
+        let bounds = CGRect(x: 0, y: 0, width: 852, height: 393)
+        let toolbarWidth: CGFloat = 108
+        let pos = TouchLayoutEditorView.selectionToolsPosition(
+            toolbarWidth: toolbarWidth,
+            box: box,
+            bounds: bounds,
+            division: nil,
+            optionsCenter: optionsCenter,
+            canvasSize: canvas,
+            scale: 1
+        )
+        let toolbarRect = CGRect(x: pos.x - toolbarWidth / 2, y: pos.y - 30, width: toolbarWidth, height: 60)
+        let optionsRect = CGRect(x: optionsCenter.x - 22, y: optionsCenter.y - 22, width: 44, height: 44)
+        #expect(!toolbarRect.intersects(optionsRect), "floating toolbar \(toolbarRect) must not overlap options button \(optionsRect)")
     }
 }
 

@@ -6,6 +6,7 @@ import CoreHaptics
 import os
 import NXCore
 import NXLauncher
+import NXModel
 
 /// A controller as GameController reports it, reduced to what the console mode shows. Tests build these instead of hardware.
 /// What a controller reports about its battery.
@@ -31,12 +32,12 @@ struct ConsolePadSnapshot: Equatable {
 
     /// The level to show, or nil when the controller has not really reported one. GameController gives 0 with an unknown state for a
     /// DualShock 4 over Bluetooth and before the first report, and some pads over USB report no battery or an unknown one: those are
-    /// never guessed (no number, outline only). Charging and full are real states, shown with the bolt.
+    /// never guessed (no number, outline only). Charging is a real state and shows the bolt, full is a level and does not.
     static func batteryReading(level: Double, state: PadBatteryState) -> (level: Double?, charging: Bool) {
         switch state {
         case .unknown: return (nil, false)
         case .charging: return (level.isFinite ? min(max(level, 0), 1) : nil, true)   // the real level, with the bolt
-        case .full: return (1, true)   // plugged in and full: the full battery with the bolt
+        case .full: return (1, false)   // full says nothing about a cable (#1033): the full battery, no bolt
         case .discharging: return (level.isFinite ? min(max(level, 0), 1) : nil, false)
         }
     }
@@ -61,56 +62,104 @@ struct ConsolePadSnapshot: Equatable {
 @MainActor final class LiveConsoleDriver: ConsoleDriver {
     @Published var state = ConsoleState()
 
-    private let library: GameLibrary
-    private let controls: ControlLayout
-    private let repo: () -> String
-    private let lang: () -> Lang
+    let library: GameLibrary
+    /// The Controls page's layout: the player mode, the Joy-Con split and the button mapping (LiveConsoleDriver+Mapping.swift).
+    let controls: ControlLayout
+    let repo: () -> String
+    let lang: () -> Lang
     private let labels: (String) -> String
+    private let saves: (String) -> (global: SaveGlobalSettings, game: SaveGameOverride)?   // the save settings (SaveSettingsStore)
+    private let sticks: () -> StickDeadzoneSettings?   // StickDeadzoneStore
+    private let player: () -> PlayerProfile?   // whose saves the game plays with (PlayerProfileStore)
+    let shellRoot: () -> String
     private let pads: () -> [ConsolePadSnapshot]
+    private let steamPads: () -> [ConsolePadSnapshot]
+    private let hidPads: () -> [ConsolePadSnapshot]
     private let launch: (LibraryGame, [String: String], @escaping (Int32?, Error?) -> Void) -> Void
     private let artwork: (LibraryGame, String) -> NSImage?
     private let startingTimeout: TimeInterval
-    private var cancellables = Set<AnyCancellable>()
+    var cancellables = Set<AnyCancellable>()
     private var observers: [NSObjectProtocol] = []
     private var refreshQueued = false
-    private var covers: [UUID: (path: String, image: NSImage?)] = [:]
+    private var covers: [UUID: (key: String, image: NSImage)] = [:]
     private var launchedPID: Int32?
-    private var timeoutTask: Task<Void, Never>?
-    private var toastTask: Task<Void, Never>?
+    /// The check of the cloud's save before a start, and the game it is for (LiveConsoleDriver+CloudSave.swift). Tests give it a fake download.
+    var cloudGate = CloudSaveGate() { didSet { watchCloudGate() } }
+    var cloudGameID: String?
+    var cloudWatch: AnyCancellable?
+    var mngMigration: MngSaveMigrationCoordinator
+    var mngMigrationGameID: String?
+    var mngMigrationWatch: AnyCancellable?
+    var mngSaveSettings: SaveSettingsStore?
+    var timeoutTask: Task<Void, Never>?
+    var launchGeneration: UInt64 = 0
+    var pendingLaunchUpstreamOverride: (gameID: String, upstream: EngineUpstreamKind)? = nil
+    private var pendingLaunch: Task<Void, Never>?
+    private let launchGracePeriod: TimeInterval
+    var toastTask: Task<Void, Never>?
+    var notices = ConsoleNoticeQueue()
     private var clock: Timer?
     /// Real controllers by id, for Identify and player assignment.
-    private var devices: [String: GCController] = [:]
+    var devices: [String: GCController] = [:]
+    /// #816 and #952 (LiveConsoleDriver+Sessions.swift): the play history, the game running now (paused, stopped, quit before another)
+    /// and the games built with older tools than the engine has.
+    let sessions: PlaySessionStore
+    let tracking = ConsoleGameTracking()
+    let toolsAge = ToolsAge()
 
-    init(library: GameLibrary, controls: ControlLayout, repo: @escaping () -> String, lang: @escaping () -> Lang, labels: @escaping (String) -> String,
-         pads: (() -> [ConsolePadSnapshot])? = nil,
+    init(launchGracePeriod: TimeInterval = 1.75, library: GameLibrary, controls: ControlLayout, repo: @escaping () -> String, lang: @escaping () -> Lang, labels: @escaping (String) -> String,
+         pads: (() -> [ConsolePadSnapshot])? = nil, steamPads: (() -> [ConsolePadSnapshot])? = nil,
+         hidPads: (() -> [ConsolePadSnapshot])? = nil,
          launch: ((LibraryGame, [String: String], @escaping (Int32?, Error?) -> Void) -> Void)? = nil,
-         artwork: ((LibraryGame, String) -> NSImage?)? = nil, startingTimeout: TimeInterval = 20, observeSystem: Bool = true, playerOutput: ((String, Int) -> Void)? = nil) {
+         artwork: ((LibraryGame, String) -> NSImage?)? = nil, startingTimeout: TimeInterval = 20, observeSystem: Bool = true, playerOutput: ((String, Int) -> Void)? = nil,
+         player: @escaping () -> PlayerProfile? = { nil },
+         saves: @escaping (String) -> (global: SaveGlobalSettings, game: SaveGameOverride)? = { _ in nil },
+         sticks: @escaping () -> StickDeadzoneSettings? = { nil },
+         shellRoot: @escaping () -> String = { "" },
+         sessions: PlaySessionStore? = nil) {
+        self.sessions = sessions ?? PlaySessionStore(file: observeSystem ? PlaySessionStore.defaultFile : nil)   // a test keeps its history in memory
+        tracking.observesSystem = observeSystem
+        self.saves = saves
+        self.sticks = sticks
+        self.shellRoot = shellRoot
         self.sendPlayerOutput = playerOutput
+        self.launchGracePeriod = launchGracePeriod
+        self.player = player
         self.library = library; self.controls = controls; self.repo = repo; self.lang = lang; self.labels = labels
+        self.mngMigration = MngSaveMigrationCoordinator(defaults: library.defaults)
         self.startingTimeout = startingTimeout
         self.pads = pads ?? { [] }
+        self.steamPads = steamPads ?? { pads == nil ? SteamLinkGamepads.shared.snapshots : [] }
+        self.hidPads = hidPads ?? { pads == nil ? HIDGamepads.shared.snapshots : [] }
         self.launch = launch ?? Self.openApplication
         self.artwork = artwork ?? { [banners = library.artworkDirectory] game, repo in
-            GameLibrary.artwork(for: game, slot: .thumbnail, repo: repo, banners: banners, maxPixel: ArtworkImages.cardPixels)
+            GameLibrary.artwork(for: game, slot: .thumbnail, repo: repo, banners: banners, maxPixel: Self.tilePixels)
         }
         if pads == nil { self.devicePads = true }
         state.padMerge = controls.padMerge
-        state.joyconSplit = controls.joyconSplit
         library.objectWillChange.sink { [weak self] _ in self?.queueRefresh() }.store(in: &cancellables)
+        self.sessions.$sessions.dropFirst().sink { [weak self] _ in self?.queueRefresh() }.store(in: &cancellables)
         controls.$padMerge.sink { [weak self] merged in self?.state.padMerge = merged }.store(in: &cancellables)
-        controls.$joyconSplit.dropFirst().sink { [weak self] split in
-            guard let self, self.state.joyconSplit != split else { return }
-            self.state.joyconSplit = split
-            self.resetPairedDevicePlayerIndices()
-            self.refreshControllers(announce: false)
-        }.store(in: &cancellables)
+        // A @Published sink runs before the value is stored: the layout is read on the next turn of the run loop.
+        controls.$pad.combineLatest(controls.$padMode).dropFirst().receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in MainActor.assumeIsolated { self?.refreshPadLayout() } }.store(in: &cancellables)
+        watchCloudGate()
+        watchMngMigration()
+        watchTools()
         refresh()
         refreshControllers(announce: false)
+        refreshPadLayout()
         announced = Set(state.controllers.map(\.id))   // controllers there at launch are not announced again by a repeated notification
         if observeSystem { scheduleBatteryRereads() }   // a controller there at launch may not have its battery yet either
         guard observeSystem else { return }
         let center = NotificationCenter.default
         observers = [
+            center.addObserver(forName: .steamLinkPadsChanged, object: SteamLinkGamepads.shared, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.refreshControllers(announce: false) }
+            },
+            center.addObserver(forName: .hidPadsChanged, object: HIDGamepads.shared, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.refreshControllers(announce: false) }
+            },
             center.addObserver(forName: .GCControllerDidConnect, object: nil, queue: .main) { [weak self] note in
                 MainActor.assumeIsolated { self?.padsChanged(connected: true, note: note) }
             },
@@ -134,13 +183,14 @@ struct ConsolePadSnapshot: Equatable {
     deinit {
         observers.forEach { NotificationCenter.default.removeObserver($0); NSWorkspace.shared.notificationCenter.removeObserver($0) }
         clock?.invalidate()
+        pendingLaunch?.cancel()
         primeTask?.cancel()
         batteryRereadTask?.cancel()
     }
 
     // MARK: Games
 
-    private func t(_ key: String) -> String { L10n.string(key, lang()) }
+    func t(_ key: String) -> String { L10n.string(key, lang()) }
 
     private func queueRefresh() {
         guard !refreshQueued else { return }
@@ -151,10 +201,14 @@ struct ConsolePadSnapshot: Equatable {
     /// The library as console games, the ones ready on this Mac first, keeping the focus and each game's shown values.
     func refresh() {
         let focus = state.focusedGameID
-        let games = ConsoleGame.readyFirst(library.games.map { consoleGame($0) })
+        let heroes = Dictionary(state.games.compactMap { g in g.hero.map { (g.id, ($0, g.heroFocus)) } }) { a, _ in a }   // kept across a refresh: no flash
+        let shown = LibraryFilter.load() == .built ? library.games.filter(LibraryFilter.built.includes) : library.games   // the desktop's filter
+        let games = ConsoleGame.readyFirst(shown.map { var g = consoleGame($0); (g.hero, g.heroFocus) = heroes[g.id].map { ($0.0, $0.1) } ?? (nil, .center); return g })
         state.games = games
+        refreshPages(shown)   // all games' order, the search's results (LiveConsoleDriver+Pages.swift)
         state.focusedGameID = games.contains { $0.id == focus } ? focus : (library.selected.map { $0.id.uuidString }.flatMap { id in games.contains { $0.id == id } ? id : nil } ?? games.first?.id)
-        state.time = Date()
+        state.time = Date(); loadHero()
+        reloadOpenDetails()   // the open options page keeps its mods, cheats, save and Reset
     }
 
     static func status(of game: LibraryGame, brokenMessage: String) -> ConsoleGame.Status {
@@ -176,92 +230,166 @@ struct ConsolePadSnapshot: Equatable {
         let store = SavedChoices(app: game.appPath, titleID: game.titleID)
         var values: [String: String] = [:]
         for s in settings { values[s.env] = s.storeBacked ? store.current(s) : game.launchValue(s) }
-        return ConsoleGame(id: game.id.uuidString, title: game.name, version: version(of: game),
-                           platforms: Self.platforms(of: game), artwork: cover(game), artworkFocus: game.artwork.focus(for: .thumbnail),
-                           status: Self.status(of: game, brokenMessage: t("console.broken")), settings: settings, values: values)
-    }
-
-    private var versions: [String: String] = [:]
-
-    /// The version of the build the library knows: the Mac app's Info.plist (pack_app.py writes CFBundleShortVersionString), else the
-    /// iPhone app's, else the one inside the IPA. Empty only when none of them states one.
-    private func version(of game: LibraryGame) -> String {
-        for path in [game.appPath, game.iosAppPath, game.ipaPath] where !path.isEmpty {
-            if let cached = versions[path] { if !cached.isEmpty { return cached }; continue }
-            let found = Self.version(at: path)
-            versions[path] = found
-            if !found.isEmpty { return found }
+        let macUpstream = game.playableMacBundle?.upstream
+        let builtTunedName = (macUpstream?.group == .gameTuned) ? macUpstream?.displayName : nil
+        let tunedNames = EngineUpstream.tunedEngines(forTitleID: game.titleID).map(\.displayName)
+        var console = ConsoleGame(id: game.id.uuidString, title: game.displayName(lang()), version: version(of: game),
+                                  platforms: Self.platforms(of: game), artwork: cover(game), artworkFocus: game.artwork.focus(for: .thumbnail),
+                                  status: Self.status(of: game, brokenMessage: t("console.broken")), settings: settings, values: values,
+                                  mapsButtons: game.isReady && SavedChoices.appReadsControllerMappings(app: game.appPath)
+                                      && game.controllerSavingEnabled(environment: game.launchOptions),
+                                  isMacNativeGames: macUpstream == .macNativeGames,
+                                  builtTunedEngineName: builtTunedName,
+                                  tunedEngineNames: tunedNames)
+        applyMultiBuildInfo(&console, from: game)
+        // built by nxkit without a game profile (v0lumehi/nxkit#54): read here, the views never touch the file
+        if game.isReady, let app = game.playableMacBundle, app.upstream == .nxkit, let profile = NxkitBuildProfile.read(app: game.appPath) {
+            console.genericBuild = profile
+            console.genericReport = NxkitFeedback.genericBuildReportURL(gameName: game.displayName(lang()), titleID: game.titleID,
+                                                                        gameVersion: app.version ?? "",
+                                                                        nxkitVersion: profile.nxkitVersion ?? nxkitVersion(game.titleID) ?? "")
         }
-        return ""
+        return withHistory(of: game, console)
     }
 
-    /// The display version in a build: a .app (Contents/Info.plist), an iOS .app (Info.plist) or an IPA (Payload/*.app/Info.plist).
-    static func version(at path: String) -> String {
-        let url = URL(fileURLWithPath: path)
-        if url.pathExtension.lowercased() == "ipa" {
-            let process = Process(), pipe = Pipe()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
-            process.arguments = ["-p", path, "Payload/*.app/Info.plist"]
-            process.standardOutput = pipe; process.standardError = FileHandle.nullDevice
-            guard (try? process.run()) != nil else { return "" }
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-            return version(plist: data)
-        }
-        for relative in ["Contents/Info.plist", "Info.plist"] {
-            if let data = try? Data(contentsOf: url.appendingPathComponent(relative)) { let v = version(plist: data); if !v.isEmpty { return v } }
-        }
-        return ""
-    }
+    /// The library's game behind a console game (LiveConsoleDriver+Mapping.swift reads its own button mapping).
+    func libraryGame(_ id: String) -> LibraryGame? { library.games.first { $0.id.uuidString == id } }
 
-    static func version(plist data: Data) -> String {
-        guard let info = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] else { return "" }
-        let v = (info["CFBundleShortVersionString"] as? String) ?? (info["CFBundleVersion"] as? String) ?? ""
-        return v.trimmingCharacters(in: .whitespaces)
-    }
+    var versions: [String: String] = [:]   // LiveConsoleDriver+Version.swift
 
-    /// Covers through the launcher's own lookup, decoded once per image path.
+    /// Covers through the launcher's own lookup, decoded once per image file stamp. Missing covers are never cached.
     private func cover(_ game: LibraryGame) -> NSImage? {
-        let key = "\(game.artwork)|\(game.artworkPath)|" + game.titleID + "|" + game.name
-        if let cached = covers[game.id], cached.path == key { return cached.image }
-        let image = artwork(game, repo())
+        let key = coverKey(for: game)
+        if let cached = covers[game.id], cached.key == key { return cached.image }
+        guard let image = artwork(game, repo()) else {
+            covers.removeValue(forKey: game.id)
+            return nil
+        }
         covers[game.id] = (key, image)
         return image
     }
 
-    /// Covers downloaded after the first draw (ArtworkStore) show up when the console asks again.
-    func reloadCovers() { covers = [:]; refresh() }
+    private func coverKey(for game: LibraryGame) -> String {
+        let fileStamp: String
+        if let url = GameLibrary.artworkURLs(for: game, slot: .thumbnail, repo: repo(), banners: library.artworkDirectory).first,
+           let attrs = try? FileManager.default.attributesOfItem(atPath: url.path) {
+            let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
+            let mtime = (attrs[.modificationDate] as? Date)?.timeIntervalSinceReferenceDate ?? 0
+            fileStamp = "\(url.path)|\(size)|\(mtime)"
+        } else {
+            fileStamp = "none"
+        }
+        return "\(game.artwork)|\(game.artworkPath)|\(game.titleID)|\(game.name)|\(fileStamp)"
+    }
 
-    func focus(_ gameID: String) { state.focus(gameID) }
+    /// Covers downloaded after the first draw (ArtworkStore) show up when the console asks again.
+    func reloadCovers() { covers = [:]; for i in state.games.indices { state.games[i].hero = nil }; refresh() }
+
+    func focus(_ gameID: String) { state.focus(gameID); loadHero() }
 
     func play(_ gameID: String) {
+        if state.pausedGameID == gameID { resume(gameID); return }   // the paused game plays on where it was (#952)
+        guard state.startingGameID == nil else { return }
         state.play(gameID)
-        guard state.startingGameID == gameID, let game = library.games.first(where: { $0.id.uuidString == gameID }) else { return }
-        let environment = GameStart.environment(for: game, library: library, controls: controls, repo: repo(), labels: labels, fullscreen: true)
-            .merging(pointerHidden() ? ["DM_CURSOR_HIDDEN": "1"] : [:]) { $1 }   // the game is a new process: without this its pointer shows until its own idle wait ends
-            .merging(FrameTimes.recordingEnvironment(for: game, library: library.folder)) { $1 }   // a frame-time recording, as the desktop Play adds (FrameTimes.swift)
-        state.starting = .preparing
-        prepareLaunch { [weak self] in
-            guard let self else { return }
-            guard self.state.startingGameID == gameID else { self.gameEnded(); return }
-            self.openGame(game, environment: environment, gameID: gameID)
+        guard state.startingGameID == gameID, library.games.contains(where: { $0.id.uuidString == gameID }) else { return }
+        launchGeneration &+= 1
+        let generation = launchGeneration
+        state.launchCancellable = launchGracePeriod > 0
+        pendingLaunch?.cancel()
+        if launchGracePeriod <= 0 { beginLaunch(gameID, generation: generation); return }
+        pendingLaunch = Task { [weak self] in
+            guard let delay = self?.launchGracePeriod else { return }
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard !Task.isCancelled, let self, self.launchGeneration == generation, self.state.startingGameID == gameID else { return }
+            self.state.launchCancellable = false
+            self.beginLaunch(gameID, generation: generation)
         }
     }
 
-    private func openGame(_ game: LibraryGame, environment: [String: String], gameID: String) {
+    func cancelPendingLaunch() -> Bool {
+        guard state.startingGameID != nil else { return false }
+        pendingLaunchUpstreamOverride = nil
+        pendingLaunch?.cancel(); pendingLaunch = nil
+        timeoutTask?.cancel()
+        if launchedPID == nil || launchedGame?.id.uuidString != state.startingGameID {
+            launchGeneration &+= 1
+            mngMigration.cancel()
+            cloudGate.cancel()
+            state.returnFromGame()
+            gameEnded()
+        } else {
+            state.returnFromGame()
+        }
+        return true
+    }
+
+    private func beginLaunch(_ gameID: String, generation: UInt64) {
+        guard launchGeneration == generation, state.startingGameID == gameID,
+              let game = resolvedLaunchGame(for: gameID) else { return }
+        let environment = GameStart.environment(for: game, library: library, controls: controls, repo: repo(), labels: labels, lang: lang(), fullscreen: true, player: player(), saves: saves(game.titleID), sticks: sticks(), homeMenu: true)   // the Home menu's way back here (#952)
+            .merging(pointerHidden() ? ["DM_CURSOR_HIDDEN": "1", "NXKIT_CURSOR_HIDDEN": "1"] : [:]) { $1 }   // the game is a new process: without this its pointer shows until its own idle wait ends (nxkit reads its own name)
+            .merging(FrameTimes.recordingEnvironment(for: game, library: library.folder)) { $1 }   // a frame-time recording, as the desktop Play adds (FrameTimes.swift)
+        state.starting = .preparing
+        beginAfterMngMigration(game: game, gameID: gameID, generation: generation) { [weak self] in
+            guard let self, self.launchGeneration == generation, self.state.startingGameID == gameID else { return }
+            self.cloudGameID = gameID
+            self.cloudGate.begin(game, environment: environment, proceed: { [weak self] choice in   // the cloud's save first (LiveConsoleDriver+CloudSave.swift, #957)
+            guard let self, self.launchGeneration == generation, self.state.startingGameID == gameID else { return }
+            self.state.starting = .preparing
+            self.prepareLaunch { [weak self] in
+                guard let self else { return }
+                guard self.launchGeneration == generation, self.state.startingGameID == gameID else { return }
+                let latest = self.resolvedLaunchGame(for: gameID) ?? game
+                MacGameMode.shared.prepareForLaunch(enabled: latest.macGameModeDesired, forApp: latest.appPath) { [weak self] error in
+                    MainActor.assumeIsolated {
+                        guard let self else { return }
+                        guard self.launchGeneration == generation, self.state.startingGameID == gameID else { return }
+                        if let error { self.clearLaunchOverrideAndFail(error.localizedDescription); return }
+                        self.pendingLaunchUpstreamOverride = nil
+                        self.openGame(latest, environment: environment.merging(choice) { $1 }, gameID: gameID, generation: generation)
+                    }
+                }
+            }
+        }, ended: { [weak self] in
+            guard let self, self.launchGeneration == generation else { return }
+            self.pendingLaunchUpstreamOverride = nil; self.state.returnFromGame()
+        })
+        }
+    }
+
+    private func openGame(_ game: LibraryGame, environment: [String: String], gameID: String, generation: UInt64) {
+        let armedCheats = CheatFuseMonitor.shared.prepareAndArm(for: game, shellRoot: shellRoot())
         launch(game, environment) { [weak self] pid, error in
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
-                    guard let self, self.state.startingGameID == gameID else { return }
-                    if let error { self.state.returnFromGame(); self.gameEnded(); self.showToast(error.localizedDescription); return }
+                    guard let self else { CheatFuseMonitor.shared.abort(armedCheats); return }
+                    // LaunchServices may return an app started elsewhere. A stale callback does not own that process.
+                    guard self.launchGeneration == generation else { CheatFuseMonitor.shared.abort(armedCheats); return }
+                    guard self.state.startingGameID == gameID else { CheatFuseMonitor.shared.abort(armedCheats); return }
+                    if let error { CheatFuseMonitor.shared.abort(armedCheats); self.state.returnFromGame(); self.gameEnded(); self.showToast(error.localizedDescription, kind: "error"); return }
                     self.launchedPID = pid
+                    self.library.recordPlayed(game.id)   // the Recently played order (#937)
+                    if let pid { self.beginTracking(game, pid: pid, environment: environment) }   // the session, its pause and its end (+Sessions)
                     self.launchedGame = game
-                    if let pid { GameReturnWatcher.shared.didStart(pid: pid) { [weak self] in self?.gameDidTerminate(pid: pid) } }   // the launcher's one watcher and its switch (ReturnAfterPlay.swift)
+                    if let pid {   // the launcher's one watcher and its switch (ReturnAfterPlay.swift), and the cloud's send an engine leaves to it (SaveEngine)
+                        CheatFuseMonitor.shared.didStart(pid: pid, pending: armedCheats)
+                        GameReturnWatcher.shared.didStart(pid: pid) { [weak self] in
+                            CheatFuseMonitor.shared.didExit(pid: pid)
+                            CloudSaveSend.afterExit(app: game.appPath, titleID: game.titleID, environment: environment, engine: SaveEngines.forApp(game.appPath, titleID: game.titleID))
+                            self?.gameDidTerminate(pid: pid)
+                        }
+                    } else {
+                        CheatFuseMonitor.shared.abort(armedCheats)
+                    }
                     self.state.starting = .opening
                     self.timeoutTask?.cancel()
+                    // An app nxkit built says when its picture shows (org.nxkit.shown, at the latest 45 s after its window):
+                    // the Starting screen waits for it, with a longer fallback than the usual one
+                    let nxkit = self.tracking.notificationPrefix == NxkitLaunch.notificationPrefix
+                    let wait = nxkit ? max(self.startingTimeout, 120) : self.startingTimeout
                     self.timeoutTask = Task { [weak self] in
-                        try? await Task.sleep(nanoseconds: UInt64((self?.startingTimeout ?? 20) * 1_000_000_000))
-                        guard !Task.isCancelled else { return }
+                        try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+                        guard !Task.isCancelled, self?.launchGeneration == generation else { return }
                         self?.gameWindowAppeared()
                     }
                 }
@@ -273,7 +401,9 @@ struct ConsolePadSnapshot: Equatable {
     /// 150 ms whatever it hid before, one that takes a yielded activation itself keeps it hidden (issue #380). Only with the pointer hidden
     /// (DM_CURSOR_HIDDEN), as the game hides it before it activates itself then.
     static func yieldTarget(environment: [String: String], appPath: String) -> String? {
-        guard environment["DM_CURSOR_HIDDEN"] == "1" else { return nil }
+        // An app nxkit built over the console (NXKIT_OVERLAY) is never activated by LaunchServices: active before its window
+        // exists, it would take the player to the desktop. It takes the front itself when its picture shows.
+        guard environment["DM_CURSOR_HIDDEN"] == "1" || environment["NXKIT_OVERLAY"] == "1" else { return nil }
         return Bundle(url: URL(fileURLWithPath: appPath))?.bundleIdentifier
     }
 
@@ -291,7 +421,7 @@ struct ConsolePadSnapshot: Equatable {
 
     /// The game's window took the front (or the wait ran out): Starting ends, the console stays selected on the game.
     func gameWindowAppeared() {
-        guard state.startingGameID != nil, launchedPID != nil || !devicePads else { return }
+        guard let id = state.startingGameID, launchedPID == nil ? !devicePads : launchedGame?.id.uuidString == id else { return }
         timeoutTask?.cancel()
         state.returnFromGame()
     }
@@ -302,14 +432,14 @@ struct ConsolePadSnapshot: Equatable {
         guard pid == launchedPID else { return }
         launchedPID = nil
         timeoutTask?.cancel()
-        state.returnFromGame()
-        gameEnded()
-        if let game = launchedGame { launchedGame = nil; offerHomeButtonHint(after: game) }
+        let game = launchedGame
+        launchedGame = nil
+        gameSessionEnded(game)   // the history, a crash, what waited for a paused game (+Sessions), then the Home button hint
     }
 
     // MARK: Home button (#336)
 
-    private var launchedGame: LibraryGame?
+    var launchedGame: LibraryGame?
     /// The Home button setting the game's last session wrote to its log (HomeButtonHint), the switch "already shown", whether this
     /// is macOS 27 and the way to the setting. Tests replace them.
     var homeButtonReported: (LibraryGame) -> String? = { HomeButtonSettings.reported(by: $0) }
@@ -318,7 +448,7 @@ struct ConsolePadSnapshot: Equatable {
     var openHomeSettings: () -> Void = { HomeButtonSettings.open() }
 
     /// After a game quit: the hint, once, when that game found that the system keeps the Home button for itself.
-    private func offerHomeButtonHint(after game: LibraryGame) {
+    func offerHomeButtonHint(after game: LibraryGame) {
         let shown = homeHintDefaults.bool(forKey: HomeButtonHint.shownKey)
         guard HomeButtonHint.shouldShow(setting: homeButtonReported(game), shown: shown, macOS27: isMacOS27) else { return }
         homeHintDefaults.set(true, forKey: HomeButtonHint.shownKey)
@@ -332,7 +462,6 @@ struct ConsolePadSnapshot: Equatable {
 
     // MARK: Options
 
-    func openOptions(_ gameID: String) { state.openOptions(gameID) }
 
     func setOption(gameID: String, setting env: String, value: String) {
         state.setOption(game: gameID, setting: env, value: value)
@@ -340,6 +469,12 @@ struct ConsolePadSnapshot: Equatable {
               let shown = state.games.first(where: { $0.id == gameID }), let s = shown.settings.first(where: { $0.env == env }),
               let stored = shown.values[env] else { return }
         if s.storeBacked { SavedChoices(app: game.appPath, titleID: game.titleID).set(s, stored) } else { library.setLaunchOption(s, stored, for: game.id) }
+        // Reset to defaults shows once something differs. Only that is read again here: the rest of the details (the cloud save's
+        // state reads the whole game log) stays as the options page loaded it, so a slider moves without waiting on the disk.
+        if let updated = library.games.first(where: { $0.id == game.id }), let i = state.games.firstIndex(where: { $0.id == gameID }) {
+            state.games[i].canReset = updated.hasLauncherOptions
+                || SavedChoices(app: updated.appPath, titleID: updated.titleID).hasChoices(state.games[i].settings)
+        }
     }
 
     // MARK: Controllers
@@ -354,7 +489,7 @@ struct ConsolePadSnapshot: Equatable {
         guard state.padMerge else { return }
         controls.padMerge = false
         state.padMerge = false
-        showToast(t("console.mergeOff"))
+        showToast(t("console.mergeOff"), kind: "controller")
     }
 
     /// The next press from any controller is taken as the answer, for 8 seconds.
@@ -364,10 +499,12 @@ struct ConsolePadSnapshot: Equatable {
             try? await Task.sleep(nanoseconds: UInt64((self?.captureSeconds ?? 8) * 1_000_000_000))
             guard !Task.isCancelled, let self, self.state.assigningPlayer != nil else { return }
             self.cancelCapture()
-            self.showToast(self.t("console.assignTimeout"))
+            self.showToast(self.t("console.assignTimeout"), kind: "controller")
         }
     }
     var captureSeconds: TimeInterval = 8
+
+    func cancelAssignment() { cancelCapture() }
 
     private func cancelCapture() {
         assignTimeout?.cancel()
@@ -394,18 +531,9 @@ struct ConsolePadSnapshot: Equatable {
     /// hand are taken and ignored.
     func consumePress(controllerID: String, isBack: Bool) -> Bool {
         guard let player = state.assigningPlayer, state.presentedSheet == .controllers else { return false }
-        let resolvedID: String
-        if let target = state.assigningControllerID {
-            guard target == controllerID || Self.baseControllerID(target) == controllerID else { return true }
-            resolvedID = target
-        } else if state.controllers.contains(where: { $0.id == controllerID }) {
-            resolvedID = controllerID
-        } else if let split = state.controllers.first(where: { Self.baseControllerID($0.id) == controllerID }) {
-            resolvedID = split.id
-        } else {
-            resolvedID = controllerID
-        }
-        if isBack { cancelCapture(); showToast(t("console.assignCancelled")); return true }
+        if let target = state.assigningControllerID, target != controllerID { return true }
+        let resolvedID = state.assigningControllerID ?? controllerID
+        if isBack { cancelCapture(); showToast(t("console.assignCancelled"), kind: "controller"); return true }
         assignPlayer(controllerID: resolvedID, player: player)
         return true
     }
@@ -419,110 +547,39 @@ struct ConsolePadSnapshot: Equatable {
         overrides[controllerID] = player
         state.assigningPlayer = nil; state.assigningControllerID = nil
         assignTimeout?.cancel()
-        for (id, value) in overrides where !id.hasSuffix(".R") {
+        for (id, value) in overrides {
             devices[id]?.playerIndex = value == 0 ? .indexUnset : (GCControllerPlayerIndex(rawValue: value - 1) ?? .indexUnset)
         }
         refreshControllers(announce: false)
-        showToast(String(format: t("console.assignedTo"), pad.name, player))
+        showToast(String(format: t("console.assignedTo"), pad.name, player), kind: "controller")
     }
     func setPadMerge(_ enabled: Bool) { controls.padMerge = enabled }
-    func setJoyconSplit(_ enabled: Bool) {
-        controls.joyconSplit = enabled
-        state.joyconSplit = enabled
-        resetPairedDevicePlayerIndices()
-        refreshControllers(announce: false)
-    }
-
-    /// Clears hardware playerIndex on paired Joy-Con `GCController` instances when toggling split mode so auto-assignment starts cleanly from P1/P2.
-    private func resetPairedDevicePlayerIndices() {
-        guard devicePads else { return }
-        for c in GCController.controllers() {
-            let cat = c.productCategory.lowercased().replacingOccurrences(of: "-", with: "")
-            if cat.contains("joycon") { c.playerIndex = .indexUnset }
-        }
-    }
-
-    static func baseControllerID(_ id: String) -> String {
-        (id.hasSuffix(".L") || id.hasSuffix(".R")) ? String(id.dropLast(2)) : id
-    }
-
-    /// Expands each paired Joy-Con snapshot into separate `Joy-Con (L)` and `Joy-Con (R)` sideways controller snapshots when `enabled` is true (#740).
-    static func splitJoyConSnapshots(_ pads: [ConsolePadSnapshot], enabled: Bool) -> [ConsolePadSnapshot] {
-        guard enabled else { return pads }
-        var out: [ConsolePadSnapshot] = []
-        for pad in pads {
-            if pad.controller.kind == .paired {
-                out.append(ConsolePadSnapshot(id: pad.id + ".L", name: "Joy-Con (L)", category: "Nintendo Switch Joy-Con (L)",
-                                              playerIndex: pad.playerIndex, battery: pad.battery, charging: pad.charging, canIdentify: pad.canIdentify, kindOverride: .gamepad))
-                out.append(ConsolePadSnapshot(id: pad.id + ".R", name: "Joy-Con (R)", category: "Nintendo Switch Joy-Con (R)",
-                                              playerIndex: nil, battery: pad.battery, charging: pad.charging, canIdentify: pad.canIdentify, kindOverride: .gamepad))
-            } else {
-                out.append(pad)
-            }
-        }
-        return out
-    }
 
     /// What this controller can do for Identify. The player lights have no capability flag in GameController, so any gamepad counts.
     static func identifyActions(_ c: GCController) -> [IdentifyPlan.Action] {
         IdentifyPlan.actions(playerLights: c.extendedGamepad != nil, lightBar: c.light != nil, rumble: c.haptics != nil)
     }
 
-    private static let log = Logger(subsystem: "NX2Apple", category: "console.identify")
-    private var identifyEngines: [String: CHHapticEngine] = [:]   // kept alive: an engine that is released stops its pattern
-    private var identifyTask: Task<Void, Never>?
-
-    /// Everything the controller has: its player lights step through 1 to 4, the light bar pulses, it rumbles. The assigned player
-    /// and the light's colour are restored after.
-    func identify(controllerID: String) {
-        guard let c = state.controllers.first(where: { $0.id == controllerID }) else { return }
-        state.identifyingControllerID = controllerID
-        showToast(String(format: t("console.identifyingName"), c.name))
-        guard let pad = devices[controllerID] else { return }
-        let actions = Self.identifyActions(pad)
-        Self.log.debug("identify \(c.name, privacy: .public): \(actions.map { "\($0)" }.joined(separator: ","), privacy: .public)")
-        identifyTask?.cancel()
-        identifyTask = Task { [weak self] in
-            let player = pad.playerIndex
-            let color = pad.light?.color
-            if actions.contains(.rumble) { self?.rumble(pad, id: controllerID) }
-            for step in 0..<8 {
-                guard !Task.isCancelled else { break }
-                if actions.contains(.playerLights) { pad.playerIndex = GCControllerPlayerIndex(rawValue: step % 4) ?? .indexUnset }
-                if actions.contains(.lightBar) { pad.light?.color = step % 2 == 0 ? GCColor(red: 1, green: 0.1, blue: 0.9) : GCColor(red: 0.1, green: 0.9, blue: 1) }
-                try? await Task.sleep(nanoseconds: 140_000_000)
-            }
-            pad.playerIndex = player
-            if let color { pad.light?.color = color }
-        }
-    }
-
-    private func rumble(_ pad: GCController, id: String) {
-        guard let haptics = pad.haptics else { Self.log.debug("identify: no haptics on this controller"); return }
-        let localities: [GCHapticsLocality]
-        if id.hasSuffix(".L") {
-            localities = [.leftHandle, .default, .all, .handles]
-        } else if id.hasSuffix(".R") {
-            localities = [.rightHandle, .default, .all, .handles]
-        } else {
-            localities = [.default, .all, .handles, .leftHandle, .rightHandle]
-        }
-        guard let engine = localities.lazy.compactMap({ haptics.createEngine(withLocality: $0) }).first else {
-            Self.log.debug("identify: haptics exist but no engine could be created (supported localities: \(haptics.supportedLocalities.map(\.rawValue).joined(separator: ","), privacy: .public))")
-            return
-        }
-        identifyEngines[id] = engine
-        do {
-            try engine.start()
-            let events = [CHHapticEvent(eventType: .hapticContinuous, parameters: [CHHapticEventParameter(parameterID: .hapticIntensity, value: 1),
-                                                                                  CHHapticEventParameter(parameterID: .hapticSharpness, value: 0.6)],
-                                        relativeTime: 0, duration: 0.9)]
-            try engine.makePlayer(with: CHHapticPattern(events: events, parameters: [])).start(atTime: CHHapticTimeImmediate)
-        } catch { Self.log.debug("identify: rumble failed: \(error.localizedDescription, privacy: .public)") }
-    }
+    static let log = Logger(subsystem: "NX2Apple", category: "console.identify")
+    var identifyEngines: [String: CHHapticEngine] = [:]   // kept alive: an engine that is released stops its pattern
+    var identifyTask: Task<Void, Never>?
+    var identifyPlayers: [String: CHHapticPatternPlayer] = [:]   // the running pattern of each controller, stopped by hand
+    var rumbleStops: [String: Task<Void, Never>] = [:]
+    var identifyRunning: String?   // the controller whose Identify is going: a second press only shows the toast again, so the player and the light it restores are the real ones
+    static let rumbleSeconds = 0.9
 
     /// macOS offers apps no way to drop a Bluetooth controller, so this says where to do it instead.
-    func disconnect(controllerID: String) { showToast(t("console.disconnectHint")) }
+    func disconnect(controllerID: String) { showToast(t("console.disconnectHint"), kind: "controller") }
+
+    /// The launcher's app updates and builds, for the General page's update row, which waits while a build runs (LiveConsoleDriver+Desktop). Set by the session.
+    weak var appUpdates: AppUpdateStore?
+    weak var builds: BuildStore?
+    weak var buildQueue: BuildQueueStore?
+    var buildEngineID: () -> String = { "" }
+    /// The nxkit version that built a game, by title id (BuildStore.nxkitRecord), for the report of a build without a game profile.
+    var nxkitVersion: (String) -> String? = { _ in nil }
+    /// Opens a page in the browser (the report of a build without a game profile). Tests replace it.
+    var openURL: (URL) -> Void = { NSWorkspace.shared.open($0) }
 
     /// Controllers that have no player take the next free one, in the order they are listed, as a console does. A fifth has none.
     static func autoAssigned(_ pads: [ConsolePadSnapshot], remembered: [String: Int] = [:]) -> [ConsolePadSnapshot] {
@@ -568,12 +625,10 @@ struct ConsolePadSnapshot: Equatable {
             guard let player = pad.playerIndex, primedPlayer[pad.id] != player else { continue }
             primedPlayer[pad.id] = player
             if let sendPlayerOutput {
-                if !pad.id.hasSuffix(".R") { sent = true; sendPlayerOutput(pad.id, player) }
+                sent = true; sendPlayerOutput(pad.id, player)
                 continue
             }
-            // A split Joy-Con pair shares one underlying GCController instance between `.L` and `.R`. Writing `.R`'s playerIndex back to
-            // that shared instance overwrites `.L`'s hardware playerIndex and causes P1/P2 to ping-pong on every reread (#740).
-            guard let device = devices[pad.id], !pad.id.hasSuffix(".R") else { continue }
+            guard let device = devices[pad.id] else { continue }
             sent = true
             device.playerIndex = GCControllerPlayerIndex(rawValue: player - 1) ?? .indexUnset
             if let light = device.light {
@@ -632,10 +687,10 @@ struct ConsolePadSnapshot: Equatable {
         let first = connected ? announced.insert(id).inserted : announced.remove(id) != nil
         controllerListChanged(connectedName: connected ? name : nil, disconnectedName: connected ? nil : name, including: including, excluding: excluding)
         guard first else { Self.hidLog.debug("repeated \(connected ? "connect" : "disconnect") for \(id, privacy: .public) ignored"); return false }
-        guard connected else { showToast(String(format: t("console.disconnected"), name)); return true }
+        guard connected else { showToast(String(format: t("console.disconnected"), name), kind: "controller"); return true }
         if let player = state.padMerge ? 1 : state.controllers.first(where: { $0.id == id })?.player {
-            showToast(String(format: t("console.connected"), name, player))
-        } else { showToast(t("console.noFreePlayer"), glyph: ConsoleGlyphs.current().glyph(for: .controllers)) }
+            showToast(String(format: t("console.connected"), name, player), kind: "controller")
+        } else { showToast(t("console.noFreePlayer"), glyph: ConsoleGlyphs.current().glyph(for: .menu), kind: "controller") }
         scheduleBatteryRereads()
         return true
     }
@@ -648,13 +703,13 @@ struct ConsolePadSnapshot: Equatable {
     private func tearDown(_ pad: GCController) {
         let id = String(UInt(bitPattern: ObjectIdentifier(pad).hashValue), radix: 16)
         pad.physicalInputProfile.valueDidChangeHandler = nil
-        for key in [id, id + ".L", id + ".R"] {
-            identifyEngines.removeValue(forKey: key)?.stop(completionHandler: nil)
-            if state.identifyingControllerID == key { identifyTask?.cancel(); state.identifyingControllerID = nil }
-            devices[key] = nil
-            overrides[key] = nil
-            primedPlayer[key] = nil
-        }
+        stopRumble(id)
+        identifyEngines.removeValue(forKey: id)
+        if identifyRunning == id { identifyRunning = nil }
+        if state.identifyingControllerID == id { identifyTask?.cancel(); state.identifyingControllerID = nil }
+        devices[id] = nil
+        overrides[id] = nil
+        primedPlayer[id] = nil
         batteryWatchers[id] = nil
         Self.hidLog.debug("torn down \(id, privacy: .public)")
     }
@@ -692,16 +747,10 @@ struct ConsolePadSnapshot: Equatable {
                                           charging: reading?.charging ?? false, canIdentify: !Self.identifyActions(c).isEmpty)
             }
         }
-        snapshots = Self.splitJoyConSnapshots(snapshots, enabled: controls.joyconSplit)
-        if devicePads, controls.joyconSplit {
-            for snap in snapshots where snap.id.hasSuffix(".L") || snap.id.hasSuffix(".R") {
-                let base = Self.baseControllerID(snap.id)
-                if let dev = devices[base] { devices[snap.id] = dev }
-            }
-        }
+        snapshots += steamPads()
+        snapshots += hidPads()
         let live = Set(snapshots.map(\.id))
-        let liveBase = Set(snapshots.map { Self.baseControllerID($0.id) })
-        batteryWatchers = batteryWatchers.filter { liveBase.contains($0.key) || !devicePads }
+        batteryWatchers = batteryWatchers.filter { live.contains($0.key) || !devicePads }
         overrides = overrides.filter { live.contains($0.key) }
         snapshots = snapshots.map { snap in
             guard let chosen = overrides[snap.id] else { return snap }
@@ -709,7 +758,7 @@ struct ConsolePadSnapshot: Equatable {
             return s
         }
         let assigned = Self.autoAssigned(snapshots, remembered: remembered)
-        for (old, new) in zip(snapshots, assigned) where old.playerIndex != new.playerIndex && !new.id.hasSuffix(".R") {
+        for (old, new) in zip(snapshots, assigned) where old.playerIndex != new.playerIndex {
             devices[new.id]?.playerIndex = GCControllerPlayerIndex(rawValue: (new.playerIndex ?? 1) - 1) ?? .indexUnset
         }
         for pad in assigned { if let p = pad.playerIndex { remembered[Self.memoryKey(pad)] = p } }
@@ -719,37 +768,6 @@ struct ConsolePadSnapshot: Equatable {
             Self.hidLog.debug("publish \(list.count) controllers at \(self.stamp(), privacy: .public): \(list.map { "\($0.name)" }.joined(separator: ", "), privacy: .public)")
             state.controllers = list
         }
+        if controls.padMode == .auto { refreshPadLayout() }   // Auto's buttons follow the controller connected now
     }
-
-    // MARK: Navigation
-
-    func dismissToast() { toastTask?.cancel(); state.toast = nil; state.identifyingControllerID = nil }
-    func back() { state.back() }
-    func exitToDesktop() { state.exitToDesktop() }
-    func returnFromGame() { state.returnFromGame() }
-
-    private func showToast(_ message: String, glyph: ConsoleGlyphs.Glyph? = nil) {
-        toastTask?.cancel()
-        state.toast = ConsoleToast(glyph: glyph, message: message)
-        toastTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
-            guard !Task.isCancelled else { return }
-            self?.state.toast = nil
-            self?.state.identifyingControllerID = nil
-        }
-    }
-}
-
-/// Calls `handler` whenever one of the object's key-value observable properties changes.
-final class KeyValueWatcher: NSObject {
-    private let object: NSObject   // held, so it cannot go away while observed
-    private let keys: [String]
-    private let handler: () -> Void
-    init(object: NSObject, keys: [String], handler: @escaping () -> Void) {
-        self.object = object; self.keys = keys; self.handler = handler
-        super.init()
-        for key in keys { object.addObserver(self, forKeyPath: key, options: [], context: nil) }
-    }
-    override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey: Any]?, context: UnsafeMutableRawPointer?) { handler() }
-    deinit { for key in keys { object.removeObserver(self, forKeyPath: key) } }
 }

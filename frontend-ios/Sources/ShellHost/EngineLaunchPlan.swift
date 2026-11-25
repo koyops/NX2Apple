@@ -19,14 +19,31 @@ public struct EngineLaunchPlan: Equatable, Sendable {
     public var workingDirectory: URL
     /// The save and temp folders.
     public var foldersToCreate: [URL]
+    /// `Documents/games/<title ID>/`: where per-game `save/`, `temp/`, and `env.txt` live.
+    public var gameDirectory: URL
+    /// Display title for generating a readable `env.txt` header when missing.
+    public var gameTitle: String
+
+    public init(environment: [String: String], arguments: [String], frameworkExecutable: URL, imageMarker: String,
+                logURL: URL, workingDirectory: URL, foldersToCreate: [URL],
+                gameDirectory: URL? = nil, gameTitle: String = "") {
+        self.environment = environment
+        self.arguments = arguments
+        self.frameworkExecutable = frameworkExecutable
+        self.imageMarker = imageMarker
+        self.logURL = logURL
+        self.workingDirectory = workingDirectory
+        self.foldersToCreate = foldersToCreate
+        self.gameDirectory = gameDirectory ?? foldersToCreate.first?.deletingLastPathComponent() ?? workingDirectory
+        self.gameTitle = gameTitle
+    }
 
     /// `envFileText` is the shared `Documents/env.txt`. `gameEnvFileText` is the game's own `Documents/games/<title ID>/env.txt`
-    /// (#557), read from `game.appFolder` when it is nil. A key in the game's file wins over the shared file, and the launch
-    /// environment (the player's settings, the paths above) wins over both. The game's own `mods/` folder sets
-    /// `DM_ROMFS_OVERLAY` (`GameMods`) when the game's env file does not, and it wins over the shared file. The order is: launch
-    /// environment, game env.txt, game mods folder, shared env.txt, framework dm/env.txt.
-    /// The framework file carries build-time defaults such as CPU BC decoding for older GPUs (#719). Automatic `DM_PSO_BUNDLE`
-    /// discovery is a fallback after all env files, so an explicit archive path or `off` can override it.
+    /// (#557), read from `game.appFolder` when it is nil. The precedence order is: explicit UI settings (and launch paths),
+    /// per-game `env.txt`, shell defaults, game `mods/` folder, shared `Documents/env.txt`, framework `dm/env.txt`, and finally
+    /// untouched built-in profile defaults. The framework file carries build-time defaults such as CPU BC decoding for older
+    /// GPUs (#719). Automatic `DM_PSO_BUNDLE` discovery is a fallback after all env files, so an explicit archive path or `off`
+    /// can override it.
     public static func make(game: LaunchableGame, appResources: URL, documents: URL, envFileText: String?, gameEnvFileText: String? = nil,
                             fileManager fm: FileManager = .default) -> EngineLaunchPlan {
         let manifest = game.manifest, fw = game.frameworkURL, gdir = game.appFolder
@@ -38,14 +55,82 @@ public struct EngineLaunchPlan: Equatable, Sendable {
 
         let perGameProfile = gdir.appendingPathComponent("profile.tsv")
         env["DM_PROFILE"] = (fm.fileExists(atPath: perGameProfile.path) ? perGameProfile : fw.appendingPathComponent(manifest.profile)).path
-        if let romfs = romfs(in: game.dataURL, manifest: manifest, fm, isDirectory) { env["DM_ROMFS"] = romfs.path }
+        if let romfs = game.romfsURL ?? DataLocator.romfs(in: game.dataURL, manifest: manifest, fm)?.romfs {
+            env["DM_ROMFS"] = romfs.path
+        }
         let save = gdir.appendingPathComponent("save", isDirectory: true), temp = gdir.appendingPathComponent("temp", isDirectory: true)
         env["DM_SAVE"] = save.path
         env["DM_TEMP"] = temp.path
         env["DM_NVN_SHMAP"] = fw.appendingPathComponent(manifest.shaderMap).path
+        func isUsableOverrideDirectory(_ url: URL) -> Bool {
+            guard ExternalShaders.isUsableOverride(at: url, fileManager: fm) else { return false }
+            // An empty folder is accepted as a player test override (EngineLaunchPlanTests:58).
+            let entries = (try? fm.contentsOfDirectory(atPath: url.path))?
+                .filter { !ExternalShaders.isIncompleteEntry($0) && !$0.hasPrefix(".") } ?? []
+            if entries.isEmpty { return true }
+            // If the folder is non-empty, ensure it matches the game's expected chain or graphics API.
+            let expectedChain = manifest.chain
+            let explicitAPI = manifest.gfxAPI.flatMap { $0.isEmpty ? nil : $0 }
+            let expectedAPI: String?
+            if let explicitAPI {
+                expectedAPI = explicitAPI
+            } else if expectedChain.hasPrefix("b-") {
+                expectedAPI = "nvn"
+            } else {
+                expectedAPI = nil
+            }
+            func matchesChainOrAPI(in root: URL) -> Bool {
+                switch expectedAPI {
+                case "vulkan":
+                    return ExternalShaders.hasCompleteTree(at: root.appendingPathComponent("vk", isDirectory: true), fileManager: fm)
+                case "gl":
+                    return ExternalShaders.hasCompleteTree(at: root.appendingPathComponent("gl", isDirectory: true), fileManager: fm)
+                default:
+                    if !expectedChain.isEmpty {
+                        let chainDir = root.appendingPathComponent(expectedChain, isDirectory: true)
+                        let chainImg = root.appendingPathComponent(expectedChain + ".img")
+                        if ExternalShaders.hasCompleteTree(at: chainDir, fileManager: fm) || fm.fileExists(atPath: chainImg.path) {
+                            return true
+                        }
+                        if explicitAPI == nil {
+                            if ExternalShaders.hasCompleteTree(at: root.appendingPathComponent("vk", isDirectory: true), fileManager: fm)
+                                || ExternalShaders.hasCompleteTree(at: root.appendingPathComponent("gl", isDirectory: true), fileManager: fm) {
+                                return true
+                            }
+                        }
+                        return false
+                    }
+                    return true
+                }
+            }
+            if matchesChainOrAPI(in: url) { return true }
+            for name in entries where name.count >= 2 && name.hasPrefix("p") && name.dropFirst().allSatisfy({ $0.isASCII && $0.isNumber }) {
+                let progRoot = url.appendingPathComponent(name, isDirectory: true)
+                if matchesChainOrAPI(in: progRoot) { return true }
+            }
+            return false
+        }
+
         let ownMSL = gdir.appendingPathComponent("msl", isDirectory: true)
-        let bundledMSL = game.shaderResourcesURL ?? fw.appendingPathComponent("msl", isDirectory: true)
-        env["DM_MSL_DIR"] = (isDirectory(ownMSL) ? ownMSL : bundledMSL).path
+        let dataMSL = game.dataURL.appendingPathComponent("msl", isDirectory: true)
+        let fwMSL = fw.appendingPathComponent("msl", isDirectory: true)
+        let resolvedMSL: URL?
+        if game.usesEmbeddedShaderTrailer {
+            resolvedMSL = nil
+        } else if isUsableOverrideDirectory(ownMSL) {
+            resolvedMSL = ownMSL
+        } else if isUsableOverrideDirectory(dataMSL) {
+            resolvedMSL = dataMSL
+        } else if let shaderURL = game.shaderResourcesURL {
+            resolvedMSL = shaderURL
+        } else if isDirectory(fwMSL) {
+            resolvedMSL = fwMSL
+        } else {
+            resolvedMSL = fwMSL
+        }
+        if let resolvedMSL, !game.builtInDefaultKeys.contains("DM_MSL_DIR") {
+            env["DM_MSL_DIR"] = resolvedMSL.path
+        }
         let ownPSO = gdir.appendingPathComponent("pso", isDirectory: true), fwPSO = fw.appendingPathComponent("pso", isDirectory: true)
         let dataAOC = game.dataURL.appendingPathComponent("aoc", isDirectory: true), ownAOC = gdir.appendingPathComponent("aoc", isDirectory: true)
         if isDirectory(dataAOC) { env["DM_AOC_DIR"] = dataAOC.path } else if isDirectory(ownAOC) { env["DM_AOC_DIR"] = ownAOC.path }
@@ -54,23 +139,37 @@ public struct EngineLaunchPlan: Equatable, Sendable {
         if let cloud = game.cloudSavesURL { env["DM_SAVE_SYNC"] = cloud.path }
         // The shell already showed its own settings, the per-game launcher screen stays out of the way.
         env["DM_LAUNCHER"] = "0"
-        for (key, value) in game.environment { env[key] = value }
+        let deferredKeys = game.shellFallbackKeys.union(game.builtInDefaultKeys)
+        for (key, value) in game.environment where !deferredKeys.contains(key) { env[key] = value }
 
         var fromFile: [String] = []
+        let inGameEditable = Set(ShellInGameMenu.allowedEnvs)
         let ownText = gameEnvFileText ?? fm.contents(atPath: gdir.appendingPathComponent("env.txt").path).flatMap { String(data: $0, encoding: .utf8) }
-        func apply(_ text: String?) {
+        func apply(_ text: String?, lockInGame: Bool) {
             for (key, value) in parseEnvFile(text ?? "") where env[key] == nil {
                 env[key] = value
-                fromFile.append(key)
+                if lockInGame || !inGameEditable.contains(key) {
+                    fromFile.append(key)
+                }
             }
         }
-        apply(ownText)
+        apply(ownText, lockInGame: false)
+        for key in game.shellFallbackKeys where env[key] == nil {
+            if let value = game.environment[key] { env[key] = value }
+        }
+        for (key, value) in game.shellEnvironment where env[key] == nil { env[key] = value }
         if env["DM_ROMFS_OVERLAY"] == nil,
            let overlay = GameMods.overlay(in: gdir.appendingPathComponent("mods", isDirectory: true), titleID: game.titleID, fm) {
             env["DM_ROMFS_OVERLAY"] = overlay
         }
-        apply(envFileText)
-        apply(fm.contents(atPath: fw.appendingPathComponent("dm/env.txt").path).flatMap { String(data: $0, encoding: .utf8) })
+        apply(envFileText, lockInGame: true)
+        apply(fm.contents(atPath: fw.appendingPathComponent("dm/env.txt").path).flatMap { String(data: $0, encoding: .utf8) }, lockInGame: true)
+        for key in game.builtInDefaultKeys where env[key] == nil {
+            if let value = game.environment[key] { env[key] = value }
+        }
+        if env["DM_MSL_DIR"] == nil, let resolvedMSL {
+            env["DM_MSL_DIR"] = resolvedMSL.path
+        }
         env["DM_ENV_FILE_KEYS"] = fromFile.joined(separator: " ")
         if env["DM_PSO_BUNDLE"] == nil {
             if isDirectory(ownPSO) { env["DM_PSO_BUNDLE"] = ownPSO.path } else if isDirectory(fwPSO) { env["DM_PSO_BUNDLE"] = fwPSO.path }
@@ -83,15 +182,72 @@ public struct EngineLaunchPlan: Equatable, Sendable {
             imageMarker: manifest.imageMarker,
             logURL: documents.appendingPathComponent("log.txt"),
             workingDirectory: documents,
-            foldersToCreate: [save, temp])
+            foldersToCreate: [save, temp],
+            gameDirectory: gdir,
+            gameTitle: game.name)
     }
 
-    /// Creates the save and temp folders (and their parents) when they are missing. The temp folder is kept out of the backup, the
-    /// save folder stays in it (`BackupExclusion`, #618).
+    /// Readable per-game `env.txt` template with every setting commented out by default so in-app settings remain unlocked.
+    public static func defaultGameEnvTemplate(title: String, titleID: String) -> String {
+        let safeTitle = title
+            .replacingOccurrences(of: "\r", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let safeID = titleID
+            .replacingOccurrences(of: "\r", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let headerTitle = safeTitle.isEmpty ? safeID : "\(safeTitle) (\(safeID))"
+        return [
+            "# NX2Apple per-game environment overrides for \(headerTitle)",
+            "# Remove the leading \"# \" on a line to set a per-game override.",
+            "# Keys set here win over Documents/env.txt and built-in defaults, and sync with the in-app settings UI.",
+            "#",
+            "# Language code (default: en-US)",
+            "# DM_LANG=en-US",
+            "#",
+            "# Frame-rate counter on screen (0 = off, 1 = on)",
+            "# DM_SHOW_FPS=0",
+            "#",
+            "# Apple Metal performance HUD (0 = off, 1 = on)",
+            "# DM_METAL_HUD=0",
+            "#",
+            "# Frame-rate cap (0 = game's own limit, 30, 60, 120)",
+            "# DM_FPS_TARGET=60",
+            "#",
+            "# Operation mode (0 = handheld, 1 = console)",
+            "# DM_OPMODE=0",
+            "#",
+            "# Picture fit in landscape (fit or fill)",
+            "# DM_PICTURE_FIT=fit",
+            "#",
+            "# Spatial upscaling for scaled pictures (off or metalfx)",
+            "# DM_PRESENT_UPSCALE=off",
+            "#",
+            "# Fixed 3D render scale factor (0.5 to 1.0)",
+            "# DM_RENDER_SCALE=1.0",
+            "#",
+            "# Audio mix mode (0 = exclusive, 1 = mix with other apps)",
+            "# DM_AUDIO_MIX=0",
+            "#",
+            "# Controller rumble (0 = off, 1 = on)",
+            "# DM_RUMBLE=1",
+            ""
+        ].joined(separator: "\n")
+    }
+
+    /// Creates the save and temp folders (and their parents) when they are missing, and seeds a commented per-game `env.txt`
+    /// only if one does not already exist. The temp folder is kept out of the backup, the save folder stays in it (`BackupExclusion`, #618).
     public func createFolders(fileManager fm: FileManager = .default) throws {
         for url in foldersToCreate {
             try fm.createDirectory(at: url, withIntermediateDirectories: true)
             if !GameDeletion.isSave(url.lastPathComponent) { BackupExclusion.exclude(url) }
+        }
+        try fm.createDirectory(at: gameDirectory, withIntermediateDirectories: true)
+        let envURL = gameDirectory.appendingPathComponent("env.txt")
+        if !fm.fileExists(atPath: envURL.path) {
+            let template = Self.defaultGameEnvTemplate(title: gameTitle, titleID: gameDirectory.lastPathComponent)
+            try Data(template.utf8).write(to: envURL, options: .atomic)
         }
     }
 
@@ -105,19 +261,5 @@ public struct EngineLaunchPlan: Equatable, Sendable {
             result.append((key: String(line[..<eq]), value: String(line[line.index(after: eq)...])))
         }
         return result
-    }
-
-    /// `DM_ROMFS`: a non-empty `romfs.img` (any case, the exact name first, like `romfs_document_images`), else a
-    /// `romfs/` tree or the folder itself, each only when it holds the manifest's marker.
-    private static func romfs(in data: URL, manifest: GameManifest, _ fm: FileManager, _ isDirectory: (URL) -> Bool) -> URL? {
-        let marker = manifest.romfsMarker
-        let names = ((try? fm.contentsOfDirectory(atPath: data.path)) ?? []).filter { $0.lowercased() == "romfs.img" }
-        for name in names.sorted(by: { ($0 == "romfs.img" ? 0 : 1, $0) < ($1 == "romfs.img" ? 0 : 1, $1) }) {
-            let url = data.appendingPathComponent(name)
-            if DataLocator.isComplete(url, manifest: manifest, fm) { return url }   // a partial copy is not the game's image
-        }
-        for tree in [data.appendingPathComponent("romfs", isDirectory: true), data]
-        where isDirectory(tree) && fm.fileExists(atPath: tree.appendingPathComponent(marker).path) { return tree }
-        return nil
     }
 }

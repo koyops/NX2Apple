@@ -64,6 +64,7 @@ enum OnboardingSetupTask: String, CaseIterable {
     var titleKey: String { "onboarding.setup.\(rawValue)" }
 }
 
+/// `.dotnet` is there only while the tools panel has a .NET row: S2Arm needs the SDK, nxnative does not (#1404).
 enum OnboardingBackgroundTask: String, CaseIterable {
     case python, dotnet, tools
     var titleKey: String { "onboarding.background.\(rawValue)" }
@@ -75,6 +76,12 @@ struct OnboardingGame: Identifiable, Equatable {
     var version: String
     /// Decoded artwork is supplied by the driver. The view never reads or fetches a file.
     var cover: NSImage? = nil
+    var needsKeys = true
+}
+
+struct OnboardingTransferProgress: Equatable {
+    var fraction: Double?
+    var detail: String
 }
 
 struct OnboardingState: Equatable {
@@ -86,11 +93,12 @@ struct OnboardingState: Equatable {
     }
     enum Platform: Equatable { case empty, selected(OnboardingPlatform) }
     enum Xcode: Equatable {
-        case checking, missing, downloading, needsSetup, settingUp, ready, failed(OnboardingFailure)
+        case checking, missing, disconnected, downloading, needsSetup, settingUp, ready, failed(OnboardingFailure)
         var statusKey: String {
             switch self {
             case .checking: return "onboarding.xcode.checking"
             case .missing: return "onboarding.xcode.missing"
+            case .disconnected: return "onboarding.xcode.disconnected"
             case .downloading: return "onboarding.xcode.downloading"
             case .needsSetup: return "onboarding.xcode.needsSetup"
             case .settingUp: return "onboarding.xcode.settingUp"
@@ -100,7 +108,7 @@ struct OnboardingState: Equatable {
         }
     }
     enum Keys: Equatable {
-        case searching, found(URL), validating, valid, invalid(String), empty
+        case searching, found(URL), validating, valid, invalid(String), empty, skipped
         var statusKey: String {
             switch self {
             case .searching: return "onboarding.keys.searching"
@@ -109,6 +117,7 @@ struct OnboardingState: Equatable {
             case .valid: return "onboarding.keys.valid"
             case .invalid: return "onboarding.keys.invalid"
             case .empty: return "onboarding.keys.empty"
+            case .skipped: return "onboarding.keys.skipped"
             }
         }
     }
@@ -123,8 +132,15 @@ struct OnboardingState: Equatable {
     var xcode: Xcode = .checking
     var setup: [OnboardingSetupTask: OnboardingTaskState] = [:]
     var background: [OnboardingBackgroundTask: OnboardingTaskState] = [:]
+    var backgroundDetails: [OnboardingBackgroundTask: String] = [:]
+    /// The tools panel has a .NET row (S2Arm). Without one the .NET task is not shown (#1404).
+    var showsDotnet = false
+    var engineTransfer: OnboardingTransferProgress? = nil
+    var keysFile: URL? = nil
     var keys: Keys = .empty
     var games: Games = .empty
+    var queuedGameIDs: Set<String> = []
+    var reviewBuildQueue: Bool { !queuedGameIDs.isEmpty }
     var done: Done = .celebrating
     var exit: Exit? = nil
     /// NVN games need the Metal compiler of Xcode 27.2, which needs macOS 26.6. Hints only: setup continues either way.
@@ -138,17 +154,27 @@ struct OnboardingState: Equatable {
     var setupTasks: [OnboardingSetupTask] {
         OnboardingSetupTask.allCases.filter { $0 != .ios || selectedPlatform?.includesIOS == true }
     }
-    var backgroundReady: Bool { OnboardingBackgroundTask.allCases.allSatisfy { background[$0] == .done } }
+    var backgroundTasks: [OnboardingBackgroundTask] {
+        OnboardingBackgroundTask.allCases.filter { $0 != .dotnet || showsDotnet }
+    }
+    var backgroundReady: Bool { backgroundTasks.allSatisfy { background[$0] == .done } }
     var backgroundFailed: Bool {
         background.values.contains { if case .failed = $0 { return true }; return false }
+    }
+    var canSkipKeys: Bool {
+        step == .keys && exit == nil && keys != .validating
+    }
+    var gamesNeedKeys: Bool {
+        guard keys == .skipped, case let .found(games) = self.games, !games.isEmpty else { return false }
+        return games.allSatisfy(\.needsKeys)
     }
     var canAdvance: Bool {
         switch step {
         case .welcome: return welcome.hasSpace
         case .platform: return selectedPlatform != nil
-        case .xcode: return xcode == .ready && backgroundReady
-        case .keys: return keys == .valid
-        case .games: if case let .found(games) = games { return !games.isEmpty }; return false
+        case .xcode: return xcode == .ready && backgroundReady && engineTransfer == nil
+        case .keys: return keys == .valid || keys == .skipped
+        case .games: if case let .found(games) = games { return !games.isEmpty && !gamesNeedKeys }; return false
         case .done: return false
         }
     }
@@ -160,10 +186,10 @@ struct OnboardingState: Equatable {
             switch xcode {
             case .missing: return .getXcode
             case .needsSetup: return .finishXcodeSetup
-            case .failed: return .retry
+            case .failed, .disconnected: return .retry
             default: return backgroundFailed ? .retry : (canAdvance ? .next : .waiting)
             }
-        case .keys: if case .found = keys { return .confirmKeys }; return canAdvance ? .next : .waiting
+        case .keys: return keys == .valid ? .confirmKeys : .waiting
         case .done: return .openLibrary
         }
     }
@@ -207,10 +233,13 @@ struct OnboardingState: Equatable {
     func start()
     func choosePlatform(_ platform: OnboardingPlatform)
     func getXcode()
+    func recheckXcode()
     func finishXcodeSetup()
     func retry(_ step: OnboardingStep)
     func chooseKeys(_ url: URL)
     func confirmKeys()
+    func skipKeys()
+    func buildGames(_ ids: Set<String>)
     func chooseGames(_ url: URL)
     func back()
     func next()

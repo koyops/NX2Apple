@@ -18,7 +18,7 @@ from nspb_qt.l10n import TABLE, load, t   # noqa: E402
 class Files(unittest.TestCase):
     def test_the_checkout_has_every_language_and_english_and_chinese_have_every_key(self):
         loaded = load(str(ROOT / 'frontend' / 'l10n'))
-        self.assertEqual(sorted(loaded), ['de', 'en', 'fr', 'it', 'ja', 'sv', 'zh'])
+        self.assertEqual(sorted(loaded), ['de', 'en', 'es', 'fr', 'it', 'ja', 'ko', 'pt-br', 'sv', 'zh'])
         self.assertEqual(set(loaded['en']), set(loaded['zh']))
         self.assertNotIn('_language', loaded['en'])
         self.assertEqual(set(TABLE), set(loaded['en']))
@@ -32,6 +32,16 @@ class Files(unittest.TestCase):
     def test_the_stale_frameworks_texts_are_there(self):
         self.assertEqual(t('stale.go', Lang('de')), 'Fortfahren')
         self.assertEqual(t('stale.go', Lang('zh')), '继续')
+
+    def test_positional_long_decimal_and_escaped_percent_placeholders_format_in_all_languages(self):
+        self.assertEqual(t('launch.scaleOfDocked', Lang('ko'), 75, '1080p'), '1080p 독 모드의 75%')
+        self.assertEqual(t('launch.scaleOfHandheld', Lang('ko'), 75, '720p'), '720p 휴대 모드의 75%')
+        self.assertEqual(t('launch.scaleOfDocked', Lang('zh'), 75, '1080p'), '底座模式 1080p 的 75%')
+        self.assertEqual(t('launch.scaleOfHandheld', Lang('zh'), 75, '720p'), '掌机模式 720p 的 75%')
+        self.assertEqual(t('launch.scaleOfDocked', Lang('ko'), 75, '100%%'), '100%% 독 모드의 75%')
+        self.assertEqual(t('supported.count', Lang('en'), 42), '42 games')
+        self.assertEqual(t('supported.count', Lang('ko'), 42), '게임 42개')
+        self.assertEqual(t('supported.count', Lang('pt-br'), 42), '42 jogos')
 
     def test_a_language_without_the_key_shows_english_and_an_unknown_key_shows_itself(self):
         with tempfile.TemporaryDirectory() as d:

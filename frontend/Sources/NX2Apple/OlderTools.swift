@@ -1,33 +1,232 @@
 import Foundation
 import NXCore
+import NXModel
 
-/// Which library games were built with older build tools (LNPANDY/NX2Apple#65, after seedds/nxnative#209): a finished build
-/// records the engine's commit (LibraryGame.toolsCommit); once the engine has moved on, a game is marked when files a build uses
+/// Which library games were built with different tools than the selected engine (LNPANDY/NX2Apple#65): a finished build
+/// records the engine's commit (LibraryGame.toolsCommit) and once the engine has moved on, a game is marked when files a build uses
 /// changed between that commit and the engine's HEAD. Only a change that can alter the built game counts, so a docs-only
 /// pull marks nothing. The engine is `engine/` of the checkout (EngineLayout.root), a git repository whose HEAD is the pin plus the
 /// patch series (tools/engine.py sync), so the diff is exactly what a new pin or a changed patch did to the build's files, and
 /// the launcher's own commits never count (#214, step 2: the checkout itself holds no engine files).
-/// A game built before the commit was recorded (or recorded the checkout's commit, as until step 2), or with an engine that is
-/// not a git one (an installed release's engine tree), is never marked.
+/// A Mac game's bundle can also name the shader chain it was built with. This detects a chain change even when the release
+/// engine has no Git history or the library has no build commit.
 final class ToolsAge: ObservableObject {
-    /// The games whose build is older than the tools in the checkout now.
+    /// The games whose build tools differ from the current engine.
     @Published private(set) var older: Set<UUID> = []
+    /// Per-game 4-state refresh assessments computed off the main thread alongside `older`.
+    @Published private(set) var assessments: [UUID: GameRefreshAssessment] = [:]
+    /// In-flight external-drive probe state for single-game hero refresh, preventing re-entrant clicks and stale callbacks.
+    @Published var singleRefreshProbingGameID: UUID?
+    var singleRefreshProbeGeneration = 0
     private var generation = 0
 
-    init(older: Set<UUID> = []) { self.older = older }
+    init(older: Set<UUID> = [], assessments: [UUID: GameRefreshAssessment] = [:]) {
+        self.older = older
+        self.assessments = assessments
+    }
 
-    /// Runs git off the main thread; a check started later wins over one still running (the repository may move in between).
-    func check(games: [LibraryGame], repo: String) {
+    func cancelSingleRefreshProbe() {
+        singleRefreshProbeGeneration &+= 1
+        if singleRefreshProbingGameID != nil {
+            singleRefreshProbingGameID = nil
+        }
+    }
+
+    /// Runs git and disk checks off the main thread. A check started later wins over one still running.
+    func check(
+        games: [LibraryGame],
+        repo: String,
+        appVersion: String = AppUpdateStore.appVersion,
+        libraryFolder: String = "",
+        seedRoot: String = BuildSeedCache.defaultRoot(),
+        shellRoot: String = ""
+    ) {
         generation += 1
         let mine = generation
-        let builds = games.map { (id: $0.id, titleID: $0.titleID, commit: $0.toolsCommit) }
+        let builds = games.map { game in
+            (id: game.id, titleID: game.titleID, commit: Self.nxnativeRefreshCommit(for: game, shellRoot: shellRoot))
+        }
         DispatchQueue.global(qos: .utility).async {
-            let result = Self.olderGames(builds, repo: repo)
+            let fm = FileManager.default
+            let engineHead = Self.head(repo: repo)
+            var diffCache: [String: [String]?] = [:]
+            func lookupDiff(_ commit: String) -> [String]? {
+                if let cached = diffCache[commit] { return cached }
+                let computed = Self.changedFiles(since: commit, repo: repo)
+                diffCache.updateValue(computed, forKey: commit)
+                return computed
+            }
+
+            let gitMarked = Self.olderGames(builds, head: engineHead, lookupDiff: lookupDiff)
+            let result = gitMarked.union(Self.shaderChainMismatches(games, repo: repo, shellRoot: shellRoot))
+
+            var assessmentsMap: [UUID: GameRefreshAssessment] = [:]
+            assessmentsMap.reserveCapacity(games.count)
+            for game in games {
+                let isMarkedOlder = result.contains(game.id)
+                let nxMac = game.nxnativeMacBuildForRefresh
+                let hasMac = nxMac != nil
+                let hasIOS = Self.hasIOSBuildOffThread(game, shellRoot: shellRoot, fm: fm)
+                let hasInputs = Self.hasReadableSourceInputs(game, fm: fm)
+                let outDir = Self.resolvedOutputDirectory(for: game, libraryFolder: libraryFolder)
+                let commit = Self.nxnativeRefreshCommit(for: game, shellRoot: shellRoot, fm: fm)
+                let gitSpecificChanged = Self.specificChangeFlag(
+                    commit: commit,
+                    titleID: game.titleID,
+                    head: engineHead,
+                    lookupDiff: lookupDiff
+                )
+                assessmentsMap[game.id] = GameUpdateCatalog.assess(
+                    titleID: game.titleID,
+                    isMarkedOlder: isMarkedOlder,
+                    hasMacBuild: hasMac,
+                    macAppPath: nxMac?.appPath ?? "",
+                    hasIOSBuild: hasIOS,
+                    hasReadableSourceInputs: hasInputs,
+                    outDir: outDir,
+                    gameName: game.name,
+                    appVersion: appVersion,
+                    gitSpecificChanged: gitSpecificChanged,
+                    seedRoot: seedRoot,
+                    repoPath: repo
+                )
+            }
+
             DispatchQueue.main.async {
-                guard mine == self.generation, result != self.older else { return }
-                self.older = result
+                guard mine == self.generation else { return }
+                if result != self.older { self.older = result }
+                if assessmentsMap != self.assessments { self.assessments = assessmentsMap }
             }
         }
+    }
+
+    /// The packer stamps the chain in NVN bundles (Mac Info.plist `DMChain` and iOS framework `game.manifest.json` `chain`).
+    /// A missing stamp is normal for other graphics backends.
+    nonisolated private static func shaderChainMismatches(_ games: [LibraryGame], repo: String, shellRoot: String = "") -> Set<UUID> {
+        let pattern = #"\A[0-9a-f]{12}\z"#
+        guard let current = EngineLayout.shaderChain(repo: repo),
+              current.range(of: pattern, options: .regularExpression) != nil else { return [] }
+        let fm = FileManager.default
+        return Set(games.compactMap { game in
+            if let macPath = game.nxnativeMacBuildForRefresh?.appPath,
+               let app = try? MacGameBundle.read(URL(fileURLWithPath: macPath)),
+               app.titleID == game.titleID,
+               let chain = app.shaderChain, chain != current,
+               chain.range(of: pattern, options: .regularExpression) != nil {
+                return game.id
+            }
+            if let iosChain = iosFrameworkChain(for: game, shellRoot: shellRoot, fm: fm),
+               iosChain != current,
+               iosChain.range(of: pattern, options: .regularExpression) != nil {
+                return game.id
+            }
+            return nil
+        })
+    }
+
+    nonisolated private static func iosFrameworkChain(for game: LibraryGame, shellRoot: String, fm: FileManager) -> String? {
+        let tid = game.titleID.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard !tid.isEmpty else { return nil }
+        var candidates: [String] = []
+        if !shellRoot.isEmpty {
+            candidates.append(ShellInstall.mirroredFramework(root: shellRoot, titleID: tid))
+        }
+        if !game.iosAppPath.isEmpty {
+            if let appShell = ShellInstall.paths(ofApp: game.iosAppPath) {
+                candidates.append(ShellInstall.mirroredFramework(root: appShell.root, titleID: tid))
+            }
+            candidates.append(game.iosAppPath + "/Frameworks/DmGame\(tid).framework")
+            candidates.append(ShellInstall.mirroredFramework(root: game.iosAppPath, titleID: tid))
+        }
+        func normalizeChain(_ raw: Any?) -> String? {
+            guard let trimmed = (raw as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                  !trimmed.isEmpty else { return nil }
+            return trimmed.hasPrefix("b-") ? String(trimmed.dropFirst(2)) : trimmed
+        }
+        for fw in candidates {
+            guard ShellInstall.missingFile(inFramework: fw, titleID: tid, fm: fm) == nil,
+                  let data = fm.contents(atPath: fw + "/game.manifest.json"),
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { continue }
+            if let manifestTID = (obj["title_id"] as? String) ?? (obj["titleID"] as? String),
+               !manifestTID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               manifestTID.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(tid) != .orderedSame {
+                continue
+            }
+            if let api = (obj["gfx_api"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+               api == "vulkan" || api == "gl" {
+                return nil
+            }
+            guard let chain = normalizeChain(obj["chain"]) else { continue }
+            return chain
+        }
+        if !game.iosAppPath.isEmpty,
+           ShellInstall.paths(ofApp: game.iosAppPath) == nil,
+           let plistData = fm.contents(atPath: game.iosAppPath + "/Info.plist"),
+           let info = (try? PropertyListSerialization.propertyList(from: plistData, format: nil)) as? [String: Any] {
+            if let api = (info["DMGfxAPI"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+               api == "vulkan" || api == "gl" {
+                return nil
+            }
+            if let plistTID = (info["DMTitleID"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !plistTID.isEmpty,
+               plistTID.caseInsensitiveCompare(tid) != .orderedSame {
+                return nil
+            }
+            return normalizeChain(info["DMChain"])
+        }
+        return nil
+    }
+
+    nonisolated private static func nxnativeRefreshCommit(for game: LibraryGame, shellRoot: String, fm: FileManager = .default) -> String {
+        if let nxMac = game.nxnativeMacBuildForRefresh {
+            return nxMac.toolsCommit.isEmpty ? game.toolsCommit : nxMac.toolsCommit
+        }
+        if hasIOSBuildOffThread(game, shellRoot: shellRoot, fm: fm) {
+            return game.toolsCommit
+        }
+        // Only third-party tuned Mac build exists without nxnative or iOS build: never treat it as an outdated nxnative build.
+        if !game.sortedMacBuilds.isEmpty {
+            return ""
+        }
+        return game.toolsCommit
+    }
+
+    nonisolated private static func hasMacBuildOffThread(_ game: LibraryGame) -> Bool {
+        game.nxnativeMacBuildForRefresh != nil
+    }
+
+    nonisolated private static func hasIOSBuildOffThread(_ game: LibraryGame, shellRoot: String = "", fm: FileManager) -> Bool {
+        game.hasIOSBuild(shellRoot: shellRoot, fm: fm)
+    }
+
+    nonisolated private static func hasReadableSourceInputs(_ game: LibraryGame, fm: FileManager) -> Bool {
+        if let folder = game.inputs[GameLibrary.folderInput]?.first, !folder.isEmpty {
+            return fm.isReadableFile(atPath: folder)
+        }
+        guard let bases = game.inputs["base"], !bases.isEmpty else { return false }
+        return bases.allSatisfy { !$0.isEmpty && fm.isReadableFile(atPath: $0) }
+    }
+
+    nonisolated static func resolvedOutputDirectory(for game: LibraryGame, libraryFolder: String = "") -> String {
+        if !game.outputDirectory.isEmpty { return game.outputDirectory }
+        if !game.sourceFolder.isEmpty { return game.sourceFolder }
+        if let base = game.inputs["base"]?.first, !base.isEmpty {
+            return (base as NSString).deletingLastPathComponent
+        }
+        if !game.archivePath.isEmpty {
+            let parent = (game.archivePath as NSString).deletingLastPathComponent
+            if (parent as NSString).lastPathComponent == "games" {
+                return (parent as NSString).deletingLastPathComponent
+            }
+            return parent
+        }
+        if let macPath = game.nxnativeMacBuildForRefresh?.appPath ?? game.sortedMacBuilds.first?.appPath ?? (game.appPath.isEmpty ? nil : game.appPath) {
+            return (macPath as NSString).deletingLastPathComponent
+        }
+        if !game.ipaPath.isEmpty {
+            return (game.ipaPath as NSString).deletingLastPathComponent
+        }
+        return libraryFolder
     }
 
     /// The engine's folders and files a build reads (scripts/build_ipa_from_nsp.py's `repo / …` paths): the host, the
@@ -37,24 +236,55 @@ final class ToolsAge: ObservableObject {
                                           "scripts/build_ipa_from_nsp.py", "dm/games/game.py", "dm/games/profile_guess.py",
                                           "dm/games/settings."]
 
+    /// Whether a changed file (a path relative to the engine) is inside this game's own profile (`dm/games/<TID>/`),
+    /// excluding documentation and test files.
+    nonisolated static func isGameSpecificChange(_ path: String, titleID: String) -> Bool {
+        guard !titleID.isEmpty else { return false }
+        if path.hasSuffix(".md") || path.contains("/tests/") { return false }
+        let prefix = "dm/games/" + titleID + "/"
+        return path.range(of: prefix, options: [.anchored, .caseInsensitive]) != nil
+    }
+
     /// Whether a changed file (a path relative to the engine) can change what a build of this game makes: a build input,
     /// or a file of the game's own profile (dm/games/<title ID>/). Notes (*.md) and tests are read by no build.
     nonisolated static func affects(_ path: String, titleID: String) -> Bool {
         if path.hasSuffix(".md") || path.contains("/tests/") { return false }
-        if path.hasPrefix("dm/games/" + titleID + "/") { return true }
+        if isGameSpecificChange(path, titleID: titleID) { return true }
         return buildInputs.contains { path.hasPrefix($0) }
     }
 
-    /// The engine's commit (the pin plus the series), for a git engine only (an engine tree has no history to compare against).
-    nonisolated static func head(repo: String, git: GitCheckout = SystemGitCheckout()) -> String? {
-        let engine = EngineLayout.root(repo)
-        guard !engine.isEmpty, FileManager.default.fileExists(atPath: engine + "/.git"), git.binary != nil else { return nil }
-        let r = git.run(engine, ["rev-parse", "HEAD"])
-        let commit = r.out.trimmingCharacters(in: .whitespacesAndNewlines)
-        return r.ok && !commit.isEmpty ? commit : nil
+    /// Determines whether git history shows a game-specific profile change since `commit`, or `nil` when commit is empty,
+    /// the engine is a release tree without git history, or git cannot diff `commit`.
+    nonisolated static func specificChangeFlag(
+        commit: String,
+        titleID: String,
+        head: String?,
+        lookupDiff: (String) -> [String]?
+    ) -> Bool? {
+        guard !commit.isEmpty, let head else { return nil }
+        if commit == head { return false }
+        if commit.hasPrefix(releasePrefix) || head.hasPrefix(releasePrefix) { return nil }
+        guard let files = lookupDiff(commit) else { return nil }
+        return files.contains { isGameSpecificChange($0, titleID: titleID) }
     }
 
-    /// The files changed between a recorded commit and the engine's HEAD; nil when git cannot tell (a commit the engine does not
+    /// What identifies the engine a build used. A git engine: its commit (the pin plus the series). A release engine tree has no
+    /// history but names itself (`.engine-id`, `<pin>-<12 hex of the series>`): `engine:<id>` then, so a game built with it can
+    /// tell that the engine moved on (LNPANDY/NX2Apple#944). nil when the engine says neither.
+    nonisolated static func head(repo: String, git: GitCheckout = SystemGitCheckout()) -> String? {
+        let engine = EngineLayout.root(repo)
+        guard !engine.isEmpty else { return nil }
+        if FileManager.default.fileExists(atPath: engine + "/.git"), git.binary != nil {
+            let r = git.run(engine, ["rev-parse", "HEAD"])
+            let commit = r.out.trimmingCharacters(in: .whitespacesAndNewlines)
+            if r.ok && !commit.isEmpty { return commit }
+        }
+        return EngineStore.identity(of: URL(fileURLWithPath: engine)).map { releasePrefix + $0 }
+    }
+
+    nonisolated static let releasePrefix = "engine:"
+
+    /// The files changed between a recorded commit and the engine's HEAD, or nil when git cannot tell (a commit the engine does not
     /// have, as for a game built before step 2 or after engine/ was made anew), which marks nothing rather than everything.
     nonisolated static func changedFiles(since commit: String, repo: String, git: GitCheckout = SystemGitCheckout()) -> [String]? {
         guard git.binary != nil else { return nil }
@@ -65,13 +295,33 @@ final class ToolsAge: ObservableObject {
 
     /// The games marked: one `git diff` per distinct recorded commit, then each game's files are filtered by its title ID.
     nonisolated static func olderGames(_ builds: [(id: UUID, titleID: String, commit: String)], repo: String) -> Set<UUID> {
+        var diffs: [String: [String]?] = [:]
+        return olderGames(builds, head: head(repo: repo)) { commit in
+            if let cached = diffs[commit] { return cached }
+            let computed = changedFiles(since: commit, repo: repo)
+            diffs.updateValue(computed, forKey: commit)
+            return computed
+        }
+    }
+
+    nonisolated private static func olderGames(
+        _ builds: [(id: UUID, titleID: String, commit: String)],
+        head: String?,
+        lookupDiff: (String) -> [String]?
+    ) -> Set<UUID> {
         let recorded = builds.filter { !$0.commit.isEmpty }
-        guard !recorded.isEmpty, let head = head(repo: repo) else { return [] }
-        var diffs: [String: [String]] = [:]
+        guard !recorded.isEmpty, let head else { return [] }
         var marked: Set<UUID> = []
         for build in recorded where build.commit != head {
-            if diffs[build.commit] == nil { diffs[build.commit] = changedFiles(since: build.commit, repo: repo) ?? [] }
-            if diffs[build.commit]!.contains(where: { affects($0, titleID: build.titleID) }) { marked.insert(build.id) }
+            // A release engine tree has no history to diff: any other engine than the one the game was built with counts, and the
+            // note says "different tools", never that a fix is in it. The files that changed are unknown there.
+            if build.commit.hasPrefix(releasePrefix) || head.hasPrefix(releasePrefix) {
+                marked.insert(build.id)
+                continue
+            }
+            if let files = lookupDiff(build.commit), files.contains(where: { affects($0, titleID: build.titleID) }) {
+                marked.insert(build.id)
+            }
         }
         return marked
     }

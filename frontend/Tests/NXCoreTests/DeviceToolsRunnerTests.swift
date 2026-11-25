@@ -56,6 +56,94 @@ final class DeviceToolsRunnerTests: XCTestCase {
         XCTAssertEqual(openssl?.input, "PEM", "the certificate goes in on standard input")
     }
 
+    func testDuplicateIdentityNamesDisambiguateBySHA1() {
+        let sha1A = "517F77994ACDB151677D9363A2DFF8B8AEBA0209"
+        let sha1B = "A45C1A228F75EDF3254C7D7951C31E21E75D0A5B"
+        let dupName = "Apple Development: lnp_andy@163.com (2ATBYHQ9BB)"
+        let multiPem = """
+        SHA-1 hash: \(sha1A)
+        -----BEGIN CERTIFICATE-----
+        FIRSTCERT
+        -----END CERTIFICATE-----
+        SHA-1 hash: \(sha1B)
+        -----BEGIN CERTIFICATE-----
+        SECONDCERT
+        -----END CERTIFICATE-----
+        """
+        fake.answer = { launch in
+            switch (launch.executable as NSString).lastPathComponent {
+            case "security" where launch.arguments.first == "find-identity":
+                return ProcessResult(out: "  1) \(sha1A) \"\(dupName)\"\n  2) \(sha1B) \"\(dupName)\"\n")
+            case "security":
+                return ProcessResult(out: multiPem)
+            case "openssl":
+                if launch.input?.contains("FIRSTCERT") == true { return ProcessResult(out: "subject=OU=TEAMAAAAAA, CN=\(dupName)") }
+                if launch.input?.contains("SECONDCERT") == true { return ProcessResult(out: "subject=OU=MG2FF22535, CN=\(dupName)") }
+                return ProcessResult(status: 1)
+            default:
+                return ProcessResult(status: 1)
+            }
+        }
+        let teams = DeviceTools.certificateTeams(runner: fake)
+        XCTAssertEqual(teams, [
+            SigningTeam(id: "TEAMAAAAAA", identity: dupName, sha1: sha1A),
+            SigningTeam(id: "MG2FF22535", identity: dupName, sha1: sha1B),
+        ])
+        XCTAssertEqual(ShellHotInstall.defaultSigningIdentity(team: "MG2FF22535", runner: fake), sha1B)
+    }
+
+    func testMatchingSigningIdentityDisambiguatesMultipleDevelopmentCertificatesUnderSameTeamAndSkipsDistribution() {
+        let sha1A = "517F77994ACDB151677D9363A2DFF8B8AEBA0209"
+        let sha1B = "A45C1A228F75EDF3254C7D7951C31E21E75D0A5B"
+        let sha1Dist = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"
+        let devName = "Apple Development: player@example.com (2ATBYHQ9BB)"
+        let distName = "Apple Distribution: player@example.com (2ATBYHQ9BB)"
+        let multiPem = """
+        SHA-1 hash: \(sha1A)
+        -----BEGIN CERTIFICATE-----
+        CERTA
+        -----END CERTIFICATE-----
+        SHA-1 hash: \(sha1B)
+        -----BEGIN CERTIFICATE-----
+        CERTB
+        -----END CERTIFICATE-----
+        """
+        fake.answer = { launch in
+            switch (launch.executable as NSString).lastPathComponent {
+            case "security" where launch.arguments.first == "find-identity":
+                return ProcessResult(out: "  1) \(sha1A) \"\(devName)\"\n  2) \(sha1B) \"\(devName)\"\n  3) \(sha1Dist) \"\(distName)\"\n")
+            case "security":
+                return ProcessResult(out: multiPem)
+            case "openssl":
+                return ProcessResult(out: "subject=OU=2ATBYHQ9BB, CN=\(devName)")
+            default:
+                return ProcessResult(status: 1)
+            }
+        }
+
+        let all = DeviceTools.allCertificateTeams(runner: fake)
+        XCTAssertEqual(all.map(\.sha1), [sha1A, sha1B], "distribution certificates stay excluded while same-team dev certs are preserved")
+
+        let beaconB = ShellHotInstall.HostBeacon(
+            bundleID: "org.nxnative.shell", teamID: "2ATBYHQ9BB", chain: "b-1",
+            version: "1.5.1", expiresAtEpoch: 1_900_000_000, allowsHotPush: true, certSHA1: sha1B.lowercased()
+        )
+        XCTAssertEqual(ShellHotInstall.matchingSigningIdentity(for: beaconB, team: "2ATBYHQ9BB", runner: fake), sha1B)
+
+        let beaconDist = ShellHotInstall.HostBeacon(
+            bundleID: "org.nxnative.shell", teamID: "2ATBYHQ9BB", chain: "b-1",
+            version: "1.5.1", expiresAtEpoch: 1_900_000_000, allowsHotPush: false, certSHA1: sha1Dist
+        )
+        XCTAssertNil(ShellHotInstall.matchingSigningIdentity(for: beaconDist, team: "2ATBYHQ9BB", runner: fake))
+
+        let beaconOther = ShellHotInstall.HostBeacon(
+            bundleID: "org.nxnative.shell", teamID: "2ATBYHQ9BB", chain: "b-1",
+            version: "1.5.1", expiresAtEpoch: 1_900_000_000, allowsHotPush: true,
+            certSHA1: String(repeating: "C", count: 40)
+        )
+        XCTAssertNil(ShellHotInstall.matchingSigningIdentity(for: beaconOther, team: "2ATBYHQ9BB", runner: fake))
+    }
+
     func testTeamsMergeTheKeychainAndXcodeAndTolerateBothMissing() {
         fake.answer = { _ in ProcessResult(status: 1) }
         XCTAssertEqual(DeviceTools.teams(runner: fake), [])

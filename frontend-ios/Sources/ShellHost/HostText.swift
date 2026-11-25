@@ -64,3 +64,45 @@ public struct GameProblem: Error, Equatable, Sendable, LocalizedError {
     /// The broken state a tile shows: the short reason, the player's sentence and the technical message.
     public var state: GameState { .broken(reason: reason, detail: cause.message, technical: detail) }
 }
+
+/// Maps known English C launch errors from `ShellMain.m` to localized `ShellHost` catalog strings.
+public func localizeEngineLaunchError(_ raw: String) -> String {
+    switch raw {
+    case "This game was updated while the app was open. Close and reopen the app to load the new build.":
+        return hostText("This game was updated while the app was open. Close and reopen the app to load the new build.")
+    case "A game is already running.":
+        return hostText("A game is already running.")
+    case "The game's start arguments are incomplete.":
+        return hostText("The game's start arguments are incomplete.")
+    case "This game's framework in Documents/Frameworks is unsigned. Install the game again from NX2Apple.":
+        return hostText("This game's framework in Documents/Frameworks is unsigned. Reinstall it with the same signing team from NX2Apple, or import your sideload .p12 certificate in Settings to sign it automatically on this device.")
+    case "iOS refused the code signature of this game's framework. Install the game again from NX2Apple.":
+        return hostText("iOS refused the code signature of this game's framework. Reinstall it with the same signing team from NX2Apple, or import your sideload .p12 certificate in Settings to sign it automatically on this device.")
+    case FrameworkSignature.unsupportedHotFrameworkSigningMessage:
+        return hostText("This app signature does not support loading games from Documents/Frameworks. Reinstall the app from NX2Apple on your computer.")
+    case FrameworkSignature.certMismatchHotFrameworkMessage:
+        return hostText("Could not load the game framework because the signing certificate does not match this app. Reinstall the app from your computer.")
+    default:
+        if raw.contains("file system sandbox blocked mmap")
+            || raw.contains("sandbox blocked mmap")
+            || raw.hasPrefix("The game's code could not be loaded:") {
+            return hostText("Could not load the game framework because the signing certificate does not match this app. Reinstall the app from your computer.")
+        }
+        return raw
+    }
+}
+
+/// Localized copy for the iOS in-game controller disconnect auto-pause overlay.
+public struct ControllerDisconnectOverlayStrings: Equatable, Sendable {
+    public let title: String
+    public let message: String
+    public let resumeTitle: String
+
+    public static func localized() -> ControllerDisconnectOverlayStrings {
+        ControllerDisconnectOverlayStrings(
+            title: hostText("Controller Disconnected"),
+            message: hostText("Game paused. Reconnect your controller or tap Resume to continue with touch controls."),
+            resumeTitle: hostText("Resume")
+        )
+    }
+}

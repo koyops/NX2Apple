@@ -153,4 +153,84 @@ final class GameDeletionTests: IsolatedDefaultsTestCase {
             window.orderOut(nil)
         }
     }
+
+    @MainActor func testSyncSharedAppWithoutDerivedDataAndNamedArchiveDeletionProtectsSharedIPA() throws {
+        // No shell/derived-data folder exists on disk.
+        for f in ["out/NX2Apple.ipa", "out/games/Hades/Hades.img", "out/games/Hades/.titleid",
+                  "shell/frameworks/DmGame\(titleID).framework/DmGame"] {
+            try file(f)
+        }
+        try Data((titleID + "\n").utf8).write(to: root.appendingPathComponent("out/games/Hades/.titleid"))
+
+        var shellLib = ShellLibrary(games: [.init(titleID: titleID, name: "Hades",
+                                                  framework: path + "/shell/frameworks/DmGame\(titleID).framework")])
+        shellLib.bundleID = "org.nxnative.shell"
+        try shellLib.save(root: path + "/shell")
+        ShellLibrary.recordInstalled(root: path + "/shell")
+        XCTAssertFalse(exists("shell/derived-data"))
+
+        let libFile = root.appendingPathComponent("library.json")
+        let library = GameLibrary(file: libFile)
+        var game = LibraryGame(titleID: titleID, name: "Hades",
+                               appPath: "",
+                               ipaPath: path + "/out/NX2Apple.ipa",
+                               archivePath: path + "/out/games/Hades")
+        game.outputDirectory = path + "/out"
+        library.games = [game]
+        library.syncSharedApp(root: path + "/shell")
+
+        let synced = try XCTUnwrap(library.games.first)
+        XCTAssertTrue(synced.hasShellFramework)
+        XCTAssertTrue(synced.installedViaShellReceipt)
+        XCTAssertTrue(synced.shellIPAExists)
+        XCTAssertTrue(synced.hasIOSBuild)
+
+        let deletionPlan = GameDeletion.plan(for: synced, shellRoot: path + "/shell",
+                                             home: path + "/home", support: root.appendingPathComponent("support"))
+        XCTAssertFalse(deletionPlan.items.contains { $0.kind == .ipa }, "shared NX2Apple.ipa must never be deleted with one game")
+        XCTAssertEqual(deletionPlan.items.first { $0.kind == .archive }?.paths, [path + "/out/games/Hades"])
+        XCTAssertEqual(deletionPlan.run(saves: false, trash: { try FileManager.default.removeItem(at: $0) }), [])
+        XCTAssertTrue(exists("out/NX2Apple.ipa"))
+        XCTAssertFalse(exists("out/games/Hades"))
+    }
+
+    func testDeletingGameRemovesAllVariantBuildFoldersAndRespectsSavesToggle() throws {
+        let tid = "0400486024DEC000"
+        for f in [
+            "src/OoT [\(tid)].nsp",
+            "out/\(tid)_build/extract/main",
+            "out/\(tid)_build/run/save/0",
+            "out/\(tid)_kidwithsword_build/extract/main",
+            "out/\(tid)_kidwithsword_build/shader/lib",
+            "out/\(tid)_kidwithsword_build/run/save/0",
+        ] {
+            try file(f)
+        }
+        var game = LibraryGame(titleID: tid, name: "Ocarina of Time")
+        game.outputDirectory = path + "/out"
+        game.inputs = ["base": [path + "/src/OoT [\(tid)].nsp"]]
+
+        let p = plan(game)
+        let buildPaths = Set(p.items.first { $0.kind == .buildFolder }?.paths ?? [])
+        XCTAssertTrue(buildPaths.contains(path + "/out/\(tid)_build/extract"))
+        XCTAssertTrue(buildPaths.contains(path + "/out/\(tid)_kidwithsword_build/extract"))
+        XCTAssertTrue(buildPaths.contains(path + "/out/\(tid)_kidwithsword_build/shader"))
+        let savePaths = Set(p.saves?.paths ?? [])
+        XCTAssertTrue(savePaths.contains(path + "/out/\(tid)_build/run"))
+        XCTAssertTrue(savePaths.contains(path + "/out/\(tid)_kidwithsword_build/run"))
+
+        // Deleting without saves removes build parts in both folders while keeping run/ in both.
+        XCTAssertEqual(p.run(saves: false, trash: { try FileManager.default.removeItem(at: $0) }), [])
+        XCTAssertFalse(exists("out/\(tid)_build/extract"))
+        XCTAssertFalse(exists("out/\(tid)_kidwithsword_build/extract"))
+        XCTAssertFalse(exists("out/\(tid)_kidwithsword_build/shader"))
+        XCTAssertTrue(exists("out/\(tid)_build/run/save/0"))
+        XCTAssertTrue(exists("out/\(tid)_kidwithsword_build/run/save/0"))
+
+        // Deleting with saves removes run/ and deletes both empty build directories.
+        XCTAssertEqual(plan(game).run(saves: true, trash: { try FileManager.default.removeItem(at: $0) }), [])
+        XCTAssertFalse(exists("out/\(tid)_build"))
+        XCTAssertFalse(exists("out/\(tid)_kidwithsword_build"))
+        XCTAssertTrue(exists("src/OoT [\(tid)].nsp"))
+    }
 }

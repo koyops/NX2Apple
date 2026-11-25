@@ -15,25 +15,44 @@ What gets replaced, and why:
 ========================  ==========================================================
 `check_prereqs`           Xcode/xcodegen/make are absent; the Windows toolchain is checked
                           instead, with the same "what is missing and how to get it" shape.
-`build_nx_extract`        use the packaged extractor, or build the Windows executable from source
+`find_nx_extract` /       use the packaged extractor, or build the Windows executable from source
+`build_nx_extract`        with NativeAOT disabled (`-p:PublishAot=false`)
 `can_clone`               no APFS: plain copies (`nx_extract` spends the disk, not the build)
 `apple_silicon`           no `sysctl`
 `heap_check`              boots the game in the Mac host; replaced by an estimate
-`build_mac_host`          the Mac host can never run here: refuses with a clear message
+`build_mac_host`          points decoder tool-mode steps (`DM_OODLE_SERVE` / `DM_OODLE_JOB`) at
+                          `oodle_emu.py` (native x64 Oodle DLL passthrough or emulated ARM64)
 `toolchain`               the shader cache key needs the Windows Metal compiler's version
-`capture_shaders` /       run-time shader capture boots the game in the Mac host: refused,
-`capture_glslc`           with the device-capture workflow explained
+`capture_shaders`         reuses existing `gl_capture` / `vk_capture` folders, reconstructs
+                          LÖVE (`love_shaders.py`) and GameMaker (`gm_shaders.py`) OpenGL
+                          shaders offline, and refuses other uncaptured run-time shaders
+`capture_glslc`           reuses existing `glslc_capture` folders or compiles embedded GLSL
+                          sources offline through the game's own `GLSLC` NSO (`glslc_emu.py`)
+`capture_jit` /           reuses `jit/jit.img` or packs existing `jit_capture/` dumps via
+`capture_nro`             `jit_capture.py`, and refuses missing runtime JIT or NRO captures
 `mac_app` / `mac_run`     Mac platforms: refused
+`proc_group.Group`        upstream's `selectors.DefaultSelector` on a pipe fd raises WinError 10038
+                          and `os.killpg` / `SIGSTOP` are POSIX-only, replaced by `_WinProcGroup`
 `build_ipa.sh`            replaced by `build_app.py` (through the shim, which also has to cover
                           the child processes the pipeline starts)
 ========================  ==========================================================
 """
 from __future__ import annotations
 
+import codecs
+import ctypes
 import importlib.util
+import io
+import locale
 import os
+import queue
+import re
 import shutil
+import signal
+import subprocess
 import sys
+import tempfile
+import threading
 import time
 from pathlib import Path
 from types import ModuleType
@@ -48,11 +67,56 @@ else:                                       # pragma: no cover - script mode
 _UPSTREAM_RUN = None
 
 #: Options that exist upstream but cannot work on Windows, with the reason shown to the user.
+#: Fast-refresh seed options (--from-seed, --seed-cache-dir, --prefill-msl) are supported on Windows and never refused.
 REFUSED_OPTIONS = {
     '--prepare-xcode': 'generates an Xcode project, which needs Xcode and xcodegen (macOS only)',
     '--platform': 'only "--platform ios" builds on Windows: the mac platforms run the game in '
                   'the Mac host, which boots the game\'s arm64 code',
 }
+
+
+def diagnose_empty_shader_log(log_text: str) -> str:
+    """Return a concise root-cause string from a `dmsh_build.log` that yielded zero metallibs."""
+    if not log_text:
+        return ''
+    if re.search(r'(?:0x[Cc]0000135|3221225781|-1073741515|STATUS_DLL_NOT_FOUND|(?:vcruntime140(?:_1)?|msvcp140)\.dll)', log_text):
+        missing = tc.missing_vc_runtime_dlls()
+        if missing:
+            return (
+                f'missing {", ".join(missing)} (0xC0000135) — '
+                f'install Microsoft Visual C++ 2015-2022 Redistributable (x64) ({tc.VCREDIST_URL})'
+            )
+        return (
+            'a shader tool failed with 0xC0000135 (DLL not found) — '
+            f'install Microsoft Visual C++ 2015-2022 Redistributable (x64) ({tc.VCREDIST_URL})'
+        )
+    if re.search(r'(?:0x[Cc]000007[Bb]|3221225595|-1073741701)', log_text):
+        return (
+            '32-bit/64-bit DLL mismatch (0xC000007B) — '
+            f'repair Microsoft Visual C++ 2015-2022 Redistributable (x64) ({tc.VCREDIST_URL})'
+        )
+    if re.search(r'no Windows tool for `xcrun -sdk iphoneos (?:metal|metallib)`', log_text):
+        return 'Metal Developer Tools for Windows (metal.exe / metallib.exe) is missing or incomplete'
+    if re.search(r'(?i)(?:metal(?:\.exe)?[^\n]*(?:unknown argument|unsupported option)|unknown argument:\s*[\'"]?-fmetal-math-mode)', log_text):
+        return (
+            'installed Metal Developer Tools for Windows is too old (missing -fmetal-math-mode=relaxed support) — '
+            f'install Metal Developer Tools {tc.METAL_TOOLS_VERSION} ({tc.METAL_TOOLS_URL})'
+        )
+    if re.search(r'(?i)spirv-cross(?:\.exe)?[^\n]*(?:not found|cannot find|No such file|actual missing|0xc0000135)', log_text):
+        return 'spirv-cross.exe is missing or cannot start (re-extract the Windows release archive or install Vulkan SDK)'
+    if re.search(r'(?i)(?:dmsh_xlate[^\n]*(?:does not start|does not run)|dotnet[^\n]*(?:not found|You must install or update \.NET))', log_text):
+        return '.NET 10 runtime / shader translator (dmsh_xlate) could not run'
+    first_err = ''
+    if m := re.search(r'(?m)^(?:\s*\[fail\]\s*|(?:fatal )?error:\s*|LLVM ERROR:\s*|xcrun_shim:\s*)(.+)$', log_text):
+        first_err = m.group(1).strip()[:200]
+    counts = re.search(r'shaders (\d+): ok 0, fail (\d+)', log_text)
+    if counts and first_err:
+        return f'all {counts.group(1)} shader compiles failed: {first_err}'
+    if counts:
+        return f'all {counts.group(1)} shader compiles failed (see dmsh_build.log)'
+    if first_err:
+        return first_err
+    return ''
 
 
 def repo_dir() -> Path:
@@ -78,12 +142,16 @@ def load_upstream(repo: Path) -> ModuleType:
     and the only use is recovering HOME when the environment lacks one. The stand-in is
     installed by the shim's `sitecustomize`, so importing this module after `shim.install` has
     run is enough; when that did not happen, a minimal stub is registered here so the loader
-    never fails on an import the rest of the file does not need.
+    never fails on an import the rest of the file does not need. `fcntl` and `signal.SIGHUP`
+    are the same case: named at module level (tree_tar's locking, and STOPS), so without a
+    stand-in the import of the whole script fails rather than one unused feature.
     """
     if 'pwd' not in sys.modules:
         _install_pwd_stub()
     if 'fcntl' not in sys.modules:
         _install_fcntl_stub()
+    if not hasattr(signal, 'SIGHUP'):
+        _install_sighup_stub()
     if not hasattr(os, 'getuid'):
         os.getuid = lambda: 0  # type: ignore[attr-defined]
     path = repo / 'scripts' / 'build_ipa_from_nsp.py'
@@ -167,6 +235,251 @@ def _install_fcntl_stub() -> None:
     sys.modules['fcntl'] = fcntl
 
 
+def _install_sighup_stub() -> None:
+    """The SIGHUP half of the shim's POSIX signal adapter, for a load without the shim.
+
+    `scripts/build_ipa_from_nsp.py` names signal.SIGHUP at module level (STOPS), so Windows
+    fails the whole import, not just the signal handling. See the shim's sitecustomize for
+    why registering it is a no-op that returns None.
+    """
+    if hasattr(signal, 'SIGHUP'):
+        return
+    signal.SIGHUP = 1
+    real = signal.signal
+
+    def _no_hup(sig, handler):
+        if sig == signal.SIGHUP:
+            return None
+        return real(sig, handler)
+
+    signal.signal = _no_hup
+
+
+_k32 = ctypes.windll.kernel32 if sys.platform == 'win32' and hasattr(ctypes, 'windll') else None
+if _k32 is not None:
+    _k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+    _k32.CreateJobObjectW.restype = ctypes.c_void_p
+    _k32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    _k32.AssignProcessToJobObject.restype = ctypes.c_int
+    _k32.QueryInformationJobObject.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32),
+    ]
+    _k32.QueryInformationJobObject.restype = ctypes.c_int
+    _k32.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    _k32.TerminateJobObject.restype = ctypes.c_int
+    _k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    _k32.CloseHandle.restype = ctypes.c_int
+
+
+class _JobAccountingInfo(ctypes.Structure):
+    _fields_ = [
+        ('TotalUserTime', ctypes.c_int64),
+        ('TotalKernelTime', ctypes.c_int64),
+        ('ThisPeriodTotalUserTime', ctypes.c_int64),
+        ('ThisPeriodTotalKernelTime', ctypes.c_int64),
+        ('TotalPageFaultCount', ctypes.c_uint32),
+        ('TotalProcesses', ctypes.c_uint32),
+        ('ActiveProcesses', ctypes.c_uint32),
+        ('TotalTerminatedProcesses', ctypes.c_uint32),
+    ]
+
+
+class _WinProcGroup:
+    """Windows stand-in for `dm/tools/proc_group.Group` (`0b124486`).
+
+    Upstream's `proc_group.Group` registers a pipe fd with `selectors.DefaultSelector` (which raises
+    `WinError 10038` on Windows because Winsock `select` only accepts sockets) and stops process
+    groups with `os.killpg` / `SIGSTOP` / `SIGCONT`. Here a daemon reader thread streams the pipe
+    through a queue so `drain` timeouts still catch descendants holding stdout open, and a Win32 Job
+    Object tracks and terminates the whole child tree cleanly (falling back to process groups on
+    POSIX so unit tests exercise the exact class on macOS and Linux).
+    """
+
+    GRACE = 5.0
+    DRAIN = 5.0
+    REAP = 0.5
+    TICK = 0.02
+
+    def __init__(self, cmd, grace=None, drain=None, **popen):
+        self.grace = self.GRACE if grace is None else grace
+        self.drain = self.DRAIN if drain is None else drain
+        self.paused = False
+        self.stragglers: list[tuple[int | None, str]] = []
+        self.done = False
+        self._job: int | None = None
+        args = [str(c) for c in cmd]
+        if sys.platform == 'win32':
+            flags = (
+                popen.pop('creationflags', 0)
+                | getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
+                | getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+            )
+            self.p = subprocess.Popen(args, creationflags=flags, **popen)
+            if _k32 is not None:
+                job = _k32.CreateJobObjectW(None, None)
+                if job:
+                    proc_handle = int(getattr(self.p, '_handle', 0) or 0)
+                    if proc_handle and _k32.AssignProcessToJobObject(job, proc_handle):
+                        self._job = job
+                    else:
+                        _k32.CloseHandle(job)
+        else:
+            self.p = subprocess.Popen(args, start_new_session=True, **popen)
+        self.pgid = self.p.pid
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, exc, tb):
+        try:
+            if kind is not None:
+                self.stop()
+            elif not self.done:
+                self.finish()
+        finally:
+            if self.p.stdout:
+                try:
+                    self.p.stdout.close()
+                except OSError:
+                    pass
+            self._close_job()
+        return False
+
+    def _close_job(self) -> None:
+        if self._job is not None and _k32 is not None:
+            _k32.CloseHandle(self._job)
+            self._job = None
+
+    def pause(self) -> None:
+        self.paused = True
+
+    def resume(self) -> None:
+        self.paused = False
+
+    def _has_live_members(self) -> bool:
+        self.p.poll()
+        if self._job is not None and _k32 is not None:
+            info = _JobAccountingInfo()
+            if _k32.QueryInformationJobObject(self._job, 1, ctypes.byref(info), ctypes.sizeof(info), None):
+                return info.ActiveProcesses > 0
+        if sys.platform != 'win32':
+            try:
+                os.killpg(self.pgid, 0)
+                return True
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return self.p.returncode is None
+        return self.p.returncode is None
+
+    def _gone(self, secs: float) -> bool:
+        end = time.monotonic() + secs
+        while True:
+            if not self._has_live_members():
+                return True
+            if time.monotonic() >= end:
+                return False
+            time.sleep(self.TICK)
+
+    def stop(self, sig=None) -> None:
+        self.done = True
+        self.resume()
+        if self._job is not None and _k32 is not None:
+            _k32.TerminateJobObject(self._job, 1)
+        elif sys.platform == 'win32':
+            try:
+                subprocess.run(
+                    ['taskkill', '/T', '/F', '/PID', str(self.pgid)],
+                    capture_output=True, timeout=10, **tc.no_window(),
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+        else:
+            try:
+                os.killpg(self.pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        if self.p.poll() is None:
+            try:
+                self.p.kill()
+            except OSError:
+                pass
+        self.p.wait()
+        self._gone(self.REAP)
+
+    def finish(self) -> int:
+        self.p.wait()
+        self.done = True
+        if not self._gone(self.drain):
+            if not self.stragglers:
+                self.stragglers.append((None, 'a background process'))
+            self.stop()
+        return self.p.returncode
+
+    def lines(self):
+        out = self.p.stdout
+        assert out is not None, 'lines() reads a group started with stdout=PIPE'
+        q: queue.Queue[bytes | None] = queue.Queue()
+        read_chunk = getattr(out, 'read1', None)
+
+        def _reader() -> None:
+            try:
+                while True:
+                    data = read_chunk(65536) if read_chunk is not None else os.read(out.fileno(), 65536)
+                    if not data:
+                        break
+                    q.put(data)
+            except (OSError, ValueError):
+                pass
+            finally:
+                q.put(None)
+
+        threading.Thread(target=_reader, daemon=True).start()
+        dec = io.IncrementalNewlineDecoder(
+            codecs.getincrementaldecoder(locale.getpreferredencoding(False))(errors='replace'),
+            translate=True,
+        )
+        buf = ''
+        end: float | None = None
+        eof = False
+        while not eof:
+            wait = 0.05 if end is None else max(0.0, min(0.05, end - time.monotonic()))
+            try:
+                item = q.get(timeout=wait)
+                if item is None:
+                    eof = True
+                    break
+                buf += dec.decode(item)
+                *done_lines, buf = buf.split('\n')
+                for line in done_lines:
+                    yield line + '\n'
+                continue
+            except queue.Empty:
+                pass
+            if end is None and self.p.poll() is not None:
+                end = time.monotonic() + self.drain
+            if end is not None and time.monotonic() >= end:
+                while True:
+                    try:
+                        item = q.get_nowait()
+                    except queue.Empty:
+                        break
+                    if item is None:
+                        eof = True
+                        break
+                    buf += dec.decode(item)
+                    *done_lines, buf = buf.split('\n')
+                    for line in done_lines:
+                        yield line + '\n'
+                if not eof:
+                    self.stragglers.append((None, 'a background process holding its output'))
+                    self.stop()
+                break
+        buf += dec.decode(b'', final=True)
+        if buf:
+            yield buf
+
+
 def _option_value(argv: list[str], name: str) -> str | None:
     for i, a in enumerate(argv):
         if a == name and i + 1 < len(argv):
@@ -200,6 +513,10 @@ def patch(mod: ModuleType, repo: Path, *, j: int | None = None) -> None:
     if _UPSTREAM_RUN is None:
         _UPSTREAM_RUN = mod.run
 
+    os.environ.setdefault('DMSH_PROCS', '0')
+    if hasattr(mod, 'proc_group'):
+        mod.proc_group.Group = _WinProcGroup
+
     # ---------------------------------------------------------------- prereqs
     def check_prereqs(env, xlate, mac=False, *a, **kw):
         if mac:
@@ -217,30 +534,119 @@ def patch(mod: ModuleType, repo: Path, *, j: int | None = None) -> None:
     mod.check_prereqs = check_prereqs
 
     # ---------------------------------------------------------------- nx_extract
+    def _nx_extract_source_sha(repo_p: Path) -> str:
+        proj = repo_p / 'dm/tools/nx_extract'
+        if hasattr(mod, 'nx_extract_source_sha') and (proj / 'Program.cs').is_file() and (proj / 'nx_extract.csproj').is_file():
+            return mod.nx_extract_source_sha(repo_p)
+        import hashlib
+        h = hashlib.sha256()
+        if proj.is_dir():
+            for f in sorted([*proj.glob('*.cs'), *proj.glob('*.csproj')], key=lambda p: p.name):
+                h.update(f.name.encode('utf-8') + b'\0' + f.read_bytes() + b'\0')
+        return h.hexdigest()[:16]
+
+    def _verify_nx_extract(exe: Path, want: str, env) -> None:
+        if not want:
+            return
+        try:
+            r = subprocess.run([str(exe), '--source-sha'], capture_output=True, text=True,
+                               env=env if env is not None else os.environ, timeout=60,
+                               errors='replace', **tc.no_window())
+        except OSError as e:
+            raise BuildError(f'nx_extract failed to start ({exe}): {e}') from e
+        got = (r.stdout or '').strip()
+        if r.returncode or not got:
+            raise BuildError(f'nx_extract does not run ({exe}, exit {r.returncode}): '
+                             f'{(r.stderr or r.stdout or "").strip()}')
+        if got != want:
+            raise BuildError(f'nx_extract was not built from the in-repo source '
+                             f'(embedded {got} / in repo {want})')
+
     def build_nx_extract(repo_: Path, work: Path, logs: Path, env, *a, **kw):
         """Use the executable shipped with this engine, or build it for a source checkout."""
-        bundled = repo_ / 'dm/tools/nx_extract_bin/nx_extract.exe'
+        repo_p = Path(repo_)
+        proj = repo_p / 'dm/tools/nx_extract'
+        has_src = (proj / 'Program.cs').is_file() and (proj / 'nx_extract.csproj').is_file()
+        want = _nx_extract_source_sha(repo_p) if has_src else ''
+        bundled = repo_p / 'dm/tools/nx_extract_bin/nx_extract.exe'
         if bundled.is_file():
+            _verify_nx_extract(bundled, want, env)
             return bundled
 
         import tempfile
-        nx = work / 'tools/nx_extract/nx_extract'
+        nx = Path(work) / 'tools/nx_extract/nx_extract'
+        nx_exe = nx.parent / 'nx_extract.exe'
+        if nx_exe.is_file():
+            try:
+                _verify_nx_extract(nx_exe, want, env)
+                return nx
+            except BuildError:
+                mod.rmtree(nx.parent)
+
         # An absolute path: `dotnet` by name relies on PATH, and a toolchain this app downloaded
         # lives in its own folder (the shim's PATH has it, but not every caller goes through it).
         dn = tc.dotnet_dir()
         dotnet = str(dn / 'dotnet.exe') if dn else 'dotnet'
-        with tempfile.TemporaryDirectory(prefix='nx_extract_') as td:
-            mod.run([dotnet, 'build', repo_ / 'dm/tools/nx_extract', '-c', 'Release',
+        with tempfile.TemporaryDirectory(prefix='nx_extract_') as td, \
+                tempfile.TemporaryDirectory(prefix='nx_extract_art_') as art:
+            mod.run([dotnet, 'build', proj, '-c', 'Release',
+                     '-p:PublishAot=false', *tc.csc_tool_args(), '--artifacts-path', art,
                      '-o', td, '-v', 'quiet', '-nologo'],
-                    logs / 'nx_extract_build.log', env=env)
+                    Path(logs) / 'nx_extract_build.log', env=env)
             exe = Path(td) / 'nx_extract.exe'
             if not exe.exists():
                 raise BuildError(f'nx_extract built without nx_extract.exe (see '
-                                 f'{logs / "nx_extract_build.log"})')
+                                 f'{Path(logs) / "nx_extract_build.log"})')
             mod.rmtree(nx.parent)
-            shutil.copytree(td, nx.parent)
+            try:
+                shutil.copytree(td, nx.parent)
+            except BaseException:
+                mod.rmtree(nx.parent)
+                raise
+        _verify_nx_extract(nx_exe, want, env)
         return nx
+
+    def find_nx_extract(repo_: Path, env=None, *a, **kw):
+        """Return the Windows extractor executable: bundled in dm/tools/nx_extract_bin/, or built into tools_dir()."""
+        repo_p = Path(repo_)
+        proj = repo_p / 'dm/tools/nx_extract'
+        has_src = (proj / 'Program.cs').is_file() and (proj / 'nx_extract.csproj').is_file()
+        want = _nx_extract_source_sha(repo_p) if has_src else ''
+        bundled = repo_p / 'dm/tools/nx_extract_bin/nx_extract.exe'
+        if bundled.is_file():
+            _verify_nx_extract(bundled, want, env)
+            return bundled
+        sha = want or _nx_extract_source_sha(repo_p)
+        cache_dir = tc.tools_dir() / f'nx_extract-{sha}'
+        cached = cache_dir / 'nx_extract.exe'
+        if cached.is_file():
+            _verify_nx_extract(cached, want, env)
+            return cached
+        import tempfile
+        dn = tc.dotnet_dir()
+        dotnet = str(dn / 'dotnet.exe') if dn else 'dotnet'
+        log = tc.tools_dir() / 'nx_extract_build.log'
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix='nx_extract_') as td, \
+                tempfile.TemporaryDirectory(prefix='nx_extract_art_') as art:
+            mod.run([dotnet, 'build', proj, '-c', 'Release', '-p:PublishAot=false',
+                     *tc.csc_tool_args(), '--artifacts-path', art, '-o', td, '-v', 'quiet',
+                     '-nologo'],
+                    log, env=env if env is not None else os.environ)
+            exe = Path(td) / 'nx_extract.exe'
+            if not exe.exists():
+                raise BuildError(f'nx_extract built without nx_extract.exe (see {log})')
+            mod.rmtree(cache_dir)
+            try:
+                shutil.copytree(td, cache_dir)
+            except BaseException:
+                mod.rmtree(cache_dir)
+                raise
+        _verify_nx_extract(cached, want, env)
+        return cached
+
     mod.build_nx_extract = build_nx_extract
+    mod.find_nx_extract = find_nx_extract
 
     # ---------------------------------------------------------------- APFS clones
     mod.can_clone = lambda *a, **kw: False
@@ -250,7 +656,11 @@ def patch(mod: ModuleType, repo: Path, *, j: int | None = None) -> None:
     mod.ALLOW_OTHER_METAL = True                  # Windows Metal Tools version differs from Xcode's
 
     # ---------------------------------------------------------------- the Mac host
+    _in_oodle_host_lookup = False
+
     def build_mac_host(repo_, out, env, logs, g, *a, **kw):
+        if _in_oodle_host_lookup:
+            return Path(__file__).resolve().parent / 'oodle_emu.py'
         raise BuildError(
             'this step boots the game\'s own arm64 code in a Mac host, which no Windows PC can '
             'run. It is needed only for a game whose shaders appear at run time (GLSLC / Vulkan / '
@@ -258,6 +668,27 @@ def patch(mod: ModuleType, repo: Path, *, j: int | None = None) -> None:
             'are in the RomFS (Mario Wonder, Odyssey, Mario Kart 8 Deluxe, the Zelda games, …) '
             'do not need it.')
     mod.build_mac_host = build_mac_host
+    if hasattr(mod, 'UE_DECODE_SECS') and isinstance(mod.UE_DECODE_SECS, (int, float)):
+        mod.UE_DECODE_SECS = max(int(mod.UE_DECODE_SECS) * 3, 900)
+
+    if not hasattr(mod, '_nspb_orig_decode_ue_shaders') and hasattr(mod, 'decode_ue_shaders'):
+        mod._nspb_orig_decode_ue_shaders = mod.decode_ue_shaders
+
+    if hasattr(mod, '_nspb_orig_decode_ue_shaders'):
+        _orig_decode_ue_shaders = mod._nspb_orig_decode_ue_shaders
+
+        def decode_ue_shaders(repo_, dirs, pkg_ver, patched, work, env, logs, g, *a, **kw):
+            nonlocal _in_oodle_host_lookup
+            prev = _in_oodle_host_lookup
+            _in_oodle_host_lookup = True
+            try:
+                return _orig_decode_ue_shaders(
+                    repo_, dirs, pkg_ver, patched, work, env, logs, g, *a, **kw
+                )
+            finally:
+                _in_oodle_host_lookup = prev
+
+        mod.decode_ue_shaders = decode_ue_shaders
 
     def heap_check(repo_, d, patched, work, env, logs, g, *a, **kw):
         """The heap check without the Mac host.
@@ -426,15 +857,434 @@ def patch(mod: ModuleType, repo: Path, *, j: int | None = None) -> None:
                 'machine on this PC. The game\'s files are extracted, so a Mac can finish the '
                 'build from the same work folder (its shader/ and extract/ are reused).')
         return fn
-    mod.capture_glslc = _refuse_capture('this game')
-    mod.capture_shaders = _refuse_capture('this game')
+    def capture_glslc(repo_=None, dirs=None, pkg_ver=None, patched=None, work=None,
+                      env=None, logs=None, g=None, *a, **kw):
+        """Reuse existing `glslc_capture` folders or compile embedded GLSL shaders offline."""
+        if isinstance(dirs, dict) and dirs and hasattr(mod, 'glslc_done'):
+            want = (
+                mod.glslc_wanted(g)
+                if (g is not None and hasattr(mod, 'glslc_wanted'))
+                else None
+            )
+            todo = [
+                v for v, d in dirs.items()
+                if not (
+                    mod.glslc_done(Path(d) / 'glslc_capture') >= want
+                    if want
+                    else mod.glslc_done(Path(d) / 'glslc_capture')
+                )
+            ]
+            if not todo:
+                mod.PROG.stage('GLSLC capture')
+                say(
+                    'reusing the captured run-time shaders: '
+                    + ', '.join(str(Path(d) / 'glslc_capture') for d in dirs.values())
+                )
+                mod.PROG.end('reused')
+                return None
 
-    def capture_jit(py_, repo_, d, patched, work, env, logs, g, *a, **kw):
-        if (Path(d) / 'jit' / 'jit.img').is_file():
-            say(f'reusing the captured JIT image: {Path(d) / "jit/jit.img"}')
-            return
+            from . import glslc_emu
+            mod.PROG.stage('GLSLC capture')
+            t0 = time.time()
+            all_ok = True
+            total_got = 0
+            for ver in todo:
+                d_path = Path(dirs[ver])
+                cap = d_path / 'glslc_capture.partial'
+                mod.rmtree(cap)
+                nro_cands: list[Path] = []
+                if patched is not None:
+                    p_path = Path(patched)
+                    nro_cands.append(
+                        p_path.with_name('nro_' + p_path.name.removeprefix('patched_'))
+                    )
+                if work is not None:
+                    nro_cands.append(Path(work) / f'nro_{ver}')
+                mod.PROG.set(
+                    step='compiling run-time shaders offline',
+                    done=0,
+                    total=len(want) if want else None,
+                    unit='shaders',
+                )
+                say(f'compiling run-time GLSLC shaders offline → {d_path / "glslc_capture"}')
+                try:
+                    glslc_emu.compile_for_version(
+                        d_path,
+                        cap,
+                        nro_dirs=nro_cands,
+                        wanted=want,
+                        say=say,
+                        progress=lambda n: mod.PROG.set(done=n),
+                    )
+                except Exception as exc:
+                    say(f'offline GLSLC compilation failed ({exc})')
+                    mod.rmtree(cap)
+                    all_ok = False
+                    break
+                got = mod.glslc_done(cap)
+                if want and got >= want or (not want and got):
+                    mod.swap_in(cap, d_path / 'glslc_capture')
+                    total_got += len(got)
+                else:
+                    if want:
+                        say(f'offline GLSLC compilation incomplete: got {len(got & want)}/{len(want)} shader(s)')
+                    mod.rmtree(cap)
+                    all_ok = False
+                    break
+            if all_ok:
+                dt = time.time() - t0
+                end_msg = (
+                    f'{total_got} shaders in {mod.hms(dt)}'
+                    if hasattr(mod, 'hms')
+                    else f'{total_got} shaders'
+                )
+                mod.PROG.end(end_msg)
+                return None
+            mod.PROG.end(ok=False)
+
+        return _refuse_capture('this game')(
+            repo_, dirs, pkg_ver, patched, work, env, logs, g, *a, **kw
+        )
+
+    mod.capture_glslc = capture_glslc
+
+    def capture_shaders(repo_=None, d=None, patched=None, work=None, env=None,
+                        logs=None, g=None, api='gl', *a, **kw):
+        """Reuse existing `gl_capture`/`vk_capture` or reconstruct LÖVE / GameMaker GL shaders offline."""
+        if d is not None:
+            d_path = Path(d)
+            out = d_path / f'{api}_capture'
+            want = (
+                mod.capture_wanted(g, api)
+                if (g is not None and hasattr(mod, 'capture_wanted'))
+                else None
+            )
+            if want and hasattr(mod, 'capture_done') and mod.capture_done(out, api) >= want:
+                c_name = (
+                    mod.CAPTURES[api]['name']
+                    if (hasattr(mod, 'CAPTURES') and api in mod.CAPTURES)
+                    else ('Vulkan' if api == 'vk' else api.upper())
+                )
+                mod.PROG.stage(f'{c_name} shader capture')
+                say(f'reusing the captured run-time shaders: {out}')
+                mod.PROG.end('reused')
+                return out
+            if api == 'gl':
+                main_nso = d_path / 'ExeFS' / 'main'
+                if main_nso.is_file():
+                    from . import gm_shaders, love_shaders
+                    part = d_path / 'gl_capture.partial'
+                    table = None
+                    if g is not None and hasattr(mod, 'CAPTURES'):
+                        try:
+                            table = g.table(mod.CAPTURES['gl']['table'])
+                        except Exception:
+                            table = None
+                    rom_src = (
+                        mod.rfs.source(d_path)
+                        if hasattr(mod, 'rfs')
+                        else (d_path / 'RomFS')
+                    )
+                    for eng_label, sh_mod, err_cls in (
+                        ('LÖVE', love_shaders, love_shaders.LoveShaderError),
+                        ('GameMaker', gm_shaders, gm_shaders.GMShaderError),
+                    ):
+                        mod.rmtree(part)
+                        try:
+                            res = sh_mod.generate(
+                                main_nso,
+                                rom_src,
+                                part,
+                                table,
+                                log=say,
+                                repo=repo_,
+                                require_table=True,
+                            )
+                        except (err_cls, ValueError) as e:
+                            mod.rmtree(part)
+                            raise BuildError(str(e)) from e
+                        if res is not None:
+                            mod.PROG.stage(f'GL shader reconstruction ({eng_label})')
+                            if hasattr(mod, 'swap_in'):
+                                mod.swap_in(part, out)
+                            else:
+                                mod.rmtree(out)
+                                part.rename(out)
+                            mod.PROG.end(f'{len(res[0])} shaders')
+                            return out
+                        mod.rmtree(part)
+        return _refuse_capture('this game')(
+            repo_, d, patched, work, env, logs, g, api, *a, **kw
+        )
+
+    mod.capture_shaders = capture_shaders
+
+    def capture_jit(py_=None, repo_=None, d=None, patched=None, work=None,
+                    env=None, logs=None, g=None, *a, **kw):
+        """Reuse `jit/jit.img` or pack existing `jit_capture/` dumps via `jit_capture.py`."""
+        if d is not None:
+            d_path = Path(d)
+            out = d_path / 'jit'
+            if (out / 'jit.img').is_file():
+                say(f'reusing the captured JIT image: {out / "jit.img"}')
+                return out
+            caps = d_path / 'jit_capture'
+            if caps.is_dir():
+                stamp_ok = True
+                if patched is not None and g is not None and hasattr(mod, 'jit_stamp'):
+                    sf = caps / 'stamp.json'
+                    stamp_ok = (
+                        sf.is_file()
+                        and sf.read_text(encoding='utf-8', errors='replace') == mod.jit_stamp(patched, g)
+                    )
+                route = (
+                    g.get('jit_route', '')
+                    if (g is not None and hasattr(g, 'get'))
+                    else ''
+                )
+                req = ('boot1', 'boot2') + (('route',) if route else ())
+                if stamp_ok and all(any((caps / n).glob('*.jit')) for n in req):
+                    mod.PROG.stage('JIT capture', step='image')
+                    tmp = d_path / 'jit.partial'
+                    mod.rmtree(tmp)
+                    log_path = (Path(logs) / 'jit_capture.log') if logs is not None else None
+                    dirs_arg = sorted(
+                        str(x) for x in caps.iterdir()
+                        if x.is_dir() and not x.name.endswith('.partial')
+                    )
+                    gid = getattr(g, 'id', '') if g is not None else ''
+                    mod.run(
+                        [py_ or sys.executable, Path(repo_) / 'dm/tools/jit_capture.py', '--profile', gid]
+                        + dirs_arg
+                        + [tmp],
+                        log_path,
+                        env=env,
+                    )
+                    if hasattr(mod, 'swap_in'):
+                        mod.swap_in(tmp, out)
+                    else:
+                        mod.rmtree(out)
+                        tmp.rename(out)
+                    summary = 'reused captures'
+                    if log_path is not None and log_path.is_file():
+                        lines = log_path.read_text(encoding='utf-8', errors='replace').strip().splitlines()
+                        if lines:
+                            summary = lines[-1][:120]
+                    mod.PROG.end(summary)
+                    return out
         _refuse_capture('this game (nn::jit)')()
+
     mod.capture_jit = capture_jit
+
+    def capture_nro(py_=None, repo_=None, exe_dir=None, out=None, nro_dir=None,
+                    env=None, logs=None, g=None, provisional=False, *a, **kw):
+        """Return `g` when no runtime NRO is missing, decode `nxboot` NROs offline, or refuse."""
+        if nro_dir is not None:
+            missing = Path(nro_dir) / 'missing.tsv'
+            if not missing.is_file():
+                return g
+            want = dict(
+                line.split('\t', 1)
+                for line in missing.read_text(encoding='utf-8', errors='replace').splitlines()
+                if line and '\t' in line
+            )
+            if not want:
+                return g
+            if exe_dir is not None and (Path(exe_dir) / 'main').is_file():
+                from . import nro_emu
+                if hasattr(mod.PROG, 'add'):
+                    mod.PROG.add(2)
+                mod.PROG.stage('NRO capture')
+                mod.PROG.set(step='decoding runtime NRO offline')
+                try:
+                    captured = nro_emu.capture_missing_nros(exe_dir, nro_dir, say=say)
+                except Exception as exc:
+                    say(f'offline NRO decode failed ({exc})')
+                    captured = []
+                rem = (
+                    [
+                        ln
+                        for ln in missing.read_text(encoding='utf-8', errors='replace').splitlines()
+                        if ln and '\t' in ln
+                    ]
+                    if missing.is_file()
+                    else []
+                )
+                if captured and not rem:
+                    name, _sha, sz = captured[-1]
+                    mod.PROG.end(f'{name}, {sz / 2**20:.1f} MB')
+                    if hasattr(mod, 'rewrite') and out is not None:
+                        return mod.rewrite(py_, repo_, exe_dir, out, env, logs, g, provisional)
+                    return g
+                mod.PROG.end(ok=False)
+        _refuse_capture('this game (runtime NRO)')()
+
+    mod.capture_nro = capture_nro
+
+    # ---------------------------------------------------------------- Unreal inline & Oodle/LZ5 shaders
+    pg = getattr(mod, 'pg', None)
+    if pg is None:
+        for sub in ('tools', 'games'):
+            d = str(Path(repo) / 'dm' / sub)
+            if d not in sys.path:
+                sys.path.insert(0, d)
+        try:
+            import importlib
+            pg = importlib.import_module('profile_guess')
+            mod.pg = pg
+        except Exception:
+            pg = None
+
+    if pg is not None:
+        if not hasattr(pg, '_nspb_orig_build_sources') and hasattr(pg, 'build_sources'):
+            pg._nspb_orig_build_sources = pg.build_sources
+        if hasattr(pg, '_nspb_orig_build_sources'):
+            _orig_build_sources = pg._nspb_orig_build_sources
+
+            def build_sources(exefs, romfs, modules=('main',), *a, **kw):
+                res = _orig_build_sources(exefs, romfs, modules, *a, **kw)
+                if isinstance(res, dict) and 'oodle_packs' in res:
+                    cache = getattr(mod, '_nspb_build_sources_oodle', None)
+                    if not isinstance(cache, dict):
+                        cache = {}
+                        mod._nspb_build_sources_oodle = cache
+                    cache[str(romfs)] = bool(res['oodle_packs'][0])
+                return res
+
+            pg.build_sources = build_sources
+
+    def _rom_has_oodle_packs(pg_mod, romfs, main_path) -> bool:
+        if pg_mod is None or main_path is None or not callable(getattr(pg_mod, 'build_sources', None)):
+            return False
+        mp = Path(main_path)
+        if not mp.is_file():
+            return False
+        try:
+            with open(mp, 'rb') as f:
+                if f.read(4) != b'NSO0':
+                    return False
+            nso_fn = getattr(pg_mod, 'nso_files', None)
+            mods = [p.name for p in nso_fn(mp.parent)] if callable(nso_fn) else [mp.name]
+            res = pg_mod.build_sources(mp.parent, romfs, mods or [mp.name])
+            if isinstance(res, dict) and 'oodle_packs' in res:
+                return bool(res['oodle_packs'][0])
+        except Exception:
+            pass
+        return False
+
+    if not hasattr(mod, '_nspb_orig_split_shaders') and hasattr(mod, 'split_shaders'):
+        mod._nspb_orig_split_shaders = mod.split_shaders
+
+    if hasattr(mod, '_nspb_orig_split_shaders'):
+        _orig_split_shaders = mod._nspb_orig_split_shaders
+
+        def split_shaders(py_, repo_, roms, mains, pkg, env, logs, g,
+                          provisional=False, oodle=None, *a, **kw):
+            """Wire `oodle_emu.py` for Oodle/LZ5 games while keeping pure Zlib/LZ4 paks zero-overhead.
+
+            When `oodle_packs` is empty and the game's `ExeFS/main` embeds no Oodle or LZ5 decoder
+            (e.g., OCTOPATH TRAVELER I or Yoshi's Crafted World), `oodle` is cleared to `None` so
+            `shader_split.py` runs purely in Python with zero child-process overhead. When the game
+            does have Oodle packs or an embedded Oodle/LZ5 decoder, `oodle` resolves `DM_OODLE_HOST`
+            to `oodle_emu.py`.
+            """
+            if oodle is not None:
+                cur_pg = getattr(mod, 'pg', None) or pg
+                cache = getattr(mod, '_nspb_build_sources_oodle', None)
+                recorded = cache if isinstance(cache, dict) else {}
+                pairs = [
+                    (r, mains[i] if mains and i < len(mains) else None)
+                    for i, r in enumerate(roms)
+                ]
+                has_oodle_packs = False
+                for r, m in pairs:
+                    key = str(r)
+                    if key in recorded:
+                        val = bool(recorded.pop(key))
+                    else:
+                        val = _rom_has_oodle_packs(cur_pg, r, m)
+                    if val:
+                        has_oodle_packs = True
+                from . import oodle_emu
+                if not has_oodle_packs and not oodle_emu.has_decoder(mains):
+                    oodle = None
+                    if env.get('DM_EXPERIMENTAL_BUILDER') == '1':
+                        env = dict(env)
+                        env.pop('DM_EXPERIMENTAL_BUILDER', None)
+                else:
+                    _orig_oodle = oodle
+
+                    def _win_oodle():
+                        nonlocal _in_oodle_host_lookup
+                        prev = _in_oodle_host_lookup
+                        _in_oodle_host_lookup = True
+                        try:
+                            return _orig_oodle()
+                        finally:
+                            _in_oodle_host_lookup = prev
+
+                    oodle = _win_oodle
+            return _orig_split_shaders(py_, repo_, roms, mains, pkg, env, logs, g,
+                                       provisional, oodle, *a, **kw)
+
+        mod.split_shaders = split_shaders
+
+    # ---------------------------------------------------------------- Windows shader diagnostics
+    if not hasattr(mod, '_nspb_orig_build_shaders') and hasattr(mod, 'build_shaders'):
+        mod._nspb_orig_build_shaders = mod.build_shaders
+
+    if hasattr(mod, '_nspb_orig_build_shaders'):
+        _orig_build_shaders = mod._nspb_orig_build_shaders
+
+        def _has_spirv_cross(repo_p, env_d: dict | None) -> bool:
+            env_d = env_d or {}
+            for key in ('SPIRV_CROSS', 'NSPB_SPIRV_CROSS'):
+                val = str(env_d.get(key) or '').strip()
+                if val:
+                    p = Path(val)
+                    if p.is_file() or p.with_suffix('.exe').is_file():
+                        return True
+                    return bool(shutil.which(val, path=env_d.get('PATH')))
+            if tc.find_exe('spirv-cross'):
+                return True
+            sc_dir = Path(repo_p) / 'dm' / 'gfx' / 'tools' / 'spirv_cross_bin'
+            if (sc_dir / 'spirv-cross.exe').is_file() or (sc_dir / 'spirv-cross').is_file():
+                return True
+            return bool(shutil.which('spirv-cross', path=env_d.get('PATH')))
+
+        def build_shaders(py, repo_, sh, xlate, env, logs, g, *a, **kw):
+            mac = bool(kw.get('mac', a[1] if len(a) > 1 else False))
+            chain = mod.chain_of(repo_) if hasattr(mod, 'chain_of') else ''
+            has_key = bool(chain and (Path(sh) / 'ios' / f'b-{chain}.key').is_file())
+            if not mac and not has_key and not _has_spirv_cross(repo_, env):
+                raise BuildError(
+                    'missing on this PC:\n'
+                    '  spirv-cross: spirv-cross.exe is missing '
+                    '(re-extract the Windows release archive or install Vulkan SDK)'
+                )
+            try:
+                return _orig_build_shaders(py, repo_, sh, xlate, env, logs, g, *a, **kw)
+            except BuildError as exc:
+                msg = str(exc)
+                if 'shader libraries in ' not in msg and 'did not finish a full build' not in msg:
+                    raise
+                why = ''
+                log_file = (Path(logs) / 'dmsh_build.log') if logs is not None else None
+                if log_file is not None and log_file.is_file():
+                    why = diagnose_empty_shader_log(log_file.read_text(encoding='utf-8', errors='replace'))
+                if not why and not mac and not _has_spirv_cross(repo_, env):
+                    why = 'spirv-cross.exe is missing (re-extract the Windows release archive or install Vulkan SDK)'
+                if not why:
+                    if missing := tc.missing_vc_runtime_dlls():
+                        why = (
+                            f'missing {", ".join(missing)} — '
+                            f'install Microsoft Visual C++ 2015-2022 Redistributable (x64) ({tc.VCREDIST_URL})'
+                        )
+                if why:
+                    raise BuildError(f'{msg} — {why}') from exc
+                raise
+
+        mod.build_shaders = build_shaders
 
     # ---------------------------------------------------------------- Mac outputs
     def mac_app(*a, **k):
@@ -478,7 +1328,21 @@ def patch(mod: ModuleType, repo: Path, *, j: int | None = None) -> None:
                 raise BuildError('--prepare-xcode needs Xcode and xcodegen: drop it on Windows')
             cmd = [sys.executable, str(Path(__file__).resolve().parent / 'build_app.py'),
                    *cmd[2:]]
-        return _UPSTREAM_RUN(cmd, log, *a, **kw)
+        res = _UPSTREAM_RUN(cmd, log, *a, **kw)
+        if (len(cmd) >= 2 and cmd[1].replace('\\', '/').endswith('dm/gfx/tools/shader_split.py')
+                and log is not None and Path(log).is_file()):
+            text = Path(log).read_text(encoding='utf-8', errors='replace')
+            if ('Oodle- or LZ5-compressed game files: set DM_OODLE_HOST' in text
+                    or 'the game\'s decoder in the Mac host' in text):
+                if len(cmd) >= 5 and Path(cmd[4]).parent.name.endswith('.partial'):
+                    mod.rmtree(Path(cmd[4]).parent)
+                m = re.search(r'^\[RED\] (.+)$', text, re.M)
+                detail = f'{m.group(1)}\n' if m else ''
+                raise BuildError(
+                    f'{detail}this game\'s shader archives use Oodle or LZ5 compression, which '
+                    'must be decoded by booting the game\'s own arm64 code in a Mac host '
+                    f'(each file in {log})')
+        return res
 
     mod.run = run_ipa
 
@@ -488,27 +1352,40 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     check_cli(argv)
     repo = repo_dir()
+    if __package__:
+        from .. import engine
+    else:                                       # pragma: no cover - script mode
+        from nspb_qt import engine
+    engine.prune_stale_bundled_engine_files(repo)
     if os.name != 'nt' and not os.environ.get('NSPB_ALLOW_NON_WINDOWS'):
         raise SystemExit('nspb_qt.win.driver runs the Windows build; on macOS use '
                          'scripts/build_ipa_from_nsp.py')
 
     from . import shim
     env = shim.build_env(python_exe=sys.executable)
-    os.environ.clear()
-    os.environ.update(env)
-    sdir = str(shim.shim_dir())
-    if sdir not in sys.path:
-        sys.path.insert(0, sdir)
-    if 'sitecustomize' not in sys.modules:
-        try:
-            import sitecustomize  # noqa: F401
-        except Exception:
-            pass
+    owned_spool: str | None = None
+    if not env.get('NSPB_SPOOL_DIR', '').strip():
+        owned_spool = tempfile.mkdtemp(prefix='nspb-spool-')
+        env['NSPB_SPOOL_DIR'] = owned_spool
+    try:
+        os.environ.clear()
+        os.environ.update(env)
+        sdir = str(shim.shim_dir())
+        if sdir not in sys.path:
+            sys.path.insert(0, sdir)
+        if 'sitecustomize' not in sys.modules:
+            try:
+                import sitecustomize  # noqa: F401
+            except Exception:
+                pass
 
-    mod = load_upstream(repo)
-    patch(mod, repo)
-    sys.argv[0] = str(repo / 'scripts' / 'build_ipa_from_nsp.py')
-    return mod.cli(argv)
+        mod = load_upstream(repo)
+        patch(mod, repo)
+        sys.argv[0] = str(repo / 'scripts' / 'build_ipa_from_nsp.py')
+        return mod.cli(argv)
+    finally:
+        if owned_spool:
+            shutil.rmtree(owned_spool, ignore_errors=True)
 
 
 if __name__ == '__main__':

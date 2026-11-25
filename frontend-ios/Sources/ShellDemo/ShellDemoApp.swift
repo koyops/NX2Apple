@@ -1,6 +1,9 @@
 import SwiftUI
 import ShellUI
 import ShellControllers
+#if canImport(UIKit)
+import UIKit
+#endif
 
 @main struct ShellDemoApp: App {
     /// `--host`, or always when built with `-D HOST_DEFAULT` (a build to install, where no launch arguments can be passed).
@@ -24,6 +27,7 @@ struct DemoScreen: View {
     @State private var padSnapshot: PadSnapshot?
     @State private var games = SampleData.games
     @State private var notice: String?
+    @State private var libraryModalPresented = false
     @State private var input = ShellInputLog()
     @State private var unfolded = ProcessInfo.processInfo.arguments.contains("--unfolded")
     /// Real controllers, through the reusable adapter in ShellControllers.
@@ -35,10 +39,23 @@ struct DemoScreen: View {
         return args[i + 1]
     }
     private var scenario: String { value("--screen") ?? "library" }
-    /// `--games 3` shows the first three sample games, for the short shelf.
+    /// `--games` sizes the sample library, repeating fixtures for long-scroll checks.
     private var shown: [GameDetail] {
         guard scenario != "empty" else { return [] }
-        return value("--games").flatMap(Int.init).map { Array(games.prefix($0)) } ?? games
+        // QA: `--switch2` marks the selected game as a Switch 2 game, for the badge and memory note of its settings.
+        var games = games
+        if args.contains("--switch2") {
+            games = games.map { var detail = $0; if detail.game.id == initialSelection { detail.game.isSwitch2 = true }; return detail }
+        }
+        guard let count = value("--games").flatMap(Int.init), !games.isEmpty else { return games }
+        return (0..<max(0, count)).map { index in
+            var detail = games[index % games.count]
+            if index >= games.count {
+                detail.game.id += "-\(index)"
+                detail.game.recentlyPlayed = nil
+            }
+            return detail
+        }
     }
     private var initialSelection: String {
         switch scenario {
@@ -58,7 +75,7 @@ struct DemoScreen: View {
         .overlay(alignment: .bottom) {
             if args.contains("--input-test") {
                 HStack {
-                    ForEach(["left", "right", "down", "up", "activate", "back", "settings"], id: \.self) { name in
+                    ForEach(["left", "right", "down", "up", "activate", "back", "settings", "options"], id: \.self) { name in
                         Button(name) { send(qaAction(name)) }.accessibilityIdentifier("qa.input.\(name)").frame(minHeight: 44)
                     }
                 }
@@ -67,7 +84,7 @@ struct DemoScreen: View {
                 .padding(.bottom, 2)
             }
         }
-        .alert("Demo action", isPresented: Binding(get: { notice != nil }, set: { if !$0 { notice = nil } })) {
+        .alert("Demo action", isPresented: Binding(get: { notice != nil && !libraryModalPresented }, set: { if !$0 { notice = nil } })) {
             Button("OK") { notice = nil }
         } message: { Text(notice ?? "") }
         .onAppear {
@@ -91,7 +108,10 @@ struct DemoScreen: View {
                     padSnapshot: padSnapshot ?? (scenario == "controllers-test"
                         ? PadSnapshot(name: "Demo", pressed: [.a, .leftBumper, .up], leftStick: CGPoint(x: 0.6, y: 0.5), rightTrigger: 0.7) : nil),
                     initialPadMapping: scenario == "controllers-mapping" ? ControllersView.mappingID : nil,
-                    initialButtonTestOpen: scenario == "controllers-test")
+                    initialButtonTestOpen: scenario == "controllers-test",
+                    notice: notice, noticeTitle: "Demo action", noticeDismissTitle: "OK",
+                    onDismissNotice: { notice = nil },
+                    onModalPresentedChange: { libraryModalPresented = $0 })
     }
 
     /// A stand-in for the foldable while no Simulator runtime for it is installed: the same running shell in a frame
@@ -126,6 +146,7 @@ struct DemoScreen: View {
         case "up": .up
         case "activate": .activate
         case "back": .back
+        case "options": .shellSettings
         default: .settings
         }
     }
@@ -134,23 +155,32 @@ struct DemoScreen: View {
     }
     /// The real controllers when any are connected, the sample ones otherwise.
     private var controllers: [ControllerInfo] {
-        if !connected.isEmpty {
+        if !args.contains("--samples"), !connected.isEmpty {
             return connected.map { ControllerInfo(id: $0.id, name: $0.name, player: demoText("Player \($0.player)"),
                                                   batteryPercent: $0.batteryPercent, charging: $0.charging) }
         }
         return SampleData.controllers
     }
+    @MainActor private static let sampleBaselineValues: [String: [String: String]] = Dictionary(
+        uniqueKeysWithValues: SampleData.games.map { game in
+            (game.id, Dictionary(uniqueKeysWithValues: game.sections.flatMap(\.rows).map { ($0.id, $0.value) }))
+        }
+    )
+
     private var actions: ShellActions {
         ShellActions(onPlay: { _ in notice = demoText("Play requested. The demo does not launch games.") },
                      onChange: { game, row, value in
             guard let g = games.firstIndex(where: { $0.id == game }) else { return }
+            let baseline = Self.sampleBaselineValues[game]?[row]
             for section in games[g].sections.indices {
                 if let index = games[g].sections[section].rows.firstIndex(where: { $0.id == row }) {
                     games[g].sections[section].rows[index].value = value
                     games[g].sections[section].rows[index].fromShell = false
-                    games[g].hasModifiedSettings = true
+                    games[g].sections[section].rows[index].fromEnvFile = false
+                    games[g].sections[section].rows[index].changed = baseline.map { $0 != value } ?? true
                 }
             }
+            games[g].hasModifiedSettings = games[g].sections.flatMap(\.rows).contains(where: \.changed)
         }, onPickGameData: { _ in notice = demoText("Choose game data requested. The host supplies the picker.") },
                      onUseAppData: { _ in notice = demoText("Use app data requested.") },
                      onPickCloudSaves: { _ in notice = demoText("Choose cloud folder requested. The host supplies the picker.") },
@@ -179,6 +209,37 @@ struct DemoScreen: View {
                      onButtonTest: { open in
             gamepads.onSnapshot = open ? { padSnapshot = $0 } : nil
             if !open { padSnapshot = nil }
+        }, onCopyShortcutURL: { id in
+            let shortcut = "nx2apple://launch?id=\(id)"
+            #if canImport(UIKit)
+            UIPasteboard.general.string = shortcut
+            #endif
+        }, onAddToHomeScreen: { id in
+            let title = games.first(where: { $0.id == id })?.game.title ?? id
+            #if canImport(UIKit)
+            UIPasteboard.general.string = title
+            #endif
+            return true
+        }, onAddToHomeScreenWithGuide: { id, _ in
+            let title = games.first(where: { $0.id == id })?.game.title ?? id
+            #if canImport(UIKit)
+            UIPasteboard.general.string = title
+            #endif
+            return true
+        }, onSaveCustomCover: { id, jpegData in
+            if let i = games.firstIndex(where: { $0.id == id }),
+               let art = Artwork(id: "custom.\(id).\(UUID().uuidString)", data: jpegData) {
+                games[i].game.banner = art
+                games[i].game.hasCustomCover = true
+            }
+        }, onResetCustomCover: { id in
+            if let i = games.firstIndex(where: { $0.id == id }),
+               let original = SampleData.games.first(where: { $0.id == id }) {
+                games[i].game.banner = original.game.banner
+                games[i].game.hasCustomCover = false
+            }
+        }, onLoadCheats: { id in
+            GameCheatsSnapshot(gameID: id, gameTitle: games.first(where: { $0.id == id })?.game.title ?? id)
         })
     }
 }

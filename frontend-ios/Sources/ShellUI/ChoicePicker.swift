@@ -70,6 +70,7 @@ extension EnvironmentValues {
 /// The list of a choice's options with a checkmark on the current one. A card in the shell's style over the dimmed
 /// settings. D-pad and keys move through `pick.<option>` targets, A or Return picks, B or Escape closes.
 struct ChoicePickerView: View {
+    @Environment(\.shellNativeBars) private var nativeBars
     let request: ChoiceRequest
     let pick: (String) -> Void
     let close: () -> Void
@@ -97,18 +98,20 @@ struct ChoicePickerView: View {
                     Text(request.row.label).shellType(ShellType.flowTitle(20)).lineLimit(2)
                         .accessibilityAddTraits(.isHeader).accessibilityIdentifier("choice.title")
                     if !request.row.note.isEmpty {
-                        Text(request.row.note).shellType(ShellType.note).foregroundStyle(.white.opacity(0.5)).lineLimit(2)
+                        Text(request.row.note).shellType(ShellType.note).foregroundStyle(.white.opacity(0.62)).lineLimit(2)
                     }
                 }
                 Spacer(minLength: 8)
-                Button(action: close) {
-                    Image(systemName: "xmark").font(.system(size: 14, weight: .semibold)).frame(width: 44, height: 44)
-                        .background(.white.opacity(0.08), in: Circle()).contentShape(Circle())
+                if !nativeBars {
+                    Button(action: close) {
+                        Image(systemName: "xmark").font(.system(size: 14, weight: .semibold)).frame(width: 44, height: 44)
+                            .background(.white.opacity(0.08), in: Circle()).contentShape(Circle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(ShellStrings.text("Close"))
                 .accessibilityIdentifier("choice.close")
                 .shellTarget("pick.close", radius: 22, action: close)
+                }
             }
             .padding(.horizontal, 20).padding(.top, 14).padding(.bottom, 8)
             Rectangle().fill(ShellPalette.hairline).frame(height: 1)
@@ -168,9 +171,9 @@ struct ChoiceValueRow: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(row.label).shellType(ShellType.settingLabel).fixedSize(horizontal: false, vertical: true)
                     if !row.note.isEmpty {
-                        Text(row.note).shellType(ShellType.note).foregroundStyle(.white.opacity(0.5)).fixedSize(horizontal: false, vertical: true)
+                        Text(row.note).shellType(ShellType.note).foregroundStyle(.white.opacity(0.62)).fixedSize(horizontal: false, vertical: true)
                     }
-                    if row.fromShell { FromSettingsMark() }
+                    if row.fromEnvFile { FromEnvFileMark(rowID: row.id) } else if row.fromShell { FromSettingsMark() }
                 }
                 Spacer(minLength: 8)
                 Text(valueLabel).shellText(14.5, .semibold).foregroundStyle(ShellPalette.cream)

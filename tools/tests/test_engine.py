@@ -323,6 +323,11 @@ class CheckAndBump(Fixture):
         out = self.tool('check', expect=1)
         self.assertIn('0002-index.patch', out); self.assertIn('generated', out)
 
+    def test_check_rejects_a_patch_that_carries_env_switches_tsv(self):
+        self.add_patch('0002-switches.patch', 'docs/env_switches.tsv', 'DM_X\tdebug\tdm/a.c\tx\n', 'Edit env switches', header='Upstream-Status: fork-only\nReason: r\nIssue: LNPANDY/NX2Apple#1\n')
+        out = self.tool('check', expect=1)
+        self.assertIn('0002-switches.patch', out); self.assertIn('docs/env_switches.tsv', out); self.assertIn('generated', out)
+
     def test_bump_drops_a_patch_upstream_took_and_moves_the_pin(self):
         self.tool('sync')
         up2 = self.up_commit('dm/a.c', 'line1\nline2 fork\nline3\nline4\nline5\nline6\nline7\n', 'upstream takes line 2')
@@ -409,8 +414,38 @@ class Tree(Fixture):
         self.assertEqual(eid, E.engine_id(self.r)); self.assertIn(eid, said)
         self.assertIn('line-2', (out / 'dm/fork_patches.txt').read_text())
         self.assertTrue((out / 'AGENTS.md').is_file())
+        manifest = out / '.engine-files'
+        self.assertTrue(manifest.is_file())
+        raw = manifest.read_bytes()
+        self.assertNotIn(b'\r\n', raw)
+        entries = raw.decode('utf-8').splitlines()
+        self.assertEqual(entries, sorted(entries))
+        self.assertIn('.engine-id', entries)
+        self.assertIn('.upstream-ref', entries)
+        self.assertIn('dm/a.c', entries)
+        self.assertIn('dm/fork_patches.txt', entries)
+        self.assertNotIn('.engine-files', entries)
         self.assertFalse((out / '.git').exists()); self.assertFalse((out / '.gitignore').exists())   # no history, no repository files
         self.assertFalse((out / 'tools').exists()); self.assertFalse((out / 'patches').exists())    # nothing of the fork
+
+    def test_tree_manifest_updates_after_adding_bundled_windows_tools(self):
+        self.tool('sync')
+        out, _ = self.make()
+        exe = out / 'dm/tools/nx_extract_bin/nx_extract.exe'
+        exe.parent.mkdir(parents=True, exist_ok=True)
+        exe.write_bytes(b'MZ')
+        spv = out / 'dm/gfx/tools/spirv_cross_bin/spirv-cross.exe'
+        spv.parent.mkdir(parents=True, exist_ok=True)
+        spv.write_bytes(b'MZ')
+        said = self.tool('tree-manifest', '--out', str(out))
+        self.assertIn('entries', said)
+        entries = (out / '.engine-files').read_text(encoding='utf-8').splitlines()
+        self.assertIn('dm/tools/nx_extract_bin/nx_extract.exe', entries)
+        self.assertIn('dm/gfx/tools/spirv_cross_bin/spirv-cross.exe', entries)
+        self.assertNotIn('.engine-files', entries)
+        not_tree = self.tmp / 'not-a-tree'
+        not_tree.mkdir()
+        self.tool('tree-manifest', '--out', str(not_tree), expect=2)
 
     def test_a_series_change_without_a_pin_move_changes_the_identity(self):
         self.tool('sync'); out, _ = self.make('one')
@@ -430,9 +465,20 @@ class Tree(Fixture):
         self.assertEqual(h('one.zip'), h('two.zip'))
         with zipfile.ZipFile(self.tmp / 'one.zip') as z:
             names = z.namelist()
-            self.assertEqual(names, sorted(names)); self.assertIn('.engine-id', names); self.assertIn('dm/a.c', names)
+            self.assertEqual(names, sorted(names)); self.assertIn('.engine-id', names); self.assertIn('.upstream-date', names); self.assertIn('dm/a.c', names)
             self.assertEqual({i.date_time for i in z.infolist()}, {E.ZIP_TIME})
             self.assertEqual(z.read('.engine-id').decode(), (out / '.engine-id').read_text())
+            self.assertEqual(z.read('.upstream-date').decode(), (out / '.upstream-date').read_text())
+
+    def test_the_tree_records_the_pins_utc_commit_date(self):
+        import datetime
+        self.tool('sync')
+        out, _ = self.make()
+        ts = int(git(self.eng, 'log', '-1', '--format=%ct', self.up1))
+        expected = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        text = (out / '.upstream-date').read_text(encoding='utf-8').strip()
+        self.assertRegex(text, r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$')
+        self.assertEqual(text, expected)
 
     def test_executable_bits_and_symlinks_survive(self):
         import stat, zipfile
@@ -472,8 +518,48 @@ class StampKey(Fixture):
         self.tool('sync')
         self.assertEqual(qt_engine.stamp_key(self.r), E.stamp_key(self.r))
         self.assertEqual(qt_engine.engine_root(str(self.r)), str(self.eng))
+        (self.r / 'patches/fork_env_switches.tsv').write_text('# name\tclass\twhere\tmeaning\nDM_TEST_SW\tdebug\tdm/a.c\ttest\n')
+        self.assertEqual(qt_engine.stamp_key(self.r), E.stamp_key(self.r))
+        self.assertTrue(qt_engine.is_stale(str(self.r)))
+        self.assertIn('patches/ changed', self.tool('stale', expect=1))
+        self.tool('sync')
+        self.assertFalse(qt_engine.is_stale(str(self.r)))
         self.add_patch('0002-b.patch', 'dm/b.c', 'b1\nb2 fork\n', 'Change b2', header=HEADER.replace('#1', '#2'))
         self.assertTrue(qt_engine.is_stale(str(self.r)))
+
+    def test_crlf_patch_and_switches_produce_same_stamp_key_and_engine_id(self):
+        sys.path.insert(0, str(REPO / 'frontend-qt'))
+        qt_engine = importlib.import_module('nspb_qt.engine')
+        sw = self.r / 'patches/fork_env_switches.tsv'
+        sw.write_bytes(b'name\tclass\tmeaning\nDM_TEST_SW\tdebug\ttest\n')
+
+        lf_key = E.stamp_key(self.r)
+        lf_eid = E.engine_id(self.r)
+        self.assertEqual(qt_engine.stamp_key(self.r), lf_key)
+
+        for rel in ('.upstream-ref', 'patches/series', 'patches/0001-line-2.patch', 'patches/fork_env_switches.tsv'):
+            p = self.r / rel
+            raw = p.read_bytes().replace(b'\r\n', b'\n')
+            p.write_bytes(raw.replace(b'\n', b'\r\n'))
+            self.assertIn(b'\r\n', p.read_bytes())
+
+        self.assertEqual(E.stamp_key(self.r), lf_key)
+        self.assertEqual(E.engine_id(self.r), lf_eid)
+        self.assertEqual(qt_engine.stamp_key(self.r), lf_key)
+
+        self.tool('sync')
+        self.assertFalse(qt_engine.is_stale(str(self.r)))
+        out = self.tmp / 'tree-crlf'
+        self.tool('tree', '--out', str(out))
+        self.assertEqual((out / '.engine-id').read_bytes(), (lf_eid + '\n').encode('utf-8'))
+
+    def test_build_qt_workflow_disables_autocrlf_before_checkout(self):
+        wf = (REPO / '.github' / 'workflows' / 'build-qt.yml').read_text(encoding='utf-8')
+        win_part = wf.split('runs-on: windows-latest', 1)[1]
+        cfg_pos = win_part.find('core.autocrlf false')
+        co_pos = win_part.find('actions/checkout@')
+        self.assertGreater(cfg_pos, -1, 'build-qt.yml Windows job must disable core.autocrlf')
+        self.assertGreater(co_pos, cfg_pos, 'core.autocrlf false must run before actions/checkout')
 
 
 if __name__ == '__main__':

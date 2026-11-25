@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import NXCore
 import NXModel
 
@@ -9,7 +10,7 @@ import NXModel
 /// What reaches back from one store to another is wired here as closures and narrow protocols: the repository's `didMove` starts the
 /// engine sync, the engine sync reads the repository and the interpreter, the build reads the repository, the tools, the engine and
 /// the devices, and the stores that need to know whether a build runs ask the build store. What needs AppKit (the file panels, the
-/// alert, the Finder, quitting) is wired here too.
+/// Finder, quitting) is wired here too.
 @MainActor final class LauncherStores {
     let localizer: Localizer
     let runner: ProcessRunner
@@ -21,18 +22,41 @@ import NXModel
     let deviceStore: DeviceStore
     let appUpdates: AppUpdateStore
     let build: BuildStore
+    let seedCompression: SeedCompressionStore
+    let seedAutoPromptHost = SeedAutoPromptHost()
+    /// The one build queue (#943), kept in Application Support so it survives a restart. A test suite of defaults keeps it in memory.
+    let queue: BuildQueueStore
+    /// The transfer queue (#1036): game data on its way to devices, beside any build.
+    let transfers: TransferQueueStore
+    /// Set by `BuildRecorder` so a finished queued build is recorded in `GameLibrary` before the next queued game overwrites `BuildStore`.
+    var settleFinishedBuild: () -> Void = {}
+    private var transferWatch: AnyCancellable?
+    private var queueWatch: AnyCancellable?
+    let players: PlayerProfileStore
+    let saveSettings: SaveSettingsStore
+    let sticks: StickDeadzoneStore
+    /// Per-title play sessions (#816, #1161), shared by the desktop launcher and console mode.
+    let playSessions: PlaySessionStore
+    /// Temporary session-only pinned game for the library's Recently played row.
+    let librarySelection = LibrarySelectionStore()
+    /// The defaults the stores were made with: the launcher keeps its own view settings there too (the library's filter and
+    /// sort), so a test's window never writes them into the shared defaults.
+    let defaults: UserDefaults
+    /// The games' build files (#232), measured and removed by `BuildFiles` (the Free space code).
+    let buildFiles = BuildFilesStore(measure: { BuildFiles.measure($0) }, remove: { try BuildFiles.remove($0) })
     private var quitObserver: NSObjectProtocol?
 
     /// - Parameters:
     ///   - xcrun: runs xcodebuild and devicectl: a test points it at a stand-in.
     ///   - volumesRoot: where external drives are mounted.
     ///   - defaults: where the stores keep their settings: a test passes its own suite, so it neither reads nor writes the shared ones.
-    init(localizer: Localizer = Localizer(), runner: ProcessRunner = SystemProcessRunner(), gitCheckout: GitCheckout? = nil,
+    init(localizer: Localizer = Localizer(), runner: ProcessRunner? = nil, gitCheckout: GitCheckout? = nil,
          releases: ReleaseSource = GitHubReleases(), xcrun: String = "/usr/bin/xcrun", volumesRoot: String = "/Volumes",
-         defaults: UserDefaults = .standard) {
+         defaults: UserDefaults = .standard, dependencyScan: (@Sendable (String, Bool) -> DependencyCheck.Result)? = nil) {
         _ = Self.endGroupsWhenQuitting
+        let runner = runner ?? SystemProcessRunner(defaults: defaults)
         let git = gitCheckout ?? SystemGitCheckout(runner: runner)
-        self.localizer = localizer; self.runner = runner; self.gitCheckout = git; self.releases = releases
+        self.localizer = localizer; self.runner = runner; self.gitCheckout = git; self.releases = releases; self.defaults = defaults
         let log = BuildLog()
         let laterBuild = Later<BuildStore>(), laterEngine = Later<EngineSyncStore>()
 
@@ -42,15 +66,29 @@ import NXModel
             isReleaseApp: { laterEngine.value?.usesEngineStore ?? false },
             log: { log.append($0) },
             didMove: { _ = laterEngine.value?.syncEngine() })   // the pull may have moved the pin or the patches
+        let appVersion = AppUpdateStore.appVersion
+        let writesReport = dependencyScan == nil
+        let dependencyReport: @Sendable ([Dep]) -> Void = { deps in
+            if writesReport { DependencyCheck.writeReport(deps, appVersion: appVersion) }
+        }
         let dependencies = DependencyStore(
             localizer: localizer, runner: runner, repo: repo, defaults: defaults,
             needsIOS: { Self.needsIOSPlatform(defaults: defaults) },
+            upstreamContext: { (laterBuild.value?.buildUpstream ?? .nxnative, laterBuild.value?.s2armPath ?? "") },
+            // a stand-in detection (the state gallery) starts no xcrun and writes no report
+            scan: dependencyScan,
+            report: dependencyReport,
             openAppStore: { NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/App Store.app")) },
             log: { log.append($0) },
             installFailed: { laterBuild.value?.note($0) })
         let engineSync = EngineSyncStore(
             localizer: localizer, runner: runner, repo: repo, python: dependencies, defaults: defaults,
-            setRepoPath: { repo.path = $0 },
+            setRepoPath: {
+                repo.path = $0
+                laterBuild.value?.refreshUpstreamLocalVersion(for: .nxnative)
+                laterBuild.value?.refreshSeenShadersInfo()
+                laterBuild.value?.refreshQueueSeenShadersEligibility()
+            },
             buildRunning: { laterBuild.value?.running ?? false },
             autoUpdate: { repo.autoUpdate },
             log: { log.append($0) })
@@ -71,8 +109,116 @@ import NXModel
                 if defaults.string(forKey: OnboardingDefaults.platform) == "mac" { _ = dependencies.check() }
             })
         laterBuild.value = build
+        build.upstreamChanged = { _ = dependencies.check() }
+        build.nxkitAutoUpdate = { repo.autoUpdate }   // nxkit's own update follows "Update automatically when the app opens" (#1460)
+        if defaults === UserDefaults.standard {
+            build.adoptInstalledUpstreams()
+        }
         self.repo = repo; self.engineSync = engineSync; self.dependencies = dependencies; self.deviceStore = devices
         self.appUpdates = updates; self.build = build
+        let queueFile = defaults === UserDefaults.standard
+            ? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("NX2Apple/build-queue.json") : nil
+        let queue = BuildQueueStore(
+            file: queueFile, engineID: { engineSync.selection.engineID }, busy: { build.running },
+            start: { build.startQueued($0) }, packageBatch: { _ in build.packageDeferred(); return build.running }, engineChangedReason: { localizer.t("queue.engineChanged") },
+            packageFailureReason: { localizer.t("queue.cannotPackage") })
+        self.queue = queue
+        build.queue = queue
+        let transferFile = queueFile?.deletingLastPathComponent().appendingPathComponent("transfer-queue.json")
+        let transfers = TransferQueueStore(
+            file: transferFile,
+            perform: { entry, report, finish in build.performTransfer(entry, report: report, finish: finish) },
+            cancelRunning: { build.cancelTransfer($0) })
+        self.transfers = transfers
+        build.transfers = transfers
+        self.seedCompression = SeedCompressionStore(
+            runner: runner,
+            repo: repo,
+            python: dependencies,
+            defaults: defaults,
+            seedRoot: { build.seedCacheRoot },
+            seedEnvironment: { build.seedEnvironment },
+            dotnetPath: { dependencies.dotnetPath },
+            buildRunning: { build.running },
+            canAutoPrompt: { [seedAutoPromptHost] in
+                !build.running && !queue.active && !transfers.entries.contains(where: \.active)
+                    && devices.shellCopy == nil && !devices.shellWaiting
+                    && !updates.showUpdateSheet && updates.uninstallPlan == nil
+                    && seedAutoPromptHost.isReady()
+            }
+        )
+        // A device that comes back continues the transfers that waited for it. The list is read again every few seconds while one waits.
+        transferWatch = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
+            .sink { [weak transfers, weak devices] _ in
+                MainActor.assumeIsolated {
+                    guard let transfers, let devices, transfers.hasWaiting else { return }
+                    transfers.deviceConnected(Set(devices.devices.filter(\.reachable).map(\.id)))
+                    devices.refresh()
+                }
+            }
+        self.saveSettings = SaveSettingsStore(defaults: defaults)
+        build.saveLocationSettings = { [weak saveSettings] tid in
+            (saveSettings?.global ?? SaveGlobalSettings(), saveSettings?.game(tid) ?? SaveGameOverride())
+        }
+        self.sticks = StickDeadzoneStore(defaults: defaults)
+        self.players = PlayerProfileStore(defaults: defaults, defaultName: { localizer.t("players.default") })
+        self.playSessions = PlaySessionStore(file: defaults === UserDefaults.standard ? PlaySessionStore.defaultFile : nil)
+        // A build that ended settles the queue's running entry and starts the next. The hop lets the install step that follows a
+        // build raise `running` again first (the BuildRecorder waits the same way).
+        queueWatch = build.$running.removeDuplicates().sink { [weak self, weak build, weak queue] running in
+            guard !running else { return }
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let build, let queue, !build.running else { return }
+                    if !queue.packaging.isEmpty {
+                        let batchID = queue.packaging.first?.batch
+                        let outcome = build.queueOutcome
+                        queue.packageEnded(succeeded: outcome.succeeded, reason: outcome.reason, stopped: outcome.stopped)
+                        if queue.running == nil && !queue.hasWaiting && queue.packaging.isEmpty {
+                            build.deferShellPackaging = false
+                            build.queuedExportIPA = nil
+                            build.queuedExportOneGame = nil
+                            build.queuedExportFramework = nil
+                            build.activeQueuedEntryID = nil
+                            build.activeQueuedArchivePath = nil
+                            build.activeQueuedRebuildsShaders = false
+                            build.enforceUpstreamForCurrentGame()
+                            if let batchID { build.publishBatchQueueRefreshCompletionIfNeeded(batchID: batchID) }
+                        }
+                        return
+                    }
+                    guard queue.running != nil else {
+                        if queue.isAdvancing {
+                            if build.queueOutcome.stopped {
+                                queue.pauseForStoppedExternalOperation()
+                            } else {
+                                if queue.hasWaiting { self?.settleFinishedBuild() }
+                                queue.processNext()
+                            }
+                        }
+                        return
+                    }
+                    let batchID = queue.running?.batch
+                    self?.settleFinishedBuild()
+                    let outcome = build.queueOutcome
+                    build.activeQueuedGameID = nil
+                    build.activeQueuedEntryID = nil
+                    build.activeQueuedArchivePath = nil
+                    build.activeQueuedRebuildsShaders = false
+                    build.activeQueueEntryUpstream = nil
+                    build.queuedIOSSeenShaders = nil
+                    queue.buildEnded(succeeded: outcome.succeeded, reason: outcome.reason, stopped: outcome.stopped)
+                    if queue.running == nil && !queue.hasWaiting && queue.packaging.isEmpty {
+                        build.deferShellPackaging = false
+                        build.queuedExportIPA = nil
+                        build.queuedExportOneGame = nil
+                        build.queuedExportFramework = nil
+                        build.enforceUpstreamForCurrentGame()
+                        if let batchID { build.publishBatchQueueRefreshCompletionIfNeeded(batchID: batchID) }
+                    }
+                }
+            }
+        }
 
         // The staged update goes in as the app quits, so the next launch is the new version without interrupting anyone.
         quitObserver = NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: nil) { [weak updates] _ in
@@ -86,7 +232,7 @@ import NXModel
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: nil) { _ in ProcessGroups.endAll() }
     }()
 
-    /// What the build store asks of AppKit: the open panel, the folder panel, the save panel, the alert and the Finder.
+    /// What the build store asks of AppKit: the open panel, the folder panel, the save panel and the Finder.
     private func wirePanels() {
         build.choosePaths = { pick in
             let p = NSOpenPanel()
@@ -113,17 +259,52 @@ import NXModel
             guard p.runModal() == .OK else { return nil }
             return p.url
         }
-        build.showNotice = { title, text in
-            let a = NSAlert()
-            a.messageText = title
-            a.informativeText = text
-            a.alertStyle = .informational
-            a.addButton(withTitle: "OK")
-            a.runModal()
-        }
         build.revealFolder = { NSWorkspace.shared.open($0) }
         build.revealItem = { NSWorkspace.shared.activateFileViewerSelecting([$0]) }
         build.openApp = { NSWorkspace.shared.openApplication(at: $0, configuration: NSWorkspace.OpenConfiguration()) }
+        build.preflightApp = { app, done in Self.preflight(app, done: done) }
+        build.runPreflight = { app, timeout in await Self.preflight(app, timeout: timeout) }
+        build.preflightKeyProblem = { [localizer] keys, files in
+            guard !keys.isEmpty, files.first.map({ !$0.isEmpty }) == true else { return nil }
+            let detailed = KeyCheck.runDetailed(KeyCheck.Inputs(keys: keys, files: files))
+            guard KeyCheck.blocksBuild(detailed) else { return nil }
+            return KeyCheck.detailedMessage(detailed, localizer.t)
+        }
+    }
+
+    /// The build's check of a new Mac app's first start (#1005, `MacPreflight`): opened through LaunchServices, as Play
+    /// opens it, since only that open has macOS check the bundle; hidden, in the background, a new instance even if an
+    /// older build of the game runs, kept out of the recent items. Its launcher sees DM_PREFLIGHT and quits at once, once
+    /// macOS lets it start. Cancellation or timeout immediately invalidates the poll timer and terminates the hidden process.
+    static func preflight(_ app: URL, done: @escaping @MainActor (Error?) -> Void) {
+        Task { @MainActor in done(await preflight(app)) }
+    }
+
+    static func preflight(_ app: URL, timeout: TimeInterval = MacPreflight.timeout, pollInterval: TimeInterval = 0.5,
+                          open: (@MainActor (URL, @escaping @MainActor (RunningPreflightApp?, Error?) -> Void) -> Void)? = nil) async -> Error? {
+        let opener = open ?? LauncherStores.openPreflightApp
+        let session = PreflightSession()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                session.start(app: app, timeout: timeout, pollInterval: pollInterval, continuation: continuation, open: opener)
+            }
+        } onCancel: {
+            Task { @MainActor in session.cancel() }
+        }
+    }
+
+    private static func openPreflightApp(_ app: URL, completion: @escaping @MainActor (RunningPreflightApp?, Error?) -> Void) {
+        let c = NSWorkspace.OpenConfiguration()
+        c.activates = false
+        c.hides = true
+        c.addsToRecentItems = false
+        c.createsNewApplicationInstance = true
+        c.environment = [MacPreflight.environmentKey: "1"]
+        NSWorkspace.shared.openApplication(at: app, configuration: c) { running, error in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { completion(running, error) }
+            }
+        }
     }
 
     /// The panel of the Build tab's Save to folder. It can make a folder, because the folder for the IPA often does not exist yet.
@@ -145,4 +326,99 @@ import NXModel
 /// A store that a closure reaches before it exists: the closures of the stores created first read it, the app fills it in last.
 @MainActor private final class Later<T: AnyObject> {
     weak var value: T?
+}
+
+@MainActor final class SeedAutoPromptHost {
+    var isReady: () -> Bool = { false }
+}
+
+protocol RunningPreflightApp: AnyObject {
+    var isTerminated: Bool { get }
+    @discardableResult func terminate() -> Bool
+    @discardableResult func forceTerminate() -> Bool
+}
+
+extension NSRunningApplication: RunningPreflightApp {}
+
+/// Tracks one hidden `DM_PREFLIGHT` launch so cancellation or timeout stops the 0.5 s timer and terminates any orphan process.
+@MainActor private final class PreflightSession {
+    private var continuation: CheckedContinuation<Error?, Never>?
+    private var running: RunningPreflightApp?
+    private var timer: Timer?
+    private var timeoutTask: Task<Void, Never>?
+    private var finished = false
+
+    func start(app: URL, timeout: TimeInterval, pollInterval: TimeInterval,
+               continuation: CheckedContinuation<Error?, Never>,
+               open: @MainActor (URL, @escaping @MainActor (RunningPreflightApp?, Error?) -> Void) -> Void) {
+        if finished {
+            continuation.resume(returning: MacPreflight.Failure.stopped)
+            return
+        }
+        self.continuation = continuation
+        guard timeout > 0 else {
+            finish(MacPreflight.Failure.timedOut, terminateApp: true)
+            return
+        }
+        timeoutTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000)) } catch { return }
+            self?.finish(MacPreflight.Failure.timedOut, terminateApp: true)
+        }
+        let deadline = Date().addingTimeInterval(timeout)
+        open(app) { [weak self] launched, error in
+            guard let self, !self.finished else {
+                Self.terminateIfNeeded(launched)
+                return
+            }
+            guard let launched else {
+                self.finish(error, terminateApp: false)
+                return
+            }
+            self.running = launched
+            if launched.isTerminated {
+                self.finish(nil, terminateApp: false)
+                return
+            }
+            if Date() > deadline {
+                self.finish(MacPreflight.Failure.timedOut, terminateApp: true)
+                return
+            }
+            self.timer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] t in
+                MainActor.assumeIsolated {
+                    guard let self, !self.finished, let current = self.running else { t.invalidate(); return }
+                    if current.isTerminated {
+                        self.finish(nil, terminateApp: false)
+                    } else if Date() > deadline {
+                        self.finish(MacPreflight.Failure.timedOut, terminateApp: true)
+                    }
+                }
+            }
+        }
+    }
+
+    func cancel() {
+        finish(MacPreflight.Failure.stopped, terminateApp: true)
+    }
+
+    private func finish(_ error: Error?, terminateApp: Bool) {
+        guard !finished else { return }
+        finished = true
+        timer?.invalidate()
+        timer = nil
+        timeoutTask?.cancel()
+        timeoutTask = nil
+        let app = running
+        running = nil
+        if terminateApp { Self.terminateIfNeeded(app) }
+        let c = continuation
+        continuation = nil
+        c?.resume(returning: error)
+    }
+
+    private static func terminateIfNeeded(_ app: RunningPreflightApp?) {
+        guard let app, !app.isTerminated else { return }
+        if !app.terminate() || !app.isTerminated {
+            _ = app.forceTerminate()
+        }
+    }
 }

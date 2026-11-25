@@ -256,4 +256,63 @@ import Testing
         #expect(!FileManager.default.fileExists(atPath: rig.gdir.path + "/cheats"))
         try plan.createFolders()
     }
+
+    @Test func audioMixPrecedenceIsGameThenShellThenBuiltIn() throws {
+        // Built-in default is off (DM_AUDIO_MIX unset) when neither game nor shell sets it.
+        let builtIn = try Rig()
+        #expect(builtIn.plan().environment["DM_AUDIO_MIX"] == nil)
+
+        // Shell default turns DM_AUDIO_MIX on when the game leaves it unset, and beats shared env.txt.
+        var shellOnly = try Rig()
+        shellOnly.game.shellEnvironment = ["DM_AUDIO_MIX": "1"]
+        #expect(shellOnly.plan().environment["DM_AUDIO_MIX"] == "1")
+        #expect(shellOnly.plan(envFile: "DM_AUDIO_MIX=0\n").environment["DM_AUDIO_MIX"] == "1")
+
+        // Game env.txt "0" overrides shell "1" via both shellEnvironment and shellFallbackKeys.
+        try shellOnly.box.write("DM_AUDIO_MIX=0\n", to: shellOnly.gdir.appendingPathComponent("env.txt"))
+        #expect(shellOnly.plan().environment["DM_AUDIO_MIX"] == "0")
+
+        var fallbackGame = try Rig(environment: ["DM_AUDIO_MIX": "1"])
+        fallbackGame.game.shellFallbackKeys = ["DM_AUDIO_MIX"]
+        try fallbackGame.box.write("DM_AUDIO_MIX=0\n", to: fallbackGame.gdir.appendingPathComponent("env.txt"))
+        #expect(fallbackGame.plan().environment["DM_AUDIO_MIX"] == "0")
+
+        // Game env.txt "1" overrides shell off.
+        let gameOn = try Rig()
+        try gameOn.box.write("DM_AUDIO_MIX=1\n", to: gameOn.gdir.appendingPathComponent("env.txt"))
+        #expect(gameOn.plan().environment["DM_AUDIO_MIX"] == "1")
+
+        // Explicit per-game choice in game.environment wins over game env.txt and shell default.
+        var explicitGame = try Rig(environment: ["DM_AUDIO_MIX": "0"])
+        explicitGame.game.shellEnvironment = ["DM_AUDIO_MIX": "1"]
+        try explicitGame.box.write("DM_AUDIO_MIX=1\n", to: explicitGame.gdir.appendingPathComponent("env.txt"))
+        #expect(explicitGame.plan().environment["DM_AUDIO_MIX"] == "0")
+    }
+
+    @Test func defaultGameEnvTemplateIsCommentedAndCreateFoldersIsNonDestructive() throws {
+        let template = EngineLaunchPlan.defaultGameEnvTemplate(title: "Orbit\nFixture", titleID: Fixtures.orbit)
+        #expect(EngineLaunchPlan.parseEnvFile(template).isEmpty)
+        for key in [
+            "DM_LANG", "DM_SHOW_FPS", "DM_METAL_HUD", "DM_FPS_TARGET", "DM_OPMODE",
+            "DM_PICTURE_FIT", "DM_PRESENT_UPSCALE", "DM_RENDER_SCALE", "DM_AUDIO_MIX", "DM_RUMBLE"
+        ] {
+            #expect(template.contains("# \(key)="), "Expected commented template line for \(key)")
+        }
+        for invalidKey in ["DM_RES_SCALE", "DM_UPSCALE", "DM_DOCKED", "DM_MOTION"] {
+            #expect(!template.contains(invalidKey), "Unexpected non-existent engine key \(invalidKey)")
+        }
+
+        let rig = try Rig()
+        let envURL = rig.gdir.appendingPathComponent("env.txt")
+        let plan = rig.plan()
+        try plan.createFolders()
+        let seeded = try String(contentsOf: envURL, encoding: .utf8)
+        #expect(EngineLaunchPlan.parseEnvFile(seeded).isEmpty)
+        #expect(seeded.contains(Fixtures.orbit))
+
+        let custom = "DM_SHOW_FPS=1\n"
+        try custom.write(to: envURL, atomically: true, encoding: .utf8)
+        try plan.createFolders()
+        #expect(try String(contentsOf: envURL, encoding: .utf8) == custom)
+    }
 }

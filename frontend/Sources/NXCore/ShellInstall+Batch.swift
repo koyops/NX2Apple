@@ -1,0 +1,390 @@
+import Foundation
+
+// Installing built frameworks without rebuilding any game, and installing a queued batch of built frameworks once at the end.
+
+extension ShellInstaller {
+    /// One game of a queued shared-app install batch.
+    package struct BatchGame: Equatable {
+        package var framework: String
+        package var titleID: String
+        package var name: String
+        package var archive: String
+        package var pickedArtwork: String?
+        package var queueEntryID: UUID?
+        package var didUpdateImg: Bool
+        package var updatedImgPath: String
+
+        package init(
+            framework: String,
+            titleID: String,
+            name: String,
+            archive: String,
+            pickedArtwork: String? = nil,
+            queueEntryID: UUID? = nil,
+            didUpdateImg: Bool = false,
+            updatedImgPath: String = ""
+        ) {
+            self.framework = framework
+            self.titleID = titleID
+            self.name = name
+            self.archive = archive
+            self.pickedArtwork = pickedArtwork
+            self.queueEntryID = queueEntryID
+            self.didUpdateImg = didUpdateImg
+            self.updatedImgPath = updatedImgPath
+        }
+    }
+
+    /// Per-game `.img` update and device transfer result returned by `installBatch` / `installBatchData`.
+    package struct BatchGameResult: Equatable, Sendable {
+        package var titleID: String
+        package var queueEntryID: UUID?
+        package var imgStatus: QueueEntryImgStatus
+
+        package init(titleID: String, queueEntryID: UUID? = nil, imgStatus: QueueEntryImgStatus) {
+            self.titleID = titleID
+            self.queueEntryID = queueEntryID
+            self.imgStatus = imgStatus
+        }
+    }
+
+    /// Signs and installs the shared app from the frameworks already built in `shell.json`, without rebuilding any game or
+    /// transferring archive game data.
+    package func installBuilt(framework: String, titleID: String, name: String) -> Outcome {
+        func withNotes(_ result: (outcome: Outcome, notes: [String])) -> Outcome {
+            var outcome = result.outcome
+            if !result.notes.isEmpty {
+                outcome.message = ([outcome.message] + result.notes).joined(separator: "\n")
+            }
+            return outcome
+        }
+        let fm = FileManager.default
+        if fm.fileExists(atPath: framework) {
+            let existing = ShellLibrary.load(root: root).games
+            var hotGames: [HotGame] = existing.compactMap { game in
+                guard game.titleID.caseInsensitiveCompare(titleID) != .orderedSame else { return nil }
+                let resolved = fm.fileExists(atPath: game.framework) ? game.framework
+                    : ShellInstall.mirroredFramework(root: root, titleID: game.titleID)
+                guard fm.fileExists(atPath: resolved) else { return nil }
+                return HotGame(framework: resolved, titleID: game.titleID, name: game.name, pickedArtwork: nil)
+            }
+            hotGames.append(HotGame(framework: framework, titleID: titleID, name: name, pickedArtwork: pickedArtwork))
+            switch attemptHotInstall(games: hotGames) {
+            case .completed(let outcome, let notes):
+                return outcome.ok ? withNotes((outcome, notes)) : outcome
+            case .fallback(let shellOutdated):
+                let signed = signAndInstallApp(framework: framework, titleID: titleID, name: name,
+                                               allowHotRetry: false, priorShellOutdated: shellOutdated)
+                guard signed.outcome.ok else { return signed.outcome }
+                return withNotes(signed)
+            }
+        }
+        let signed = signAndInstallApp(framework: framework, titleID: titleID, name: name)
+        guard signed.outcome.ok else { return signed.outcome }
+        return withNotes(signed)
+    }
+
+    /// Signs and installs the shared app once for all games built in a queue batch, then copies the missing game data of each game.
+    package func installBatch(_ games: [BatchGame]) -> Outcome {
+        guard let last = games.last else {
+            return Outcome(ok: false, message: fmt("shell.projectFailed", "empty batch"))
+        }
+        if games.count == 1 {
+            var single = self
+            single.pickedArtwork = last.pickedArtwork
+            var result = single.install(framework: last.framework, titleID: last.titleID, name: last.name, archive: last.archive)
+            result.batchGameResults = buildBatchResults(
+                games: games,
+                completedIndices: (result.ok && !result.copySkipped && !last.archive.isEmpty) ? [0] : [],
+                failureReason: result.ok ? nil : result.message
+            )
+            return result
+        }
+        let fm = FileManager.default
+        for game in games where !fm.fileExists(atPath: game.framework) {
+            var outcome = missingFramework(game.framework, name: game.name)
+            outcome.batchGameResults = buildBatchResults(games: games, completedIndices: [], failureReason: outcome.message)
+            return outcome
+        }
+        let shellOutdated: Bool
+        switch attemptHotInstall(games: games.map {
+            HotGame(framework: $0.framework, titleID: $0.titleID, name: $0.name, pickedArtwork: $0.pickedArtwork)
+        }) {
+        case .completed(let outcome, let notes):
+            guard outcome.ok else {
+                var failed = outcome
+                failed.batchGameResults = buildBatchResults(games: games, completedIndices: [], failureReason: outcome.message)
+                return failed
+            }
+            var result = copyBatchGameData(games, app: outcome.appPath, bundleID: outcome.bundleID, start: outcome)
+            if result.ok, !notes.isEmpty {
+                result.message = ([result.message] + notes).joined(separator: "\n")
+            }
+            return result
+        case .fallback(let outdated):
+            shellOutdated = outdated
+        }
+        if let refused = pairingRefusal() {
+            var outcome = refused
+            outcome.batchGameResults = buildBatchResults(games: games, completedIndices: [], failureReason: outcome.message)
+            return outcome
+        }
+
+        let stateFile = ShellLibrary.stateFile(root: root)
+        let before = fm.contents(atPath: stateFile)
+        var library = ShellLibrary.load(root: root)
+        for game in games.dropLast() {
+            library.add(.init(titleID: game.titleID, name: game.name, framework: game.framework))
+            if let picked = game.pickedArtwork {
+                _ = ShellInstall.placeBanner(titleID: game.titleID, framework: game.framework, banners: banners, picked: picked, ensureCached: ensureBanner)
+            }
+        }
+        do {
+            try library.save(root: root)
+        } catch {
+            let msg = fmt("shell.projectFailed", error.localizedDescription)
+            var outcome = Outcome(ok: false, message: msg)
+            outcome.batchGameResults = buildBatchResults(games: games, completedIndices: [], failureReason: msg)
+            return outcome
+        }
+
+        var batchInstaller = self
+        batchInstaller.pickedArtwork = last.pickedArtwork
+        let signed = batchInstaller.signAndInstallApp(framework: last.framework, titleID: last.titleID, name: last.name,
+                                                      allowHotRetry: false, priorShellOutdated: shellOutdated)
+        guard signed.outcome.ok else {
+            if let before { try? before.write(to: URL(fileURLWithPath: stateFile), options: .atomic) }
+            else if fm.fileExists(atPath: stateFile) { try? fm.removeItem(atPath: stateFile) }
+            var outcome = signed.outcome
+            outcome.batchGameResults = buildBatchResults(games: games, completedIndices: [], failureReason: outcome.message)
+            return outcome
+        }
+        // Re-apply picked artwork for earlier games in the batch on the mirrored frameworks inside the built app if needed
+        let mirrored = ShellLibrary.load(root: root)
+        for game in games.dropLast() {
+            if let picked = game.pickedArtwork,
+               let entry = mirrored.games.first(where: { $0.titleID.caseInsensitiveCompare(game.titleID) == .orderedSame }) {
+                _ = ShellInstall.placeBanner(titleID: entry.titleID, framework: entry.framework, banners: banners, picked: picked, ensureCached: ensureBanner)
+            }
+        }
+
+        var result = copyBatchGameData(games, app: signed.outcome.appPath, bundleID: signed.outcome.bundleID, start: signed.outcome)
+        if result.ok, !signed.notes.isEmpty {
+            result.message = ([result.message] + signed.notes).joined(separator: "\n")
+        }
+        return result
+    }
+
+    /// Retries only the game-data transfer step for a batch install whose app bundle is already on the device.
+    package func installBatchData(_ games: [BatchGame]) -> Outcome {
+        if let refused = pairingRefusal() {
+            var outcome = refused
+            outcome.batchGameResults = buildBatchResults(games: games, completedIndices: [], failureReason: outcome.message)
+            return outcome
+        }
+        let bundleID = ShellLibrary.load(root: root).bundleID
+        let app = ShellInstall.appPath(root: root)
+        let start = Outcome(ok: true, message: fmt("dev.installed", deviceName), appPath: app, bundleID: bundleID)
+        return copyBatchGameData(games, app: app, bundleID: bundleID, start: start)
+    }
+
+    private struct PendingGameCopy {
+        var gameIndex: Int
+        var game: BatchGame
+        var diff: PreparedDeviceDiff
+        var missing: [ShellDataParts.Item]
+        var needed: Int64
+    }
+
+    private func buildBatchResults(games: [BatchGame], completedIndices: Set<Int>, failureReason: String?) -> [BatchGameResult] {
+        games.enumerated().map { idx, game in
+            guard game.didUpdateImg else {
+                return BatchGameResult(titleID: game.titleID, queueEntryID: game.queueEntryID, imgStatus: .unchanged)
+            }
+            if completedIndices.contains(idx) {
+                let rawName = game.updatedImgPath.isEmpty ? "romfs.img" : (game.updatedImgPath as NSString).lastPathComponent
+                let name = rawName == "msl" ? "msl" : rawName
+                return BatchGameResult(
+                    titleID: game.titleID,
+                    queueEntryID: game.queueEntryID,
+                    imgStatus: .transferred(imgName: name, deviceName: deviceName)
+                )
+            }
+            return BatchGameResult(
+                titleID: game.titleID,
+                queueEntryID: game.queueEntryID,
+                imgStatus: .manualReplace(imgPath: game.updatedImgPath, reason: failureReason)
+            )
+        }
+    }
+
+    private func copyBatchGameData(_ games: [BatchGame], app: String, bundleID: String, start: Outcome) -> Outcome {
+        var outcome = start
+        let checkName = fmt("shell.checkStage", deviceName)
+        begin(Self.checkStageID, checkName)
+        var pending: [PendingGameCopy] = []
+        var alreadyCurrentIndices = Set<Int>()
+        var totalNeeded: Int64 = 0
+        var totalFiles = 0
+        var anyVersionChanged = false
+        var allCurrent = true
+
+        for (idx, game) in games.enumerated() {
+            guard !game.archive.isEmpty else {
+                if game.didUpdateImg { allCurrent = false }
+                continue
+            }
+            let listing = NSTemporaryDirectory() + "nspb-shell-files-\(UUID().uuidString.prefix(8)).json"
+            defer { try? FileManager.default.removeItem(atPath: listing) }
+            _ = run(ShellInstall.listCommand(xcrun: xcrun, device: device, bundleID: bundleID, titleID: game.titleID, json: listing),
+                    env: nil, label: checkName, step: { _ in nil })
+            let onDevice = ShellInstall.parseListing(FileManager.default.contents(atPath: listing))
+            let diff = prepareDeviceDiff(titleID: game.titleID, archive: game.archive, bundleID: bundleID, onDevice: onDevice)
+            if diff.identity != diff.previous || diff.identity == nil {
+                allCurrent = false
+            }
+            let missing = ShellDataParts.toCopy(local: diff.local, device: diff.comparable, splitAbove: partSize, partSize: partSize)
+            guard !missing.isEmpty else {
+                alreadyCurrentIndices.insert(idx)
+                continue
+            }
+            let needed = missing.reduce(Int64(0)) { sum, item in
+                let b = ShellDataParts.bytes(of: item, local: diff.local, partSize: partSize)
+                return Int64.max - sum < b ? Int64.max : sum + b
+            }
+            totalNeeded = Int64.max - totalNeeded < needed ? Int64.max : totalNeeded + needed
+            totalFiles += Set(missing.map(\.file)).count
+            if let identity = diff.identity, let previous = diff.previous, identity != previous { anyVersionChanged = true }
+            pending.append(PendingGameCopy(gameIndex: idx, game: game, diff: diff, missing: missing, needed: needed))
+        }
+        end(Self.checkStageID, checkName, ok: true)
+
+        guard !pending.isEmpty else {
+            outcome.message = fmt(allCurrent ? "shell.dataCurrent" : "shell.dataAlready", deviceName)
+            outcome.batchGameResults = buildBatchResults(games: games, completedIndices: alreadyCurrentIndices, failureReason: nil)
+            return outcome
+        }
+
+        let logCopy = NSTemporaryDirectory() + "nspb-shell-log-\(UUID().uuidString.prefix(8)).txt"
+        defer { try? FileManager.default.removeItem(atPath: logCopy) }
+        _ = run(ShellInstall.shellLogCommand(xcrun: xcrun, device: device, bundleID: bundleID, destination: logCopy),
+                env: nil, label: checkName, step: { _ in nil })
+        if let free = ShellInstall.freeSpace(inShellLog: try? String(contentsOfFile: logCopy, encoding: .utf8)) {
+            log("device free space: \(free) bytes, the batch game data to copy: \(totalNeeded) bytes\n")
+            if free - ShellInstall.freeSpaceMargin < totalNeeded {
+                let noSpaceMsg = fmt("shell.noSpace", deviceName, Double(totalNeeded) / 1e9, Double(free) / 1e9)
+                var failed = Outcome(ok: false, message: noSpaceMsg, appPath: app, bundleID: bundleID)
+                failed.batchGameResults = buildBatchResults(games: games, completedIndices: alreadyCurrentIndices, failureReason: noSpaceMsg)
+                return failed
+            }
+        }
+
+        let link = connection()
+        let profile = linkProfile(for: link)
+        var plan = copyPlan(files: totalFiles, bytes: totalNeeded, connection: link, linkProfile: profile)
+        if anyVersionChanged {
+            let note = t("shell.dataChanged")
+            plan.versionNote = note
+            log(note + "\n")
+        }
+        log(plan.sizeText + "\n" + plan.connectionText + "\n")
+        let parts = pending.reduce(0) { $0 + $1.missing.filter { if case .part = $0 { return true } else { return false } }.count }
+        if parts > 0 { log(fmt("shell.dataParts", parts) + "\n") }
+        var decision = decideCopy(plan)
+        if decision == .waitForCable {
+            decision = waitForCable(initialProfile: profile)
+        }
+        guard decision == .copy else {
+            outcome.copySkipped = true
+            let skippedMsg = fmt("dev.copySkipped", deviceName)
+            outcome.message = skippedMsg
+            outcome.batchGameResults = buildBatchResults(games: games, completedIndices: alreadyCurrentIndices, failureReason: skippedMsg)
+            return outcome
+        }
+
+        let copyName = fmt("dev.copyStage", deviceName)
+        begin(Self.copyStageID, copyName)
+        let totalItems = pending.reduce(0) { $0 + $1.missing.count }
+        var copiedItems = 0
+        var copiedBytes: Int64 = 0
+        var completedIndices = alreadyCurrentIndices
+
+        for entry in pending {
+            for item in entry.missing {
+                if waitCancelled() {
+                    end(Self.copyStageID, copyName, ok: false, detail: "")
+                    outcome.copySkipped = true
+                    let skippedMsg = fmt("dev.copySkipped", deviceName)
+                    outcome.message = skippedMsg
+                    outcome.batchGameResults = buildBatchResults(games: games, completedIndices: completedIndices, failureReason: skippedMsg)
+                    return outcome
+                }
+                copyProgress(copiedBytes, totalNeeded)
+                let itemDetail = "\(copiedItems + 1)/\(totalItems)"
+                stage(ShellStage(id: Self.copyStageID, name: copyName, state: .running, detail: itemDetail,
+                                 percent: copiedBytes > 0 && totalNeeded > 0 ? Double(copiedBytes) / Double(totalNeeded) * 100 : nil))
+                if let primaryImage = entry.diff.primaryImage, item.file == primaryImage, entry.diff.previous != nil {
+                    defaults.removeObject(forKey: entry.diff.receipt)
+                }
+                var source = entry.diff.origins[item.file] ?? (entry.game.archive + "/" + item.file), destination = item.file, staged: String?
+                if case .part(let file, let index, let count) = item {
+                    if file == entry.diff.primaryImage, let identity = entry.diff.identity {
+                        defaults.set(identity, forKey: entry.diff.partsReceipt)
+                    }
+                    let path = NSTemporaryDirectory() + "nspb-part-\(UUID().uuidString.prefix(8))"
+                    do {
+                        try ShellDataParts.writePart(source: source, index: index, size: entry.diff.local[file] ?? 0, partSize: partSize, to: path)
+                    } catch {
+                        try? FileManager.default.removeItem(atPath: path)
+                        let why = error.localizedDescription
+                        end(Self.copyStageID, copyName, ok: false, detail: why)
+                        let incompleteMsg = fmt("shell.copyIncomplete", deviceName, why)
+                        var incomplete = Outcome(ok: false, message: incompleteMsg, appPath: app,
+                                                 bundleID: bundleID, copied: copiedItems, failure: .shellDataIncomplete)
+                        incomplete.detail = why
+                        incomplete.batchGameResults = buildBatchResults(games: games, completedIndices: completedIndices, failureReason: incompleteMsg)
+                        return incomplete
+                    }
+                    staged = path; source = path; destination = ShellDataParts.name(of: file, index: index, count: count)
+                }
+                let finishedBytes = copiedBytes
+                let itemBytes = ShellDataParts.bytes(of: item, local: entry.diff.local, partSize: partSize)
+                let r = run(ShellInstall.copyCommand(xcrun: xcrun, device: device, bundleID: bundleID, titleID: entry.game.titleID,
+                                                     source: source, relativePath: destination),
+                            env: nil, label: copyName, stageID: Self.copyStageID) { line in
+                    guard let parsed = BuildProgress.installStep(line), let raw = parsed.percent else { return nil }
+                    let clamped = min(max(raw, 0), 100)
+                    guard totalNeeded > 0 else { return (itemDetail, clamped > 0 ? clamped : nil) }
+                    let doneBytes = Double(finishedBytes) + Double(itemBytes) * clamped / 100.0
+                    copyProgress(min(Int64(doneBytes.rounded()), totalNeeded), totalNeeded)
+                    let weighted = min(doneBytes / Double(totalNeeded) * 100.0, 100.0)
+                    return (itemDetail, weighted > 0 ? weighted : nil)
+                }
+                if let staged { try? FileManager.default.removeItem(atPath: staged) }
+                if r.status != 0 {
+                    let why = r.lastError ?? fmt("msg.exitCode", r.status)
+                    end(Self.copyStageID, copyName, ok: false, detail: why)
+                    let incompleteMsg = fmt("shell.copyIncomplete", deviceName, why)
+                    var incomplete = Outcome(ok: false, message: incompleteMsg, appPath: app,
+                                             bundleID: bundleID, copied: copiedItems, failure: .shellDataIncomplete)
+                    incomplete.detail = why
+                    incomplete.batchGameResults = buildBatchResults(games: games, completedIndices: completedIndices, failureReason: incompleteMsg)
+                    return incomplete
+                }
+                copiedItems += 1
+                outcome.copied = copiedItems
+                copiedBytes += itemBytes
+            }
+            if let primaryImage = entry.diff.primaryImage, let identity = entry.diff.identity,
+               entry.missing.contains(where: { $0.file == primaryImage }) {
+                defaults.set(identity, forKey: entry.diff.receipt)
+                defaults.removeObject(forKey: entry.diff.partsReceipt)
+            }
+            completedIndices.insert(entry.gameIndex)
+        }
+        copyProgress(totalNeeded, totalNeeded)
+        end(Self.copyStageID, copyName, ok: true)
+        outcome.batchGameResults = buildBatchResults(games: games, completedIndices: completedIndices, failureReason: nil)
+        return outcome
+    }
+}

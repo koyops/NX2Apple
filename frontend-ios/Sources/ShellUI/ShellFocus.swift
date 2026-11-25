@@ -21,6 +21,27 @@ struct FocusTarget: Equatable {
 /// It holds only the latest focus geometry and actions, never game or settings state.
 @MainActor final class FocusTargetBuffer {
     var values: [FocusTarget] = []
+    // Native sheets host their own preferences; retain the library targets while a sheet is open.
+    var libraryValues: [FocusTarget] = []
+    var toolbarValues: [String: FocusTarget] = [:]
+    private var toolbarOwners: [String: UUID] = [:]
+
+    func registerToolbar(_ target: FocusTarget, owner: UUID) {
+        toolbarValues[target.id] = target
+        toolbarOwners[target.id] = owner
+    }
+
+    func unregisterToolbar(id: String, owner: UUID) {
+        guard toolbarOwners[id] == owner else { return }
+        toolbarValues.removeValue(forKey: id)
+        toolbarOwners.removeValue(forKey: id)
+    }
+
+    func active(prefix: String, toolbarIDs: Set<String>) -> [FocusTarget] {
+        let content = (libraryValues + values).filter { !toolbarIDs.contains($0.id) }
+        let toolbar = toolbarValues.values.filter { toolbarIDs.contains($0.id) }.sorted { $0.id < $1.id }
+        return (content + toolbar).filter { $0.id.hasPrefix(prefix) && $0.frame.width > 1 }
+    }
 }
 struct FocusTargets: PreferenceKey {
     static var defaultValue: [FocusTarget] { [] }
@@ -36,6 +57,9 @@ private struct FocusAppearanceKey: EnvironmentKey {
 private struct IgnoresPressKey: EnvironmentKey {
     static var defaultValue: () -> Bool { { false } }
 }
+private struct ShellFocusRefreshKey: EnvironmentKey {
+    static let defaultValue = 0
+}
 extension EnvironmentValues {
     /// True while a press is the system's echo of a controller button, not a finger (see `LibraryView.noteTouch`). A
     /// control that moves at once on a press, before its value comes back, asks it first.
@@ -47,40 +71,59 @@ extension EnvironmentValues {
         get { self[FocusAppearanceKey.self] }
         set { self[FocusAppearanceKey.self] = newValue }
     }
+    var shellFocusRefresh: Int {
+        get { self[ShellFocusRefreshKey.self] }
+        set { self[ShellFocusRefreshKey.self] = newValue }
+    }
 }
 struct ShellFocusTarget: ViewModifier {
     let id: String
     let enabled: Bool
     /// The ring follows the control's shape: 12 for covers and cards, a large value for capsules and circles.
     let radius: CGFloat
+    var showsRing = true
     let action: () -> Void
+    /// Radius for capsules and circles: any value above half the control's shorter side draws a full round end.
+    static let capsule: CGFloat = 100
+    /// The corner radius the ring really draws for a control of `size`: SwiftUI clamps it to half the shorter side.
+    nonisolated static func ringCornerRadius(radius: CGFloat, size: CGSize) -> CGFloat {
+        min(radius + 5, min(size.width, size.height) / 2 + 5)
+    }
+    /// Only the focused target draws a ring, and only while focus is visible.
+    nonisolated static func drawsRing(showsRing: Bool, visible: Bool, focused: String?, id: String) -> Bool {
+        showsRing && visible && focused == id
+    }
     @Environment(\.shellFocus) private var focus
+    @Environment(\.shellFocusRefresh) private var focusRefresh
     func body(content: Content) -> some View {
         content
             .overlay {
-                if focus.visible && focus.id == id {
+                if Self.drawsRing(showsRing: showsRing, visible: focus.visible, focused: focus.id, id: id) {
                     RoundedRectangle(cornerRadius: radius + 5).strokeBorder(ShellPalette.cream, lineWidth: 3)
                         .padding(-5).allowsHitTesting(false).accessibilityHidden(true)
                         // On and off at once: a ring fading in or out stays where it was while a panel slides, apart
-                        // from its control.
+                        // from its control. An animated scroll to the focused row (withAnimation around scrollTo) must not
+                        // fade the ring either: the old row's ring lingered and the new one flashed (#1026).
                         .transition(.identity)
+                        .transaction { $0.animation = nil; $0.disablesAnimations = true }
                 }
             }
             .background {
                 if enabled {
                     GeometryReader { geometry in
                         Color.clear.preference(key: FocusTargets.self, value: [
-                            FocusTarget(id: id, frame: geometry.frame(in: .named("shell")), activate: action)
+                            FocusTarget(id: id, frame: geometry.frame(in: .global), activate: action)
                         ])
                     }
+                    .id(focusRefresh)
                 }
             }
             .id(id)
     }
 }
 extension View {
-    func shellTarget(_ id: String, enabled: Bool = true, radius: CGFloat = 12, action: @escaping () -> Void) -> some View {
-        modifier(ShellFocusTarget(id: id, enabled: enabled, radius: radius, action: action))
+    func shellTarget(_ id: String, enabled: Bool = true, radius: CGFloat = 12, showsRing: Bool = true, action: @escaping () -> Void) -> some View {
+        modifier(ShellFocusTarget(id: id, enabled: enabled, radius: radius, showsRing: showsRing, action: action))
     }
 }
 
@@ -111,3 +154,123 @@ enum FocusNavigation {
         return candidates.min(by: { score($0) < score($1) })?.id ?? id
     }
 }
+
+private struct ShellNativeBarsKey: EnvironmentKey { static let defaultValue = false }
+extension EnvironmentValues {
+    var shellNativeBars: Bool {
+        get { self[ShellNativeBarsKey.self] }
+        set { self[ShellNativeBarsKey.self] = newValue }
+    }
+}
+
+/// Keyboard commands use a non-text responder on iOS, so a context menu cannot summon a text keyboard.
+struct ShellKeyboardNavigation: ViewModifier {
+    let active: Bool
+    let handle: (ShellInput.Action) -> Void
+    #if !os(iOS)
+    @FocusState private var focused: Bool
+    #endif
+    func body(content: Content) -> some View {
+        #if os(iOS)
+        content.background { ShellKeyCommands(active: active, handle: handle).frame(width: 0, height: 0) }
+        #else
+        content.focusable(active).focused($focused).focusEffectDisabled()
+            .onAppear { focused = active }
+            .onChange(of: active) { _, value in focused = value }
+            .onKeyPress(.leftArrow) { press(.left) }
+            .onKeyPress(.rightArrow) { press(.right) }
+            .onKeyPress(.upArrow) { press(.up) }
+            .onKeyPress(.downArrow) { press(.down) }
+            .onKeyPress(.return) { press(.activate) }
+            .onKeyPress(.escape) { press(.back) }
+            .onKeyPress("o") { press(.settings) }
+            .onKeyPress("y") { press(.controllers) }
+            .onKeyPress(",") { press(.shellSettings) }
+        #endif
+    }
+    private func press(_ action: ShellInput.Action) -> KeyPress.Result {
+        guard active else { return .ignored }
+        handle(action)
+        return .handled
+    }
+}
+
+#if os(iOS)
+private struct ShellKeyCommands: UIViewRepresentable {
+    let active: Bool
+    let handle: (ShellInput.Action) -> Void
+    func makeUIView(context: Context) -> CommandView { CommandView() }
+    func updateUIView(_ view: CommandView, context: Context) {
+        view.active = active
+        view.handle = handle
+        view.syncFirstResponder()
+    }
+    final class CommandView: UIView {
+        var active = false
+        var handle: ((ShellInput.Action) -> Void)?
+        private static let actions: [(String, ShellInput.Action)] = [
+            (UIKeyCommand.inputLeftArrow, .left), (UIKeyCommand.inputRightArrow, .right),
+            (UIKeyCommand.inputUpArrow, .up), (UIKeyCommand.inputDownArrow, .down),
+            ("\r", .activate), (UIKeyCommand.inputEscape, .back), ("o", .settings), ("y", .controllers), (",", .shellSettings)
+        ]
+        override var canBecomeFirstResponder: Bool {
+            active && !hostHasPresentedModal && !windowHasTextInputFirstResponder
+        }
+        override var keyCommands: [UIKeyCommand]? {
+            canBecomeFirstResponder ? Self.actions.map { UIKeyCommand(input: $0.0, modifierFlags: [], action: #selector(command(_:))) } : nil
+        }
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            syncFirstResponder()
+        }
+        func syncFirstResponder() {
+            let hostModal = hostHasPresentedModal
+            if ShellKeyboardCommandPolicy.shouldResignFirstResponder(
+                active: active,
+                alreadyFirstResponder: isFirstResponder,
+                hostHasPresentedModal: hostModal
+            ) {
+                resignFirstResponder()
+                return
+            }
+            if ShellKeyboardCommandPolicy.shouldBecomeFirstResponder(
+                active: active,
+                inWindow: window != nil,
+                alreadyFirstResponder: isFirstResponder,
+                hostHasPresentedModal: hostModal,
+                windowHasTextInputFirstResponder: windowHasTextInputFirstResponder
+            ) {
+                becomeFirstResponder()
+            }
+        }
+        private var hostHasPresentedModal: Bool {
+            var responder: UIResponder? = next
+            while let current = responder {
+                if let vc = current as? UIViewController {
+                    return vc.presentedViewController != nil
+                }
+                responder = current.next
+            }
+            return false
+        }
+        private var windowHasTextInputFirstResponder: Bool {
+            guard let window else { return false }
+            let windows = window.windowScene?.windows ?? [window]
+            return windows.contains { Self.containsTextInputFirstResponder(in: $0) }
+        }
+        private static func containsTextInputFirstResponder(in view: UIView) -> Bool {
+            if view.isFirstResponder {
+                return view is UITextInput || view is UITextField || view is UITextView || view is UISearchBar
+            }
+            for subview in view.subviews where containsTextInputFirstResponder(in: subview) {
+                return true
+            }
+            return false
+        }
+        @objc private func command(_ command: UIKeyCommand) {
+            guard canBecomeFirstResponder, let action = Self.actions.first(where: { $0.0 == command.input })?.1 else { return }
+            handle?(action)
+        }
+    }
+}
+#endif

@@ -1,282 +1,424 @@
 import SwiftUI
+import CoreText
 import NXCore
 import NXModel
 import NXLauncher
 
-/// The Library page of the launcher: the hero, the collection row and the status line of a game. A move out of LauncherView.swift
+/// The Library page of the launcher: the hero, the collection grid and the status line of a game. A move out of LauncherView.swift
 /// (LNPANDY/NX2Apple#387), the state stays in LauncherView.
 extension LauncherView {
+    private var libraryReservedHeaderHeight: CGFloat {
+        libraryHeaderHeight + 1   // the solid bar and its hairline sit above the hero on every macOS (#1458)
+    }
+
     var libraryPage: some View {
         GeometryReader { geometry in
-            if library.games.isEmpty {
-                emptyLibrary
+            if showsAllGames {
+                allGamesPage(size: geometry.size)
             } else {
-                ScrollView {
+                recentPage(geometry)
+            }
+        }
+    }
+
+    /// The hero of the selected game, the Recently played row under it. The hero takes what the row leaves, the row's height
+    /// grows with the window's width (its cards do, up to 300 pt).
+    private func recentPage(_ geometry: GeometryProxy) -> some View {
+        let editing = artworkEditor != nil
+        let width = max(0, geometry.size.width - (editing ? ArtworkPanel.width + 1 : 0))
+        let row = recentRowHeight > 0 ? recentRowHeight : 124 + LibraryCarouselLayout.cardWidth(in: geometry.size.width) / LibraryCardLayout.aspect
+        let hero = heroGame
+        return ScrollViewReader { proxy in
+            ScrollView {
+                HStack(spacing: 0) {
                     VStack(alignment: .leading, spacing: 0) {
-                        if let game = heroGame {
-                            // While the panel is open the hero is laid out at its size with the panel closed (the panel's
-                            // width given back, the height it had) and scaled down to fit: same crop, same title, only smaller
-                            let editing = artworkEditor != nil
-                            let full = CGSize(width: geometry.size.width + (editing ? ArtworkPanel.width + 1 : 0),
-                                              height: editing ? closedHeroHeight : max(240, geometry.size.height - collectionHeight))
-                            let scale = min(1, geometry.size.width / full.width)
-                            hero(game, width: full.width, height: full.height)
-                                .scaleEffect(scale, anchor: .topLeading)
-                                .frame(width: geometry.size.width, height: full.height * scale, alignment: .topLeading)
-                                .opacity(dimmed(.hero))
-                                .onAppear { closedHeroHeight = full.height; artworkHeroAspect = full.width / full.height }
-                                .onChange(of: full) { size in
-                                    if !editing { closedHeroHeight = size.height }
-                                    artworkHeroAspect = size.width / size.height
+                        let full = CGSize(width: geometry.size.width,
+                            height: editing ? closedHeroHeight : max(LibraryHeroLayout.height(available: 0, hasDeviceActions: library.games.contains { !$0.installedDevice.isEmpty }),
+                                                                     geometry.size.height - libraryReservedHeaderHeight - row))
+                        let scale = min(1, width / max(1, full.width))
+                        self.hero(hero, width: full.width, height: full.height)
+                            .scaleEffect(scale, anchor: .topLeading)
+                            .frame(width: width, height: editing ? full.height * scale : nil, alignment: .topLeading)
+                            .opacity(dimmed(.hero))
+                            .overlay(alignment: .topLeading) {   // the notice slot, under the top bar
+                                if !editing { noticeSlot(libraryNotices(hero: hero)).padding(.top, DS.Space.s) }
+                            }
+                            .onGeometryChange(for: CGSize.self) { $0.size } action: { size in
+                                if !editing {
+                                    if abs(size.height - closedHeroHeight) > 0.5 { closedHeroHeight = size.height }
+                                    let aspect = size.width / max(1, size.height)
+                                    if abs(aspect - artworkHeroAspect) > 0.001 { artworkHeroAspect = aspect }
                                 }
-                        }
-                        // The hero takes what the collection leaves: the row's height grows with the window's width (its cards
-                        // do, up to 300 pt), so a fixed share left a fullscreen window's cards cut off at the bottom
-                        collection(width: geometry.size.width)
-                            .background(GeometryReader { g in Color.clear.preference(key: CollectionHeightKey.self, value: g.size.height) })
+                            }
+                        recentRow(width: width)
+                            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
+                                if abs(height - recentRowHeight) > 0.5 { recentRowHeight = height }
+                            }
                             .opacity(dimmed(.thumbnail))
-                    }
+                    }.frame(width: width)
+                    if editing { Color.clear.frame(width: ArtworkPanel.width + 1) }
                 }
-                .onPreferenceChange(CollectionHeightKey.self) { h in if h > 0, abs(h - collectionHeight) > 0.5 { collectionHeight = h } }
-                .animation(.easeOut(duration: 0.18), value: artworkSlot)
+            }
+            .onChange(of: padFocus.focused) { id in
+                if let id, id.hasPrefix("card.") || id.hasPrefix("library."), let frame = padFocus.frame(of: id),
+                   frame.minY < libraryHeaderHeight || frame.maxY > geometry.size.height {
+                    withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) { proxy.scrollTo("library.collection.header", anchor: .top) }
+                }
+            }
+        }
+        .coordinateSpace(name: "library.scroll")
+        .modifier(LibraryScrollUnderlap())
+        .animation(.easeOut(duration: 0.18), value: artworkSlot)
+        .onChange(of: library.selectedID) { _ in toolsAge.cancelSingleRefreshProbe() }
+        .onChange(of: m.running) { running in
+            library.invalidateArtworkStates()
+            if running { toolsAge.cancelSingleRefreshProbe() }
+        }
+        .onChange(of: activeBuildID) { _ in library.invalidateArtworkStates() }
+        .onChange(of: buildQueue.entries) { _ in library.invalidateArtworkStates() }
+        .onDisappear { toolsAge.cancelSingleRefreshProbe() }
+        .allowsHitTesting(!editing)
+        .overlay(alignment: .trailing) {
+            if let editor = artworkEditor {
+                HStack(spacing: 0) {
+                    Divider().opacity(0.3)
+                    ArtworkPanel(editor: editor, labels: loc.t, save: { closeArtwork(save: true) }, cancel: { closeArtwork(save: false) })
+                        .onReceive(editor.$draft) { refreshPreview($0) }
+                        .onReceive(editor.$slot) { artworkSlot = $0 }
+                        .onChange(of: artworkHeroAspect) { editor.heroAspect = $0 }
+                }.frame(width: ArtworkPanel.width + 1)
+                    .transition(reduceMotion ? .opacity : .move(edge: .trailing).combined(with: .opacity))
+            }
+        }
+        .modifier(LibraryHeaderBar(header: libraryHeader))
+    }
+
+    func hero(_ game: LibraryGame?, width: CGFloat, height: CGFloat) -> some View {
+        let layout = LibraryHeroLayout.content(width: width, height: height, headerHeight: 0)   // the hero starts below the bar
+        let titleSize = layout.titleSize
+        let titleTopInset = Typography.manropeFont(size: titleSize, weight: .heavy).map { max(0, CTFontGetAscent($0) - CTFontGetCapHeight($0)) } ?? 0
+        let contentGap = layout.columnGap
+        let textWidth = max(0, width - 68)   // no cover tile beside the title (#1458): the text starts at the content edge
+        return ZStack(alignment: .bottomLeading) {
+            GeometryReader { position in
+                let pull = max(0, position.frame(in: .named("library.scroll")).minY)
+                let backdropHeight = max(height, position.size.height)
+                ZStack {
+                    ZStack {
+                        if let game, let image = heroImage(for: game) {
+                            let state = library.artworkState(for: game, building: isBuildingGame(game), queued: isQueuedGame(game))
+                            ArtworkFill(image: image, focus: displayed(game).artwork.focus(for: .hero))
+                                .saturation(LibraryArtworkTone.saturation(muted: state.monochrome))   // sharp, never blurred (#1458)
+                                .id(game.id).transition(.opacity)
+                        } else {
+                            LibraryFallbackArtwork(size: CGSize(width: width + 96, height: backdropHeight + pull + 96))
+                        }
+                    }
+                    .animation(LibraryHeroTransition.artwork(reduceMotion: reduceMotion), value: game?.id)
+                    .frame(width: width + 96, height: backdropHeight + pull + 96)
+                    .frame(width: width, height: max(0, backdropHeight + pull - 1)).clipped()
+                    .frame(width: width, height: backdropHeight + pull, alignment: .top)
+                    // The artwork sharp, not blurred (#1458): dimmed at the top under the bar, darker behind the title on the left, and
+                    // fading into the page at the bottom, where the row of games starts.
+                    LinearGradient(stops: [.init(color: .black.opacity(0.45), location: 0),
+                                           .init(color: .black.opacity(0.1), location: 0.22),
+                                           .init(color: .black.opacity(0.25), location: 0.5),
+                                           .init(color: LauncherPalette.background.opacity(0.92), location: 0.86),
+                                           .init(color: LauncherPalette.background, location: 1)],
+                                   startPoint: .top, endPoint: .bottom)
+                    LinearGradient(stops: [.init(color: .black.opacity(0.55), location: 0), .init(color: .black.opacity(0.2), location: 0.55),
+                                           .init(color: .clear, location: 1)], startPoint: .leading, endPoint: .trailing)
+                }.frame(width: width, height: backdropHeight + pull)
+                .background(LauncherPalette.background)
+                .offset(y: -pull)
+            }.allowsHitTesting(false)
+            Group {
+                if let game {
+                    HStack(alignment: .bottom, spacing: contentGap) {
+                        VStack(alignment: .leading, spacing: layout.titleActionGap) {
+                            VStack(alignment: .leading, spacing: layout.badgeTitleGap) {
+                                heroBadges(game)
+                                ZStack(alignment: .bottomLeading) {
+                                    Text(game.displayName(loc.lang)).font(.manrope(titleSize, .heavy))
+                                        .accessibilityLabel(game.displayName(loc.lang))
+                                        .tracking(-1).lineLimit(3).minimumScaleFactor(0.85)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                        // Trim the font's space above capitals without changing the title-to-action gap.
+                                        .padding(.top, -titleTopInset)
+                                        .shadow(color: .black.opacity(0.3), radius: 12)
+                                        .frame(width: textWidth, alignment: .leading)
+                                        .id(game.id).transition(.opacity)
+                                }
+                                .animation(LibraryHeroTransition.metadata(reduceMotion: reduceMotion), value: game.id)
+                                if game.playableMacBundle?.upstream == .nxkit {
+                                    // A quiet property under the title (#1460): nxkit (Beta) built this app
+                                    Label(loc.t("nxkit.builtWith"), systemImage: "hammer")
+                                        .font(DS.Font.body).foregroundStyle(DS.Color.textSecondary)
+                                        .help(m.nxkitRecord(game.titleID).map { String(format: loc.t("nxkit.version"), $0.version) } ?? loc.t("nxkit.builtWith"))
+                                        .accessibilityIdentifier("hero.nxkit")
+                                }
+                            }
+                            heroActions(game, compact: width < 760)
+                            if let generic = nxkitGenericBuild(game) {
+                                // built without a game profile (v0lumehi/nxkit#54): it may not start or render wrong, said every time
+                                NxkitGenericBuildRow(profile: generic.profile, reportURL: generic.report)
+                                    .frame(maxWidth: 620, alignment: .leading)
+                            }
+                            if let prompt = nxkitLaunchPrompt(game) {
+                                // "Did it work?" after the first start of an app nxkit built, once (#1460)
+                                NxkitFeedbackRow(prompt: prompt) { m.markNxkitFeedbackAsked(prompt.id) }
+                                    .frame(maxWidth: 620, alignment: .leading)
+                            }
+                        }.frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .padding(.horizontal, 34).padding(.bottom, 24)
+                } else {
+                    emptyLibraryHero(width: width)
+                }
+            }.transaction { $0.animation = nil }
+        }
+        .frame(width: width).frame(minHeight: height, alignment: .bottomLeading)
+        .task(id: "\(game?.id.uuidString ?? "")|\(loc.lang.code)|\(game?.appPath ?? "")") {
+            guard let game else {
+                heroIcon = nil
+                return
+            }
+            let banners = library.artworkDirectory
+            let fallbackKeys = library.keysFile()
+            let langCode = loc.lang.code
+            if let offline = await GameLibrary.loadAppIcon(
+                for: game,
+                banners: banners,
+                language: langCode,
+                fallbackKeys: fallbackKeys,
+                maxPixel: ArtworkImages.iconPixels
+            ) {
+                guard !Task.isCancelled, heroGame?.id == game.id else { return }
+                heroIcon = (game.id, offline)
+            }
+            guard performStartupChecks || artworkStore !== ArtworkStore.shared else { return }
+            if let url = await artworkStore.fetchIcon(game.titleID, language: langCode) {
+                ArtworkImages.shared.invalidate(at: url)
+                let online = await ArtworkImages.shared.loadImage(at: url, maxPixel: ArtworkImages.iconPixels)
+                guard !Task.isCancelled, heroGame?.id == game.id else { return }
+                if let online { heroIcon = (game.id, online) }
             }
         }
     }
 
-    var emptyLibrary: some View {
-        VStack(alignment: .leading, spacing: 22) {
-            Spacer()
-            Image(systemName: "gamecontroller").font(.system(size: 44, weight: .light))
-                .foregroundStyle(LauncherPalette.cream)
-            Text(loc.t("library.welcome")).font(.manrope(54, .bold)).tracking(-1.8)
-            Text(loc.t("library.welcomeNote")).font(.manrope(17)).foregroundStyle(.secondary)
-                .frame(maxWidth: 490, alignment: .leading).fixedSize(horizontal: false, vertical: true)
-            Button { newBuild() } label: {
-                Label(loc.t("library.firstBuild"), systemImage: "plus")
-                    .font(.manrope(16, .semibold))
-                    .padding(.horizontal, 24).padding(.vertical, 15)
-                    .foregroundStyle(.black).background(LauncherPalette.cream, in: Capsule())
-            }
-            .buttonStyle(.plain).padding(.top, 8)
-            Button(action: chooseLibraryFolder) {
-                Label(loc.t("library.chooseFolder"), systemImage: "folder")
-                    .font(.manrope(14)).foregroundStyle(.secondary)
-            }.buttonStyle(.plain)
-            Spacer()
-            Text(loc.t("library.localNote")).font(.manrope(12)).foregroundStyle(.secondary)
-        }
-        .padding(48).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+    /// The question after the first start of an app nxkit built: it was played after the build nxkit recorded, and not asked yet.
+    func nxkitLaunchPrompt(_ game: LibraryGame) -> NxkitFeedbackPrompt? {
+        guard let record = m.nxkitRecord(game.titleID), let played = game.lastPlayed, played >= record.date,
+              !m.nxkitFeedbackAsked(record.buildID + "." + NxkitFeedbackPrompt.Moment.firstLaunch.rawValue),
+              let app = game.playableMacBundle, app.upstream == .nxkit else { return nil }
+        return NxkitFeedbackPrompt(buildID: record.buildID, moment: .firstLaunch, titleID: game.titleID, gameName: game.displayName(loc.lang),
+                                   gameVersion: app.version ?? "", nxkitVersion: record.version, engineBuild: record.hostBuild)
     }
 
-    func hero(_ game: LibraryGame, width: CGFloat, height: CGFloat) -> some View {
-        ZStack(alignment: .bottomLeading) {
-            if let image = heroArtwork?.id == game.id ? heroArtwork?.image : artwork[game.id] {
-                ArtworkFill(image: image, focus: displayed(game).artwork.focus(for: .hero))
-                    .frame(width: width, height: height).clipped()
-            } else {
-                LauncherPalette.surface
-                Image(systemName: "gamecontroller").font(.system(size: 160, weight: .ultraLight))
-                    .foregroundStyle(Color.white.opacity(0.05))
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing).padding(60)
-            }
-            LinearGradient(stops: [.init(color: .clear, location: 0.25),
-                                   .init(color: .black.opacity(0.25), location: 0.45),
-                                   .init(color: LauncherPalette.background, location: 1)],
-                           startPoint: .top, endPoint: .bottom)
-            LinearGradient(colors: [.black.opacity(0.24), .clear], startPoint: .leading, endPoint: .trailing)
-            VStack(alignment: .leading, spacing: 14) {
-                HStack(spacing: 14) {
-                    status(game, prominent: true)
-                    if toolsAge.older.contains(game.id) && !(m.running && activeBuildID == game.id) {
-                        Button { configureBuild(game) } label: {
-                            Label(loc.t("library.rebuildShort"), systemImage: "arrow.clockwise")
-                                .font(.manrope(12, .semibold)).foregroundStyle(LauncherPalette.cream)
-                                .padding(.horizontal, 10).padding(.vertical, 4)
-                                .overlay(Capsule().strokeBorder(LauncherPalette.cream.opacity(0.35)))
-                                .contentShape(Capsule())
-                        }
-                        .buttonStyle(.plain).disabled(m.running || game.inputs["base", default: []].isEmpty)
-                        .help(loc.t("library.olderToolsHelp"))
-                        .padTarget("hero.rebuild", scope: "main", radius: 12) { if !m.running { configureBuild(game) } }
-                    }
-                }
-                Text(game.name).font(.manrope(min(68, width * 0.052), .heavy))
-                    .tracking(-1.6).lineLimit(2).shadow(color: .black.opacity(0.25), radius: 12)
-                HStack(spacing: 18) {
-                    Button { primaryAction(game) } label: {
-                        LauncherHeroActionLabel(
-                            title: game.primary == .play ? loc.t("library.play")
-                                : (game.primary == .openOnDevice ? String(format: loc.t("dev.open"), devices.deviceName(game.installedDevice))
-                                   : loc.t("library.newBuild")),
-                            symbol: game.primary == .play ? "play.fill" : (game.primary == .openOnDevice ? "iphone" : "hammer.fill"))
-                    }
-                    .buttonStyle(.plain).disabled(launching || (m.running && !game.isReady) || artworkEditor != nil)
-                    .keyboardShortcut(.return, modifiers: [])
-                    .padTarget("hero.play", scope: "main", radius: 30) { if !launching { primaryAction(game) } }
-                    if game.isReady {
-                        Button { optionsFor = game.id } label: {
-                            Image(systemName: "slider.horizontal.3").font(.system(size: 17))
-                                .frame(width: 48, height: 48)
-                                .background(Color.white.opacity(0.10), in: Circle())
-                                .overlay(Circle().strokeBorder(Color.white.opacity(0.14)))
-                        }
-                        .buttonStyle(.plain).help(loc.t("launch.title")).accessibilityLabel(loc.t("launch.title"))
-                        .padTarget("hero.options", scope: "main", radius: 24) { optionsFor = game.id }
-                    }
-                    Button { manageOpenFor = manageOpenFor == nil ? game.id : nil } label: { ManageButtonLabel(title: loc.t("library.manage")) }
-                        .buttonStyle(.plain).accessibilityLabel(loc.t("library.manage"))
-                        .anchorPreference(key: ManageAnchorKey.self, value: .bounds) { $0 }
-                        .padTarget("hero.manage", scope: "main", radius: 12) { manageOpenFor = game.id }
-                }
-                // A free Apple ID's provisioning profile lasts 7 days. Say when this app's runs out, and offer the
-                // re-sign at any time: renewing early (before a trip, say) is as valid as renewing just in time.
-                if game.onDevice && !game.isOlderIOSBuild {
-                    HStack(spacing: 10) {
-                        Image(systemName: "checkmark.seal").font(.system(size: 12))
-                            .foregroundStyle(LauncherPalette.cream.opacity(0.7))
-                        Text(signatureExpiry[game.id].map { AppSignature.describe($0, loc.t) } ?? loc.t("dev.expiryUnknown"))
-                            .font(.manrope(12.5))
-                            .foregroundStyle(signatureExpiry[game.id].map { AppSignature.isUrgent($0) } == true
-                                             ? LauncherPalette.building : .secondary)
-                        Button { resign(game) } label: {
-                            Text(loc.t("dev.resign")).font(.manrope(12, .semibold))
-                                .foregroundStyle(LauncherPalette.cream)
-                                .padding(.horizontal, 10).padding(.vertical, 4)
-                                .overlay(Capsule().strokeBorder(LauncherPalette.cream.opacity(0.35)))
-                                .contentShape(Capsule())
-                        }
-                        .buttonStyle(.plain).disabled(m.running)
-                        .help(loc.t("dev.resignHelp"))
-                        .padTarget("hero.resign", scope: "main", radius: 12) { if !m.running { resign(game) } }
-                    }
-                }
-                if let resignNote {
-                    Text(resignNote).font(.manrope(12)).foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            .padding(.horizontal, 34).padding(.bottom, 34)
-        }
-        .frame(width: width, height: height).clipped()
+    /// An app nxkit built without a game profile (NxkitBuildProfile), and its prefilled report: only what this launcher knows.
+    func nxkitGenericBuild(_ game: LibraryGame) -> (profile: NxkitBuildProfile, report: URL)? {
+        guard let app = game.playableMacBundle, app.upstream == .nxkit, let profile = NxkitBuildProfile.read(app: game.appPath) else { return nil }
+        return (profile, NxkitFeedback.genericBuildReportURL(gameName: game.displayName(loc.lang), titleID: game.titleID, gameVersion: app.version ?? "",
+                                                             nxkitVersion: profile.nxkitVersion ?? m.nxkitRecord(game.titleID)?.version ?? ""))
     }
 
+    private func heroBadges(_ game: LibraryGame) -> some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 10) { heroBadgeContent(game) }.fixedSize(horizontal: true, vertical: false)
+            VStack(alignment: .leading, spacing: 8) { heroBadgeContent(game) }
+        }
+    }
+
+    @ViewBuilder private func heroBadgeContent(_ game: LibraryGame) -> some View {
+        Group {
+            LibraryArtworkChip(state: library.artworkState(for: game, building: isBuildingGame(game), queued: isQueuedGame(game)))
+            libraryMetadataBadges(game)
+        }
+    }
+
+    /// Narrow windows place collection controls on a separate line.
+    static let collectionWideHeaderWidth: CGFloat = 1100
+
+    /// The All games grid (LauncherView+Carousel.swift opens it): the whole library, filtered, ordered and counted.
     func collection(width: CGFloat) -> some View {
-        let cardWidth = min(300, max(190, (width - 124) / 5))
-        let step = cardWidth + 14
+        let cardWidth = LibraryCardLayout.width(in: width)
+        let columns = LibraryCardLayout.columns(in: width)
         let games = filteredGames
         let heroID = heroGame?.id
+        let compactHeader = width < Self.collectionWideHeaderWidth
         return VStack(alignment: .leading, spacing: 18) {
-            HStack(spacing: 16) {
-                Text(loc.t("library.collection")).font(.manrope(28, .bold)).tracking(-0.6)
-                Spacer()
-                LauncherSegmented(options: LibraryFilter.allCases.map { ($0.rawValue, loc.t($0.labelKey)) },
-                                  selection: libraryFilter.rawValue) { setLibraryFilter(LibraryFilter(rawValue: $0) ?? .owned) }
-                    .frame(width: LauncherControl.width)
-                    .padTarget("library.filter", scope: "main", radius: 17,
-                               activate: { setLibraryFilter(libraryFilter == .owned ? .built : .owned) },
-                               adjust: { setLibraryFilter($0 > 0 ? .built : .owned) })
-                Text(String(format: loc.t("library.gameCount"), libraryFilter == .owned ? library.games.count : library.games.filter(libraryFilter.includes).count))
-                    .font(.manrope(12)).foregroundStyle(.secondary)
-            }
-            if games.isEmpty {
-                Text(loc.t("library.noResults")).foregroundStyle(.secondary).padding(.vertical, 28)
-            } else {
-                ScrollViewReader { proxy in
-                ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(alignment: .top, spacing: 14) {
-                            ForEach(games) { game in
-                                let _ = LauncherWork.count(.card)
-                                Button { library.selectedID = game.id } label: {
-                                    VStack(alignment: .leading, spacing: 8) {
-                                        ZStack {
-                                            if let image = artwork[game.id] {
-                                                ArtworkFill(image: image, focus: displayed(game).artwork.focus(for: .thumbnail))
-                                            } else {
-                                                LauncherPalette.surface
-                                                Image(systemName: "gamecontroller").font(.system(size: 30, weight: .light)).foregroundStyle(.secondary)
-                                            }
-                                        }
-                                        .frame(width: cardWidth, height: cardWidth / 1.8).clipped()
-                                        .clipShape(RoundedRectangle(cornerRadius: 5))
-                                        .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(
-                                            game.id == heroID ? LauncherPalette.cream : .clear, lineWidth: 2))
-                                        Text(game.name).font(.manrope(16, .semibold)).lineLimit(1)
-                                        status(game)
-                                        Capsule().fill(game.id == heroID ? LauncherPalette.cream : .clear)
-                                            .frame(height: 3).padding(.top, 4)
-                                    }
-                                    .frame(width: cardWidth, alignment: .leading).contentShape(Rectangle())
-                                }
-                                .buttonStyle(.plain)
-                                .accessibilityAddTraits(game.id == heroID ? .isSelected : [])
-                                .padTarget("card." + game.id.uuidString, scope: "main", radius: 7) { if !launching { primaryAction(game) } }
-                            }
+            let headerLayout = compactHeader
+                ? AnyLayout(VStackLayout(alignment: .leading, spacing: 12))
+                : AnyLayout(HStackLayout(spacing: 16))
+            headerLayout {
+                allGamesHeader(count: games.count, compact: compactHeader)
+                HStack(spacing: 12) {
+                Spacer(minLength: 0)
+                LauncherGlassGroup {
+                    HStack(spacing: 12) {
+                        if !library.games.isEmpty { collectionBatchRefreshButton(compact: compactHeader) }
+                        activityLogButton()
+                        Button(loc.t("supported.title"), action: openSupportedGames)
+                            .buttonStyle(LauncherSecondaryButtonStyle())
+                            .padTarget("library.supported", scope: "main", activate: openSupportedGames)
+                        HStack(spacing: 8) {
+                            // a narrow window keeps the menu without the word before it (the menu's accessible label says Sort)
+                            if !compactHeader { Text(loc.t("sort.label")).font(DS.Font.callout).foregroundStyle(DS.Color.textSecondary).fixedSize() }
+                            LauncherDropdown(options: LibrarySort.allCases.map { ($0.rawValue, loc.t($0.labelKey)) }, selection: librarySort.rawValue,
+                                             label: loc.t("sort.label"), style: .button) { setLibrarySort(LibrarySort(rawValue: $0) ?? .recent) }
+                                .padTarget("library.sort", scope: "main",
+                                           activate: { setLibrarySort(librarySort == .recent ? .name : .recent) },
+                                           adjust: { setLibrarySort($0 > 0 ? .name : .recent) })
                         }
-                        // Room for the controller's focus ring, which sits 4 pt outside a card: the row clips at its edges, so it
-                        // gets the room inside and gives it back outside (the cards stay where they were)
-                        .padding(.horizontal, Self.ringRoom).padding(.top, Self.ringRoom).padding(.bottom, 5 + Self.ringRoom)
-                        .background(EnclosingScrollView(row: row))
-                    }
-                    .padding(.horizontal, -Self.ringRoom).padding(.vertical, -Self.ringRoom)
-                    .onChange(of: padFocus.focused) { id in   // the focused card scrolls into the row's view
-                        guard let id, id.hasPrefix("card.") else { return }
-                        withAnimation(.easeInOut(duration: 0.25)) { proxy.scrollTo(id, anchor: .center) }
+                        LauncherSegmented(options: LibraryFilter.libraryOptions.map { ($0.rawValue, loc.t($0.labelKey)) },
+                                          selection: libraryFilter.rawValue) { setLibraryFilter(LibraryFilter(rawValue: $0) ?? .owned) }
+                            .compactFrame(minWidth: LauncherControl.width)
+                            .padTarget("library.filter", scope: "main",
+                                       activate: { setLibraryFilter(libraryFilter == .ios ? .owned : libraryFilter.adjusted(1)) },
+                                       adjust: { setLibraryFilter(libraryFilter.adjusted($0)) })
                     }
                 }
-                    .overlay(alignment: .topLeading) {
-                        if row.canBack {
-                            pager("chevron.left", height: cardWidth / 1.8) { row.page(-1, step: step) }.offset(x: -22)
-                        }
+                }
+            }.id("library.collection.header")
+            if games.isEmpty && !library.games.isEmpty {
+                Text(loc.t(search.isEmpty ? "console.allGames.empty" : "library.noResults"))
+                    .font(DS.Font.body).foregroundStyle(DS.Color.textSecondary)
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 24)
+            } else {
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(minimum: 0), spacing: LibraryCardLayout.gridSpacing, alignment: .top), count: columns),
+                      alignment: .leading, spacing: 18) {
+                if games.isEmpty {
+                    ForEach(0..<(columns * 2), id: \.self) { _ in LibraryCarouselPlaceholder(width: cardWidth) }
+                } else {
+                    ForEach(games) { game in
+                        let _ = LauncherWork.count(.card)
+                        collectionCard(game, width: cardWidth, selected: game.id == heroID, in: games, columns: columns,
+                                       choose: { chooseFromAllGames(game) })
                     }
-                    .overlay(alignment: .topTrailing) {
-                        if row.canForward {
-                            pager("chevron.right", height: cardWidth / 1.8) { row.page(1, step: step) }.offset(x: 22)
-                        }
-                    }
+                }
+            }.padding(.top, 8)
             }
         }
         .padding(.horizontal, 34).padding(.top, 8).padding(.bottom, 22)
     }
 
-    /// A round button floating over the row's edge, centred on the artwork, shown while the row scrolls that way.
-    func pager(_ symbol: String, height: CGFloat, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: symbol).font(.system(size: 16, weight: .semibold)).foregroundStyle(.white)
-                .frame(width: 44, height: 44)
-                .background(Color.black.opacity(0.72), in: Circle())
-                .overlay(Circle().strokeBorder(Color.white.opacity(0.16)))
-                .shadow(color: .black.opacity(0.4), radius: 10)
-                .contentShape(Circle())
-        }
-        .buttonStyle(.plain)
-        .frame(height: height)
-        .accessibilityLabel(loc.t(symbol == "chevron.left" ? "library.scrollBack" : "library.scrollForward"))
-        .transition(.opacity)
+    static func tunedMetadataBadge(for game: LibraryGame, t: (String) -> String) -> LibraryGameCard.TunedBadge? {
+        LibraryGameCard.tunedBadge(
+            built: game.playableMacBundle?.upstream,
+            builtUpstreams: game.sortedMacBuilds.map(\.upstream),
+            available: EngineUpstream.tunedEngines(forTitleID: game.titleID),
+            t: t
+        )
     }
 
-    func status(_ game: LibraryGame, prominent: Bool = false) -> some View {
-        let building = m.running && activeBuildID == game.id
-        let color = building ? LauncherPalette.building : ((game.isReady || game.hasIOSBuild) ? LauncherPalette.ready : LauncherPalette.unbuilt)
-        let key = building ? "library.building" : (game.isReady ? "library.ready" : (game.hasIOSBuild ? (game.isOlderIOSBuild ? "library.olderIOS" : "library.readyIOS") : "library.notBuilt"))
-        return HStack(spacing: 7) {
-            Circle().fill(color).frame(width: prominent ? 9 : 7, height: prominent ? 9 : 7)
-            Text(prominent ? loc.t(key).uppercased() : loc.t(key))
-                .font(prominent ? .manrope(12, .bold) : .manrope(13, .medium))
-                .tracking(prominent ? 1.3 : 0)   // the eyebrow: the same face, in tracked capitals
-                .foregroundStyle(color)
+    var queuedLibraryTitleIDs: Set<String> {
+        Set(buildQueue.queued.map { $0.titleID.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() })
+    }
+
+    func isBuildingGame(_ game: LibraryGame) -> Bool {
+        guard m.running else { return false }
+        if activeBuildID == game.id { return true }
+        if let running = buildQueue.running, running.titleID.caseInsensitiveCompare(game.titleID) == .orderedSame { return true }
+        if m.buildingGame, let buildingTitleID = m.gameTitleID, !buildingTitleID.isEmpty,
+           buildingTitleID.caseInsensitiveCompare(game.titleID) == .orderedSame { return true }
+        return false
+    }
+
+    func isQueuedGame(_ game: LibraryGame) -> Bool {
+        !isBuildingGame(game) && buildQueue.queued.contains { $0.titleID.caseInsensitiveCompare(game.titleID) == .orderedSame }
+    }
+
+    func effectiveLibraryQueueTarget(for game: LibraryGame, selectedTarget: String? = nil, upstream: EngineUpstreamKind? = nil, supportsGenericNUP: Bool? = nil) -> String {
+        let baseTarget = selectedTarget ?? (m.isMacOnlyUpstreamSelected ? BuildTarget.mac : BuildTarget.normalized(m.target))
+        let resolvedUpstream = resolvedLibraryQueueUpstream(for: game, selectedTarget: baseTarget, activeUpstream: upstream ?? m.buildUpstream, supportsGenericNUP: supportsGenericNUP ?? MacNativeGamesBuilder.supportsGenericNUP(in: m.macNativeGamesPath))
+        return resolvedUpstream.buildsMacOnly ? BuildTarget.mac : baseTarget
+    }
+
+    private func resolvedLibraryQueueUpstream(for game: LibraryGame, selectedTarget: String, activeUpstream: EngineUpstreamKind, supportsGenericNUP: Bool) -> EngineUpstreamKind {
+        let isNUP = MacNativeGamesBuilder.isNUPInputPath(game.inputs[GameLibrary.folderInput]?.first)
+            || MacNativeGamesBuilder.isNUPInputPath(game.inputs["base"]?.first)
+        return BuildSelectedSheet.rowEngineTag(
+            for: game.titleID,
+            selectedTarget: selectedTarget,
+            activeUpstream: activeUpstream,
+            isNUP: isNUP,
+            supportsGenericNUP: supportsGenericNUP
+        ) ?? activeUpstream
+    }
+
+    /// Adds games to the build queue with the Builds page's target, upstream, and iOS delivery settings (#1112).
+    func enqueueBuilds(_ games: [LibraryGame]) {
+        let batch = UUID()
+        let upstream = m.buildUpstream
+        let selectedTarget = m.isMacOnlyUpstreamSelected ? BuildTarget.mac : BuildTarget.normalized(m.target)
+        let packagesSharedApp = !(devices.exportIPA && (devices.exportOneGame || devices.exportFramework))
+        let exportsFramework = devices.exportIPA && !devices.exportOneGame && devices.exportFramework
+        let supportsGenericNUP = MacNativeGamesBuilder.supportsGenericNUP(in: m.macNativeGamesPath)
+        let entries = games.compactMap { game -> QueueEntry? in
+            guard !isBuildingGame(game), game.hasQueueableSources else { return nil }
+            let rowUpstream = resolvedLibraryQueueUpstream(for: game, selectedTarget: selectedTarget, activeUpstream: upstream, supportsGenericNUP: supportsGenericNUP)
+            let effectiveTarget = rowUpstream.buildsMacOnly ? BuildTarget.mac : selectedTarget
+            guard buildQueue.canEnqueue(game.titleID, target: effectiveTarget) else { return nil }
+            let isIOS = effectiveTarget != BuildTarget.mac
+            let standaloneIOS = isIOS && rowUpstream.buildsIOSStandaloneOnly
+            return QueueEntry(
+                game: game,
+                engineID: stores.engineSync.selection.engineID,
+                target: effectiveTarget,
+                batch: batch,
+                packageAfter: !standaloneIOS && packagesSharedApp && isIOS,
+                exportIPA: standaloneIOS ? true : (isIOS && exportsFramework ? true : nil),
+                exportFramework: standaloneIOS ? false : (isIOS && exportsFramework ? true : nil)
+            )
+        }
+        buildQueue.enqueue(entries)
+    }
+
+    func libraryMetadataBadges(_ game: LibraryGame) -> some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 7) { metadataBadgeContent(game) }.fixedSize(horizontal: true, vertical: false)
+            VStack(alignment: .leading, spacing: 8) { metadataBadgeContent(game) }
+        }
+        .accessibilityElement(children: .contain)
+    }
+
+    @ViewBuilder private func metadataBadgeContent(_ game: LibraryGame) -> some View {
+        Group {
+            if let played = heroPlayTime(for: game) {
+                DSTag(played)
+                    .help(loc.t("activity.totalTime"))
+                    .accessibilityLabel("\(loc.t("activity.totalTime")) \(played)")
+            }
+            if let badge = Self.tunedMetadataBadge(for: game, t: { loc.t($0) }) {
+                DSTag(badge.title, emphasized: true, width: badge.fixedWidth)
+                    .help(badge.help)
+                    .accessibilityLabel(badge.help)
+            }
+            if game.playableMacBundle?.upstream == .nxkit, NxkitBuildProfile.read(app: game.appPath) != nil {
+                // built without a game profile (v0lumehi/nxkit#54): a quiet tag, the row under the actions says what it means
+                DSTag(loc.t("nxkit.generic.badge"), emphasized: true)
+                    .help(loc.t("nxkit.generic.help"))
+                    .accessibilityLabel(loc.t("nxkit.generic.help"))
+                    .accessibilityIdentifier("hero.nxkitGeneric")
+            }
             if GameFolder.profileIsSwitch2(game.titleID, engineRoot: EngineLayout.root(m.repo.path)) {   // #445
-                Text(loc.t("switch2.badge"))
-                    .font(.manrope(prominent ? 11 : 10.5, .bold)).foregroundStyle(LauncherPalette.cream.opacity(0.85))
-                    .padding(.horizontal, 7).padding(.vertical, 2)
-                    .overlay(Capsule().strokeBorder(LauncherPalette.cream.opacity(0.35)))
+                ArtworkStatusChip(title: loc.t("switch2.badge"), color: LauncherPalette.notice, showsIndicator: false)
                     .help(loc.t("switch2.help"))
             }
-            if !building && toolsAge.older.contains(game.id) {   // a quiet note beside the status, not a warning
-                Text("· " + loc.t(prominent ? "library.olderTools" : "library.olderToolsShort"))
-                    .font(.manrope(prominent ? 13 : 12)).foregroundStyle(.secondary).lineLimit(1)
+            if verifiedProfiles.isUnverified(game) {
+                LibraryProfileChip(title: loc.t("macLibVerify.badge"), explanation: loc.t("macLibVerify.note"), showingHelp: $profileHelpOpen).id(game.id)
+            }
+            if game.isOlderIOSBuild {
+                ArtworkStatusChip(title: loc.t("library.chip.olderIOS"), color: LauncherPalette.advisory)
+                    .help(loc.t("library.olderIOS"))
+            }
+            if toolsAge.older.contains(game.id) {   // a quiet note beside the status, not a warning
+                ArtworkStatusChip(title: loc.t("library.olderToolsShort"), color: ArtworkStatusChip.neutralColor, showsIndicator: false)
                     .help(loc.t("library.olderToolsHelp"))
             }
+            deviceFrameworkBadge(game)
         }
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
     }
+
 }

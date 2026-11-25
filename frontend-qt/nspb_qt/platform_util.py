@@ -5,11 +5,15 @@ the window never branch on sys.platform themselves.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import time
+import urllib.request
 from pathlib import Path
 
 IS_WIN = sys.platform.startswith('win')
@@ -119,6 +123,7 @@ def python_candidates(extra_candidates: list[str] | None = None) -> list[str]:
             os.path.expandvars(r'%LOCALAPPDATA%\Programs\Python\Python312\python.exe'),
             os.path.expandvars(r'%LOCALAPPDATA%\Programs\Python\Python311\python.exe'),
             os.path.expandvars(r'%ProgramFiles%\Python312\python.exe'),
+            r'C:\Python312\python.exe',
         ]
     else:
         fw = '/Library/Frameworks/Python.framework/Versions'
@@ -130,7 +135,37 @@ def python_candidates(extra_candidates: list[str] | None = None) -> list[str]:
         cands += version_manager_pythons()
     if w := _which('python3' if not IS_WIN else 'python'):
         cands.append(w)
+    if IS_WIN:
+        cands = [c for c in cands if c and 'windowsapps' not in c.replace('/', '\\').lower()]
     return cands
+
+
+def _usable_venv_base(py: str, ver: str) -> bool:
+    """Whether `py` (at version `ver`) can create a venv and install the bundled wheels.
+
+    On Windows the shipped offline `wheels/` folder carries `cp312` (`win_amd64`) wheels only, so
+    an unpacked system Python 3.13 / 3.14 without the packages pre-installed would fail offline
+    `pip install --no-index`. Also reject Windows embeddable zip layouts (`python*._pth`) and
+    custom system installs where `Lib/` is present without `Lib/venv` or `Lib/ensurepip`.
+    """
+    vt = _ver_tuple(ver)
+    if vt < MIN_PYTHON:
+        return False
+    if IS_WIN:
+        if vt != (3, 12):
+            return False
+        py_dir = Path(py).parent
+        try:
+            if any(py_dir.glob('python*._pth')):
+                return False
+            lib_dir = py_dir / 'Lib'
+            if any(py_dir.glob('python*.zip')) and not lib_dir.is_dir():
+                return False
+            if lib_dir.is_dir() and not ((lib_dir / 'venv').is_dir() and (lib_dir / 'ensurepip').is_dir()):
+                return False
+        except OSError:
+            return False
+    return True
 
 
 def find_python(extra_candidates: list[str] | None = None) -> tuple[str, bool, str]:
@@ -141,7 +176,7 @@ def find_python(extra_candidates: list[str] | None = None) -> tuple[str, bool, s
     every python on the machine (see python_candidates for the order).
     """
     probe = (
-        "import lz4, capstone, fontTools, zbic\n"
+        "import lz4, capstone, fontTools, zbic, unicorn\n"
         "try:\n"
         "    from compression import zstd\n"
         "except ImportError:\n"
@@ -164,7 +199,7 @@ def find_python(extra_candidates: list[str] | None = None) -> tuple[str, bool, s
         if _runs(c, ['-c', probe]):
             if ready is None or _win_ver_rank(ver) > _win_ver_rank(ready[1]):
                 ready = (c, ver)
-        elif fallback is None or _win_ver_rank(ver) > _win_ver_rank(fallback[1]):
+        elif _usable_venv_base(c, ver) and (fallback is None or _win_ver_rank(ver) > _win_ver_rank(fallback[1])):
             fallback = (c, ver)
     if ready:
         return (ready[0], True, ready[1])
@@ -191,14 +226,14 @@ def venv_base(preferred: str) -> str | None:
             preferred = str(sub)
     if preferred and p.is_file() and os.access(preferred, os.X_OK):
         v = _python_version(preferred)
-        if v and _ver_tuple(v) >= MIN_PYTHON:
+        if v and _usable_venv_base(preferred, v):
             return preferred
     best: tuple[str, str] | None = None
     for c in python_candidates():
         if not c or not Path(c).is_file() or not os.access(c, os.X_OK):
             continue
         v = _python_version(c)
-        if not v or _ver_tuple(v) < MIN_PYTHON:
+        if not v or not _usable_venv_base(c, v):
             continue
         if best is None or _win_ver_rank(v) > _win_ver_rank(best[1]):
             best = (c, v)
@@ -236,6 +271,9 @@ def _runs(exe: str, args: list[str]) -> bool:
         return False
 
 
+_ORIG_RUNS = _runs
+
+
 def venv_dir() -> Path:
     if IS_WIN:
         base = Path(os.environ.get('LOCALAPPDATA', Path.home() / 'AppData' / 'Local'))
@@ -247,6 +285,126 @@ def venv_dir() -> Path:
 def venv_python() -> str:
     v = venv_dir()
     return str(v / ('Scripts/python.exe' if IS_WIN else 'bin/python3'))
+
+
+def _is_under_dir(candidate: Path, root: Path) -> bool:
+    """Return whether `candidate` resides under `root`, resolving parents without dereferencing leaf symlinks."""
+    try:
+        cand_real = Path(
+            os.path.normcase(os.path.abspath(os.path.join(os.path.realpath(candidate.parent), candidate.name)))
+        )
+        root_real = Path(os.path.normcase(os.path.abspath(os.path.realpath(root))))
+        cand_real.relative_to(root_real)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def is_app_managed_python(py: str) -> bool:
+    """Return whether `py` belongs to the launcher's own venv or Windows app-managed Python."""
+    if not py:
+        return False
+    p = Path(os.path.abspath(py))
+    if _is_under_dir(p, venv_dir()):
+        return True
+    if IS_WIN:
+        local_app = Path(os.environ.get('LOCALAPPDATA', str(Path.home() / 'AppData' / 'Local')))
+        tools_root = local_app / 'NS Port Builder' / 'tools'
+        if _is_under_dir(p, tools_root):
+            return True
+    return False
+
+
+def _marker_in_tree(root: Path) -> bool:
+    """Check typical PEP 668 `EXTERNALLY-MANAGED` marker locations under an interpreter prefix."""
+    direct = (
+        root / 'EXTERNALLY-MANAGED',
+        root / 'lib' / 'EXTERNALLY-MANAGED',
+        root / 'Lib' / 'EXTERNALLY-MANAGED',
+    )
+    if any(p.is_file() for p in direct):
+        return True
+    lib_dir = root / 'lib'
+    if lib_dir.is_dir():
+        try:
+            for sub in lib_dir.iterdir():
+                if sub.is_dir() and sub.name.startswith('python') and (sub / 'EXTERNALLY-MANAGED').is_file():
+                    return True
+        except OSError:
+            pass
+    return False
+
+
+def has_externally_managed_marker(py: str, *, env: Mapping[str, str] | None = None) -> bool:
+    """Return whether `py` is marked as externally managed per PEP 668."""
+    if not py:
+        return False
+    p = Path(os.path.abspath(py))
+    is_venv_layout = (p.parent.parent / 'pyvenv.cfg').is_file() or (p.parent / 'pyvenv.cfg').is_file()
+
+    if (p.parent / 'EXTERNALLY-MANAGED').is_file() or _marker_in_tree(p.parent.parent):
+        return True
+
+    if is_venv_layout:
+        # A venv isolates its own site-packages from the base interpreter's EXTERNALLY-MANAGED marker.
+        return False
+
+    try:
+        resolved = p.resolve()
+        if (resolved.parent / 'EXTERNALLY-MANAGED').is_file() or _marker_in_tree(resolved.parent.parent):
+            return True
+    except OSError:
+        pass
+
+    if not p.is_file():
+        return False
+
+    probe = (
+        'import os, sys, sysconfig; '
+        'p = sysconfig.get_path("stdlib") or ""; '
+        'm = os.path.join(p, "EXTERNALLY-MANAGED") if p else ""; '
+        'v = sys.prefix != sys.base_prefix; '
+        'print("1" if (not v and m and os.path.isfile(m)) else "0")'
+    )
+    try:
+        r = subprocess.run(
+            [str(p), '-c', probe],
+            capture_output=True,
+            text=True,
+            errors='replace',
+            timeout=10,
+            env=dict(env) if env is not None else child_env(),
+            **no_window_kwargs(),
+        )
+        return r.returncode == 0 and r.stdout.strip() == '1'
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def find_standalone_nsz(env: Mapping[str, str] | None = None) -> str | None:
+    """Return a standalone nsz >= 5.0 executable on PATH (supports `--keys`), or None."""
+    run_env = dict(env) if env is not None else child_env()
+    search_path = run_env.get('PATH')
+    for name in ('nsz', 'nsz-cli-macos-arm64'):
+        exe = shutil.which(name, path=search_path)
+        if not exe:
+            continue
+        exe_abs = str(Path(exe).absolute())
+        try:
+            r = subprocess.run(
+                [exe_abs, '--help'],
+                capture_output=True,
+                text=True,
+                errors='replace',
+                timeout=30,
+                env=run_env,
+                **no_window_kwargs(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if r.returncode == 0 and '--keys' in (r.stdout or ''):
+            return exe_abs
+    return None
 
 
 # ---------------------------------------------------------------- dotnet
@@ -362,6 +520,11 @@ def child_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     is_frozen = bool(getattr(sys, 'frozen', False) or meipass)
     env.pop('_MEIPASS', None)
     env.pop('_MEIPASS2', None)
+    env.pop('VIRTUAL_ENV', None)
+    env.pop('PYTHONSTARTUP', None)
+    env.pop('PIP_USER', None)
+    env.pop('PIP_TARGET', None)
+    env.pop('PIP_REQUIRE_VIRTUALENV', None)
     if is_frozen:
         for k in ('PYTHONHOME', 'QT_PLUGIN_PATH', 'QML2_IMPORT_PATH'):
             env.pop(k, None)
@@ -400,6 +563,68 @@ def child_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+_PROXY_KEY_PAIRS: tuple[tuple[str, str], ...] = (
+    ('http_proxy', 'HTTP_PROXY'),
+    ('https_proxy', 'HTTPS_PROXY'),
+    ('all_proxy', 'ALL_PROXY'),
+    ('no_proxy', 'NO_PROXY'),
+)
+_ACTIVE_PROXY_KEYS: frozenset[str] = frozenset({
+    'http_proxy', 'HTTP_PROXY',
+    'https_proxy', 'HTTPS_PROXY',
+    'all_proxy', 'ALL_PROXY',
+})
+
+
+def proxy_env(
+    base_env: Mapping[str, str] | None = None,
+    *,
+    system_proxies: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Return a child env with paired proxy variables, falling back to OS system proxy settings."""
+    env = dict(base_env) if base_env is not None else child_env()
+    has_explicit = False
+    for low_key, up_key in _PROXY_KEY_PAIRS:
+        val = str(env.get(low_key) or env.get(up_key) or '').strip()
+        if val:
+            env[low_key] = val
+            env[up_key] = val
+            if low_key in _ACTIVE_PROXY_KEYS:
+                has_explicit = True
+    if not has_explicit:
+        sys_p: Mapping[str, str] = {}
+        if system_proxies is not None:
+            sys_p = system_proxies
+        else:
+            try:
+                sys_p = urllib.request.getproxies()
+            except Exception:
+                sys_p = {}
+        applied = False
+        http_val = str(sys_p.get('http') or '').strip()
+        https_val = str(sys_p.get('https') or '').strip()
+        socks_val = str(sys_p.get('socks') or sys_p.get('all') or '').strip()
+        no_val = str(sys_p.get('no') or '').strip()
+        if http_val and not env.get('http_proxy'):
+            env['http_proxy'] = http_val
+            env['HTTP_PROXY'] = http_val
+            applied = True
+        if https_val and not env.get('https_proxy'):
+            env['https_proxy'] = https_val
+            env['HTTPS_PROXY'] = https_val
+            applied = True
+        if not applied and socks_val and not env.get('all_proxy'):
+            if '://' not in socks_val:
+                socks_val = f'socks5h://{socks_val}'
+            env['all_proxy'] = socks_val
+            env['ALL_PROXY'] = socks_val
+            applied = True
+        if applied and no_val and not env.get('no_proxy'):
+            env['no_proxy'] = no_val
+            env['NO_PROXY'] = no_val
+    return env
+
+
 def short_path(p: str) -> str:
     """Home shown as ~ (keeps the account name out of screenshots)."""
     home = str(Path.home())
@@ -411,6 +636,108 @@ def no_window_kwargs() -> dict:
     if IS_WIN:
         return {'creationflags': subprocess.CREATE_NO_WINDOW}
     return {}
+
+
+def process_group_kwargs() -> dict:
+    """Start a child process in its own process group so descendants can be terminated together."""
+    if IS_WIN:
+        if hasattr(subprocess, 'CREATE_NEW_PROCESS_GROUP') or hasattr(subprocess, 'CREATE_NO_WINDOW'):
+            flags = (
+                getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
+                | getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+            )
+            return {'creationflags': flags}
+        return {'start_new_session': True}
+    return {'start_new_session': True}
+
+
+def kill_process_tree(proc: subprocess.Popen | None, *, grace_sec: float = 0.2) -> None:
+    """Terminate `proc` and all of its descendants so inherited stdout/stderr pipes close immediately."""
+    if proc is None:
+        return
+    pid = getattr(proc, 'pid', None)
+    valid_pid = isinstance(pid, int) and pid > 1
+    poll_fn = getattr(proc, 'poll', None)
+    kill_fn = getattr(proc, 'kill', None)
+    term_fn = getattr(proc, 'terminate', None)
+    wait_fn = getattr(proc, 'wait', None)
+
+    if IS_WIN:
+        if valid_pid:
+            try:
+                subprocess.run(
+                    ['taskkill', '/F', '/T', '/PID', str(pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                    **no_window_kwargs(),
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+        try:
+            still_alive = (poll_fn() is None) if callable(poll_fn) else True
+            if still_alive and callable(kill_fn):
+                kill_fn()
+                if callable(wait_fn):
+                    try:
+                        wait_fn(timeout=0.5)
+                    except (TypeError, subprocess.SubprocessError):
+                        pass
+        except OSError:
+            pass
+        return
+
+    if valid_pid and hasattr(os, 'killpg'):
+        own_pgid = os.getpgrp() if hasattr(os, 'getpgrp') else -1
+        if pid != os.getpid() and pid != own_pgid:
+            sent_group = False
+            try:
+                os.killpg(pid, signal.SIGTERM)
+                sent_group = True
+            except ProcessLookupError:
+                pass
+            except OSError:
+                pass
+            if sent_group:
+                deadline = time.monotonic() + max(0.0, grace_sec)
+                while time.monotonic() < deadline:
+                    if callable(poll_fn):
+                        try:
+                            poll_fn()
+                        except OSError:
+                            pass
+                    try:
+                        os.killpg(pid, 0)
+                    except ProcessLookupError:
+                        sent_group = False
+                        break
+                    except OSError:
+                        break
+                    time.sleep(0.02)
+                if sent_group:
+                    try:
+                        os.killpg(pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+    try:
+        still_alive = (poll_fn() is None) if callable(poll_fn) else False
+        if still_alive:
+            if callable(term_fn):
+                term_fn()
+            if callable(wait_fn):
+                try:
+                    wait_fn(timeout=max(0.05, grace_sec))
+                except subprocess.TimeoutExpired:
+                    if callable(kill_fn):
+                        kill_fn()
+                    try:
+                        wait_fn(timeout=0.5)
+                    except (TypeError, subprocess.SubprocessError):
+                        pass
+                except TypeError:
+                    pass
+    except OSError:
+        pass
 
 
 _ORIG_POPEN_INIT = subprocess.Popen.__init__
@@ -433,14 +760,14 @@ def reveal(path: str | Path | None) -> bool:
             return False
     if p.is_dir() and (p / 'romfs.img').is_file():
         target = (p / 'romfs.img').resolve()
-        is_file = True
+        select_item = True
     else:
         target = p.resolve()
-        is_file = target.is_file()
+        select_item = target.is_file() or target.suffix.lower() in ('.framework', '.app')
 
     if IS_WIN:
         norm = os.path.normpath(str(target))
-        if is_file:
+        if select_item:
             try:
                 import ctypes
                 shell32 = ctypes.windll.shell32
@@ -468,7 +795,7 @@ def reveal(path: str | Path | None) -> bool:
                 return True
             except OSError:
                 pass
-        folder_norm = os.path.normpath(str(target.parent if is_file else target))
+        folder_norm = os.path.normpath(str(target.parent if select_item else target))
         if hasattr(os, 'startfile'):
             try:
                 os.startfile(folder_norm)  # type: ignore[attr-defined]
@@ -477,7 +804,7 @@ def reveal(path: str | Path | None) -> bool:
                 pass
     elif IS_MAC:
         try:
-            cmd = ['/usr/bin/open', '-R', str(target)] if is_file else ['/usr/bin/open', str(target)]
+            cmd = ['/usr/bin/open', '-R', str(target)] if select_item else ['/usr/bin/open', str(target)]
             subprocess.Popen(cmd)
             return True
         except OSError:
@@ -486,7 +813,7 @@ def reveal(path: str | Path | None) -> bool:
     try:
         from PySide6.QtCore import QUrl
         from PySide6.QtGui import QDesktopServices
-        open_dir = target.parent if is_file else target
+        open_dir = target.parent if select_item else target
         return bool(QDesktopServices.openUrl(QUrl.fromLocalFile(str(open_dir))))
     except Exception:
         return False

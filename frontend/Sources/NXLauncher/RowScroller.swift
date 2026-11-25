@@ -8,9 +8,14 @@ package final class RowScroller: ObservableObject {
     @Published package private(set) var canForward = false
     private weak var scrollView: NSScrollView?
     private var observers: [NSObjectProtocol] = []
+    private var pendingScrollToStart = false
 
     package func attach(_ view: NSScrollView) {
-        guard view !== scrollView else { return update() }
+        guard view !== scrollView else {
+            if pendingScrollToStart { scrollToStart() }
+            else { update() }
+            return
+        }
         observers.forEach(NotificationCenter.default.removeObserver)
         scrollView = view
         let clip = view.contentView
@@ -19,8 +24,28 @@ package final class RowScroller: ObservableObject {
         view.documentView?.postsFrameChangedNotifications = true
         observers = [(NSView.boundsDidChangeNotification, clip), (NSView.frameDidChangeNotification, clip),
                      (NSView.frameDidChangeNotification, view.documentView as Any)].map { name, object in
-            NotificationCenter.default.addObserver(forName: name, object: object, queue: .main) { [weak self] _ in self?.update() }
+            NotificationCenter.default.addObserver(forName: name, object: object, queue: .main) { [weak self] _ in
+                DispatchQueue.main.async { [weak self] in self?.update() }
+            }
         }
+        if pendingScrollToStart {
+            pendingScrollToStart = false
+            clip.setBoundsOrigin(NSPoint(x: 0, y: clip.bounds.minY))
+            view.reflectScrolledClipView(clip)
+        }
+        update()
+    }
+
+    /// Scrolls the row immediately back to its leading edge, or queues the reset until attached.
+    package func scrollToStart() {
+        guard let view = scrollView else {
+            pendingScrollToStart = true
+            return
+        }
+        pendingScrollToStart = false
+        let clip = view.contentView
+        clip.setBoundsOrigin(NSPoint(x: 0, y: clip.bounds.minY))
+        view.reflectScrolledClipView(clip)
         update()
     }
 

@@ -60,7 +60,7 @@ class CommittedCatalogs(unittest.TestCase):
 
     def test_every_language_has_every_shell_text(self):
         codes = C.apple_codes(self.languages)
-        self.assertEqual(sorted(codes), sorted(['en', 'zh-Hans', 'de', 'sv', 'fr', 'it', 'ja']))
+        self.assertEqual(sorted(codes), sorted(['en', 'zh-Hans', 'de', 'sv', 'fr', 'it', 'ja', 'es', 'ko', 'pt-BR']))
         for target in C.CATALOGS:
             for key, entry in json.loads(C.catalog_path(target).read_text(encoding='utf-8'))['strings'].items():
                 self.assertEqual(sorted(entry['localizations']), sorted(codes), f'{target}: {key} lacks a language')
@@ -83,14 +83,12 @@ class CommittedCatalogs(unittest.TestCase):
         block = re.search(r'<key>CFBundleLocalizations</key>\s*<array>(.*?)</array>', plist, re.S)
         self.assertEqual(re.findall(r'<string>([^<]*)</string>', block.group(1)), codes, 'Demo/Gen/Info.plist is out of step with project.yml')
 
-    def test_the_shell_app_of_the_engine_declares_every_language_of_the_files(self):
-        project = ROOT / 'engine' / 'dm' / 'ios' / 'project-shell.yml'
-        if not project.exists():
-            self.skipTest('engine/ is not built (python3 tools/engine.py sync)')
+    def test_the_shell_app_declares_every_language_of_the_files(self):
+        project = ROOT / 'frontend-ios' / 'Shell' / 'project-shell.yml'
         declared = re.search(r'CFBundleLocalizations:\s*\[([^\]]*)\]', project.read_text(encoding='utf-8'))
-        self.assertIsNotNone(declared, 'dm/ios/project-shell.yml has no CFBundleLocalizations')
+        self.assertIsNotNone(declared, 'frontend-ios/Shell/project-shell.yml has no CFBundleLocalizations')
         self.assertEqual([c.strip() for c in declared.group(1).split(',')], C.apple_codes(self.languages),
-                         'dm/ios/project-shell.yml: CFBundleLocalizations are the language files, en first (a patch in patches/)')
+                         'frontend-ios/Shell/project-shell.yml: CFBundleLocalizations are the language files, en first')
 
     def test_try_local_declares_every_language_of_the_files(self):
         text = (TOOLS / 'try-local').read_text(encoding='utf-8')

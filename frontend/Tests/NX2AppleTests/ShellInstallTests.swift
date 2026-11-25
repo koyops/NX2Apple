@@ -141,14 +141,16 @@ import NXModel
 
     /// The failure of the report: the repo is an engine in the store (no frontend-ios in it), the release app carries the package.
     func testStoreEngineGetsTheBundledPackage() throws {
-        let store = try makeTree(["engine/id/dm/ios/tools/build_shell.sh"]) + "/engine/id"
-        let bundle = try makeTree(["frontend-ios/Package.swift", "frontend-ios/AppIcon.icon/icon.json"])
+        let store = try makeTree(["engine/id/dm/gfx/nvn/dmsh_chain.h"]) + "/engine/id"
+        let bundle = try makeTree(["frontend-ios/Package.swift", "frontend-ios/AppIcon.icon/icon.json", "frontend-ios/Shell/build_shell.sh"])
         let package = try XCTUnwrap(ShellInstall.shellPackage(resources: bundle, repo: store))
         let env = ShellInstall.projectEnvironment(root: "/R", frameworks: [], bundleID: "b", team: "T", python: "/py", path: "/p",
-                                                  home: "/h", user: "u", package: package)
+                                                  home: "/h", user: "u", package: package, engine: store)
         let path = try XCTUnwrap(env["DM_SHELL_PACKAGE"])
         XCTAssertTrue(FileManager.default.fileExists(atPath: path + "/Package.swift"))
         XCTAssertTrue(FileManager.default.fileExists(atPath: path + "/AppIcon.icon"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: path + "/Shell/build_shell.sh"))
+        XCTAssertEqual(env["DM_ENGINE_DIR"], store)
         XCTAssertFalse(path.hasPrefix(store))
         XCTAssertNil(ShellInstall.projectEnvironment(root: "/R", frameworks: [], bundleID: "b", team: "T", python: "/py", path: "/p",
                                                      home: "/h", user: "u")["DM_SHELL_PACKAGE"])
@@ -180,7 +182,7 @@ import NXModel
         let root = "/R/NX2Apple-shell"
         XCTAssertEqual(ShellInstall.buildArguments(workDir: "/W", team: "T"), ["--shell-framework", "/W/shell-framework", "--team-id", "T"])
         XCTAssertEqual(ShellInstall.frameworkPath(workDir: "/W", titleID: "01"), "/W/shell-framework/DmGame01.framework")
-        XCTAssertEqual(ShellInstall.projectCommand(repo: "/repo"), ["/bin/bash", "/repo/dm/ios/tools/build_shell.sh", "--prepare-xcode"])
+        XCTAssertEqual(ShellInstall.projectCommand(package: "/pkg/frontend-ios"), ["/bin/bash", "/pkg/frontend-ios/Shell/build_shell.sh", "--prepare-xcode"])
         let env = ShellInstall.projectEnvironment(root: root, frameworks: ["/f/a", "/f/b"], bundleID: "org.nxnative.shell", team: "T",
                                                   python: "/py", path: "/opt/homebrew/bin:/usr/bin", home: "/h", user: "u")
         XCTAssertEqual(env, ["SHELL_DIR": root + "/project", "DM_SHELL_FRAMEWORKS": "/f/a\n/f/b", "DM_BUNDLE_ID": "org.nxnative.shell",
@@ -201,7 +203,7 @@ import NXModel
         let copy = ShellInstall.copyCommand(xcrun: "/x", device: "D", bundleID: "b", titleID: "01", source: "/a/aoc/1.img", relativePath: "aoc/1.img")
         XCTAssertEqual(copy, ["/x", "devicectl", "device", "copy", "to", "--device", "D", "--source", "/a/aoc/1.img",
                               "--destination", "Documents/games/01/aoc/1.img", "--domain-type", "appDataContainer", "--domain-identifier", "b"])
-        for command in [build, list, copy, ShellInstall.projectCommand(repo: "/r"), ShellInstall.installCommand(xcrun: "/x", device: "D", app: "/a")] {
+        for command in [build, list, copy, ShellInstall.projectCommand(package: "/p"), ShellInstall.installCommand(xcrun: "/x", device: "D", app: "/a")] {
             XCTAssertFalse(command.contains("--remove-existing-content"))
         }
     }
@@ -280,7 +282,7 @@ import NXModel
                 XCTAssertFalse(text.contains(";") || text.contains("；"), key)
             }
         }
-        XCTAssertEqual(L10n.string("build.iosNote", .en), "One app on your iPhone or iPad for all your games.")
+        XCTAssertEqual(L10n.string("build.iosNote", .en), "One iOS app for all your games.")
     }
 
     // ---- the stand-ins ----
@@ -289,7 +291,8 @@ import NXModel
     private var container: String { path("device") }
     private var state: String { path("state") }
 
-    /// xcodebuild and devicectl as one script. `state/taken` makes the plain bundle ID "registered to another team".
+    /// xcodebuild and devicectl as one script. `state/taken` makes the plain bundle ID "registered to another team", `state/noprofile`
+    /// makes the bundle ID it holds have no profile.
     private func makeXcrun() throws -> String {
         try fm.createDirectory(atPath: state, withIntermediateDirectories: true)
         let xcrun = path("xcrun")
@@ -301,16 +304,47 @@ import NXModel
         open(STATE + '/calls.txt', 'a').write(' '.join(a) + '\\n')
         def val(flag): return a[a.index(flag) + 1] if flag in a else None
         if a[0] == 'xcodebuild':
+            pbx = val('-project') + '/project.pbxproj'
+            if os.path.exists(pbx):
+                import re
+                pdir = os.path.dirname(val('-project'))
+                for m in re.finditer(r'(?:path|relativePath) = "([^"]+)";', open(pbx).read()):
+                    pkg = m.group(1) if os.path.isabs(m.group(1)) else os.path.normpath(os.path.join(pdir, m.group(1)))
+                    if not os.path.isfile(pkg + '/Package.swift'):
+                        print('xcodebuild: error: Could not resolve package dependencies:', flush=True)
+                        sys.exit(74)
+            if os.path.exists(STATE + '/xcodebuild-error'):
+                sys.stderr.write(open(STATE + '/xcodebuild-error').read())
+                sys.exit(70)
             bundle = [x.split('=', 1)[1] for x in a if x.startswith('PRODUCT_BUNDLE_IDENTIFIER=')][0]
             if os.path.exists(STATE + '/taken') and bundle == 'org.nxnative.shell':
                 print('error: The app identifier "' + bundle + '" cannot be registered to your development team because it is not available. Change your bundle identifier to a unique string to try again.', flush=True)
                 sys.exit(65)
+            if os.path.exists(STATE + '/noprofile') and bundle == open(STATE + '/noprofile').read().strip():
+                print('error: No profiles for \\'' + bundle + '\\' were found: Xcode couldn\\'t find any iOS App Development provisioning profiles matching \\'' + bundle + '\\'.', flush=True)
+                sys.exit(65)
             if os.path.exists(STATE + '/nomemory') and not os.path.exists(os.path.dirname(val('-project')) + '/entitlements-empty'):
                 print('error: Provisioning profile iOS Team Provisioning Profile: ' + bundle + ' doesn\\'t include the Increased Memory Limit capability.', flush=True)
                 sys.exit(65)
+            if os.path.exists(STATE + '/fail-xcodebuild'):
+                print('error: Communication with Apple failed: Your device is offline.', flush=True)
+                sys.exit(65)
             app = val('-derivedDataPath') + '/Build/Products/Release-iphoneos/DmShell.app'
+            fwlist = os.path.dirname(val('-project')) + '/frameworks.txt'
+            if os.path.exists(fwlist):
+                for line in open(fwlist).read().splitlines():
+                    if not line.strip(): continue
+                    fw = line.split('\t')[1] if '\t' in line else line.strip()
+                    if not os.path.isdir(fw):
+                        print('error: ' + fw + ': No such file or directory (in target \\'DmShell\\' from project \\'DmShell\\')', flush=True)
+                        sys.exit(65)
+                    os.makedirs(app + '/Frameworks/' + os.path.basename(fw), exist_ok=True)
             os.makedirs(app, exist_ok=True)
             open(app + '/bundle.txt', 'w').write(bundle)
+            if os.path.exists(STATE + '/new-profile'):
+                shutil.copyfile(STATE + '/new-profile', app + '/embedded.mobileprovision')
+                os.makedirs(app + '/_CodeSignature', exist_ok=True)
+                open(app + '/_CodeSignature/CodeResources', 'w').write('new-sig')
             print('CodeSign ' + app, flush=True)
         elif a[:3] == ['devicectl', 'list', 'devices']:
             n = (int(open(STATE + '/list-count').read()) if os.path.exists(STATE + '/list-count') else 0) + 1
@@ -326,6 +360,9 @@ import NXModel
                 sys.exit(1)
             shutil.copyfile(src, val('--destination'))
         elif a[:3] == ['devicectl', 'device', 'install']:
+            if os.path.exists(STATE + '/fail-install'):
+                print('ERROR: The device was disconnected during installation.', flush=True)
+                sys.exit(1)
             app = a[-1]
             bundle = open(app + '/bundle.txt').read()
             os.makedirs(CONT + '/' + bundle + '/Documents', exist_ok=True)   # an existing container is kept as it is
@@ -373,7 +410,7 @@ import NXModel
     /// A checkout with a stand-in build_shell.sh: it records its environment, makes the project folder, and refuses when asked to.
     private func makeRepo() throws -> String {
         let repo = path("repo")
-        try write(repo + "/dm/ios/tools/build_shell.sh", """
+        try write(repo + "/frontend-ios/Shell/build_shell.sh", """
         #!/bin/bash
         [ "$1" = "--prepare-xcode" ] || { echo "FAIL: no --prepare-xcode"; exit 1; }
         if [ -f "\(state)/refuse" ]; then
@@ -382,10 +419,23 @@ import NXModel
           exit 1
         fi
         mkdir -p "$SHELL_DIR/DmShell.xcodeproj"
+        : > "$SHELL_DIR/frameworks.txt"
+        while IFS= read -r fw; do
+          [ -n "$fw" ] || continue
+          [ -d "$fw" ] || { echo "[RED] $fw: no readable game.manifest.json"; exit 1; }
+          [ -f "$fw/refuse-me" ] && { echo "[RED] $fw: built without a host in the framework (loader 'FR')"; exit 1; }
+          tid=$(basename "$fw" .framework); tid=${tid#DmGame}
+          printf '%s\t%s\t%s\n' "$tid" "$fw" "$tid" >> "$SHELL_DIR/frameworks.txt"
+        done <<< "$DM_SHELL_FRAMEWORKS"
+        cat > "$SHELL_DIR/DmShell.xcodeproj/project.pbxproj" <<EOF
+        F96F /* frontend-ios */ = {isa = PBXFileReference; name = "frontend-ios"; path = "$DM_SHELL_PACKAGE"; sourceTree = SOURCE_ROOT; };
+        376B /* XCLocalSwiftPackageReference */ = {isa = XCLocalSwiftPackageReference; relativePath = "$DM_SHELL_PACKAGE"; };
+        EOF
         env | sort > "\(state)/shell-env.txt"
         if [ "${DM_ENTITLEMENTS+set}" = set ] && [ -z "$DM_ENTITLEMENTS" ]; then touch "$SHELL_DIR/entitlements-empty"; else rm -f "$SHELL_DIR/entitlements-empty"; fi
         """)
         try write(repo + "/frontend-ios/Package.swift", "// swift-tools-version: 5.9\n")
+        try fm.createDirectory(atPath: repo + "/frontend-ios/Shell/App", withIntermediateDirectories: true)
         return repo
     }
 
@@ -675,6 +725,104 @@ import NXModel
         XCTAssertFalse(calls.contains { $0.hasPrefix("xcodebuild") || $0.hasPrefix("devicectl device") })   // nothing was signed or installed
     }
 
+    func testARefusedProjectLeavesShellJsonAsItWas() throws {
+        let f = try makeFixture()
+        let i = installer(f)
+        XCTAssertTrue(install(i, f).ok)
+        let before = try Data(contentsOf: URL(fileURLWithPath: ShellLibrary.stateFile(root: f.root)))
+        // A second game whose framework build_shell.sh rejects (an older build without a host in the framework, #392 follow-up)
+        let other = "0100AAAA00000000"
+        let framework = path("work2/shell-framework/DmGame\(other).framework")
+        try write(framework + "/game.manifest.json", "{}")
+        try write(framework + "/DmGame\(other)", "executable")
+        try write(state + "/refuse", "")
+        let r = i.install(framework: framework, titleID: other, name: "Other", archive: f.archive)
+        XCTAssertFalse(r.ok)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: ShellLibrary.stateFile(root: f.root))), before)
+        XCTAssertEqual(ShellLibrary.load(root: f.root).games.map(\.titleID), [titleID])
+        try fm.removeItem(atPath: state + "/refuse")
+        XCTAssertTrue(install(i, f).ok, "the next install of the first game is not blocked by the refused one")
+    }
+
+    func testARefusedReplacementKeepsTheMirrorThatWorked() throws {
+        let f = try makeFixture()
+        let i = installer(f)
+        XCTAssertTrue(install(i, f).ok)
+        let before = try Data(contentsOf: URL(fileURLWithPath: ShellLibrary.stateFile(root: f.root)))
+        // The game is rebuilt into a framework build_shell.sh rejects (an older build without a host in the framework)
+        try write(f.framework + "/refuse-me", "")
+        XCTAssertFalse(install(i, f).ok)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: ShellLibrary.stateFile(root: f.root))), before)
+        XCTAssertTrue(fm.fileExists(atPath: mirrored(f.root) + "/DmGame\(titleID)"))
+        XCTAssertFalse(fm.fileExists(atPath: mirrored(f.root) + "/refuse-me"), "the mirror is the framework that worked")
+        // Another game installs afterwards, with the first one's framework that worked
+        let other = "0100AAAA00000000"
+        let framework = path("work2/shell-framework/DmGame\(other).framework")
+        try write(framework + "/game.manifest.json", "{}")
+        try write(framework + "/DmGame\(other)", "executable")
+        let r = i.install(framework: framework, titleID: other, name: "Other", archive: f.archive)
+        XCTAssertTrue(r.ok, r.message)
+        XCTAssertEqual(ShellLibrary.load(root: f.root).games.map(\.titleID), [titleID, other])
+    }
+
+    func testATeamChangeRetriesUnderTheNewTeamsVariant() throws {
+        let f = try makeFixture()
+        try write(state + "/taken", "")
+        // Team A installed first and stored its own variant
+        var a = installer(f)
+        a.team = "AAAAAAAAAA"
+        let variantA = ShellLibrary.teamVariant(team: a.team)
+        XCTAssertTrue(install(a, f).ok)
+        XCTAssertEqual(ShellLibrary.load(root: f.root).bundleID, variantA)
+        // Team B is selected now: Xcode only says it has no profile for team A's variant
+        try write(state + "/noprofile", variantA)
+        let variantB = ShellLibrary.teamVariant(team: team)
+        let r = install(installer(f), f)
+        XCTAssertTrue(r.ok, r.message)
+        XCTAssertEqual(r.bundleID, variantB)
+        XCTAssertEqual(ShellLibrary.load(root: f.root).bundleID, variantB)
+        let builds = calls.filter { $0.hasPrefix("xcodebuild") }
+        XCTAssertTrue(builds[builds.count - 2].contains("PRODUCT_BUNDLE_IDENTIFIER=\(variantA) build"))
+        XCTAssertTrue(builds[builds.count - 1].contains("PRODUCT_BUNDLE_IDENTIFIER=\(variantB) build"))
+    }
+
+    func testTheRetryRuleIsApartFromTheCardRule() {
+        let a = "org.nxnative.shell.AAAAAAAAAA", b = "org.nxnative.shell.BBBBBBBBBB"
+        let noProfileA = "error: No profiles for '\(a)' were found"
+        XCTAssertTrue(ShellInstall.retryUnderTeamVariant(noProfileA, attempted: a, variant: b), "a team change still retries")
+        XCTAssertFalse(BuildFailureClassifier.signingTeamTaken(noProfileA), "but is not carded as registered to another team")
+        XCTAssertFalse(ShellInstall.retryUnderTeamVariant("error: No profiles for '\(b)' were found", attempted: b, variant: b))
+        XCTAssertTrue(ShellInstall.retryUnderTeamVariant("error: No profiles for 'org.nxnative.shell' were found",
+                                                         attempted: "org.nxnative.shell", variant: b))
+        XCTAssertTrue(ShellInstall.retryUnderTeamVariant("cannot be registered to your development team", attempted: a, variant: b))
+        XCTAssertFalse(ShellInstall.retryUnderTeamVariant("error: something else", attempted: a, variant: b))
+    }
+
+    func testARefusedFirstProjectLeavesNoShellJson() throws {
+        let f = try makeFixture()
+        try write(state + "/refuse", "")
+        XCTAssertFalse(install(installer(f), f).ok)
+        XCTAssertFalse(fm.fileExists(atPath: ShellLibrary.stateFile(root: f.root)))
+    }
+
+    func testTeamVariantSignedWithoutTheMemoryCapabilityIsStored() throws {
+        let f = try makeFixture()
+        try write(state + "/taken", "")
+        try write(state + "/nomemory", "")
+        let variant = ShellLibrary.teamVariant(team: team)
+        let r = install(installer(f), f)
+        XCTAssertTrue(r.ok, r.message)
+        XCTAssertTrue(r.noMemoryCapability)
+        XCTAssertEqual(r.bundleID, variant)
+        XCTAssertEqual(ShellLibrary.load(root: f.root).bundleID, variant)
+        let builds = calls.filter { $0.hasPrefix("xcodebuild") }
+        XCTAssertEqual(builds.count, 3)   // the plain identifier, the variant with the request, the variant without it
+        XCTAssertTrue(builds[2].contains("PRODUCT_BUNDLE_IDENTIFIER=\(variant) build"))
+        XCTAssertTrue(install(installer(f), f).ok)
+        XCTAssertTrue(calls.filter { $0.hasPrefix("xcodebuild") }[3].contains("PRODUCT_BUNDLE_IDENTIFIER=\(variant) build"),
+                      "the next install starts with the stored variant")
+    }
+
     func testMissingShellPackageStopsBeforeTheScript() throws {
         let f = try makeFixture()
         try fm.removeItem(atPath: f.repo + "/frontend-ios")
@@ -740,6 +888,56 @@ import NXModel
     }
 
     // ---- the connection ----
+
+    func testUnavailableDestinationShowsLocalizedRecoveryStepsAndKeepsTheLog() throws {
+        let f = try makeFixture()
+        let error = "xcodebuild: error: Unable to find a destination matching the provided destination specifier:"
+        let diagnostic = """
+        \(error)
+            { id:\(device) }
+
+        Destinations incompatible with the "DmShell" scheme:
+            { platform:macOS, arch:arm64e, id:MAC, name:My Mac, error:My Mac’s macOS platform doesn’t match DmShell.app’s supported platforms. }
+        """
+        try write(state + "/xcodebuild-error", diagnostic)
+        testDefaults.set(f.root, forKey: "shellRoot")
+        let messages: [(Lang, String, String)] = [
+            (.en, "Selected iPhone or iPad unavailable",
+             "Xcode cannot use the selected iPhone or iPad. Connect and unlock it, check Xcode’s Devices and Simulators, then select it again under Install on."),
+            (.zh, "所选 iPhone 或 iPad 不可用",
+             "Xcode 无法使用所选 iPhone 或 iPad。请连接并解锁设备，在 Xcode 的“设备与模拟器”中检查它，然后在“安装到”中重新选择。"),
+            (Lang("de"), "Ausgewähltes Gerät nicht verfügbar",
+             "Xcode kann das ausgewählte iPhone oder iPad nicht verwenden. Verbinde und entsperre es, prüfe es in Xcodes „Devices and Simulators“ und wähle es unter „Installieren auf“ erneut aus.")
+        ]
+        for (lang, summary, message) in messages {
+            let stores = try makeModel(f)
+            let model = stores.build
+            stores.localizer.lang = lang
+            stores.deviceStore.readTeams = { [SigningTeam(id: "TEAM123456", identity: "")] }
+
+            let stopped = expectation(description: "The sign step failed")
+            let token = model.$running.dropFirst().filter { !$0 }.prefix(1).sink { _ in stopped.fulfill() }
+            model.installShell(framework: f.framework, titleID: titleID, name: "Test Game", archive: f.archive)
+            wait(for: [stopped], timeout: 30)
+            withExtendedLifetime(token) {}
+
+            XCTAssertEqual(model.doneNote, message, lang.code)
+            XCTAssertEqual(model.stages.first(where: { $0.id == ShellInstaller.signStageID })?.detail, summary, lang.code)
+            XCTAssertTrue(model.log.text.contains(diagnostic), "The full Xcode diagnostic remains available in the build log")
+        }
+    }
+
+    func testOtherXcodeFailuresStillShowTheLastError() throws {
+        let f = try makeFixture()
+        try write(state + "/xcodebuild-error", """
+        /fixture/Shell.swift:4:12: error: cannot find 'ShellConfig' in scope
+        /fixture/Shell.swift:8:12: error: cannot find 'startShell' in scope
+        ** BUILD FAILED **
+        """)
+        let result = install(installer(f), f)
+        XCTAssertFalse(result.ok)
+        XCTAssertEqual(result.message, "Signing failed: /fixture/Shell.swift:8:12: error: cannot find 'startShell' in scope")
+    }
 
     func testConnectionFromTheRealDeviceList() throws {
         let real = """
@@ -878,6 +1076,150 @@ import NXModel
         XCTAssertEqual(installer(f).installData(titleID: titleID, archive: f.archive).message, "Installed on Z, the game data was already on the device")
     }
 
+    // ---- a file larger than one part (#899) ----
+
+    func testPartNamesSizesAndWhatToSend() throws {
+        XCTAssertEqual(ShellDataParts.partSize, 512 << 20)
+        XCTAssertEqual(ShellDataParts.name(of: "romfs.img", index: 3, count: 9), "romfs.img.nxpart.0003.0009")
+        XCTAssertEqual(ShellDataParts.name(of: "aoc/1.img", index: 0, count: 2), "aoc/1.img.nxpart.0000.0002")
+        XCTAssertTrue(ShellDataParts.isPart("romfs.img.nxpart.0000.0002", of: "romfs.img"))
+        XCTAssertFalse(ShellDataParts.isPart("romfs.img", of: "romfs.img"))
+        XCTAssertEqual(ShellDataParts.count(size: 10, partSize: 4), 3)
+        XCTAssertEqual(ShellDataParts.count(size: 8, partSize: 4), 2)
+        XCTAssertEqual(ShellDataParts.count(size: 0, partSize: 4), 1)
+        XCTAssertEqual(ShellDataParts.range(index: 2, size: 10, partSize: 4).offset, 8)
+        XCTAssertEqual(ShellDataParts.range(index: 2, size: 10, partSize: 4).length, 2)
+        // 8 GB of memory: up to 2 GB whole, never less than one part
+        XCTAssertEqual(ShellDataParts.singleCopyLimit(physicalMemory: 8 << 30), 2 << 30)
+        XCTAssertEqual(ShellDataParts.singleCopyLimit(physicalMemory: 1 << 30), ShellDataParts.partSize)
+
+        let local: [String: Int64] = ["romfs.img": 10, "aoc/1.img": 4]
+        XCTAssertEqual(ShellDataParts.toCopy(local: local, device: [:], splitAbove: 4, partSize: 4),
+                       [.whole("aoc/1.img"), .part("romfs.img", index: 0, count: 3), .part("romfs.img", index: 1, count: 3),
+                        .part("romfs.img", index: 2, count: 3)])
+        // parts on the device with their size are not sent again, a short one is
+        XCTAssertEqual(ShellDataParts.toCopy(local: local, device: ["aoc/1.img": 4, "romfs.img.nxpart.0000.0003": 4, "romfs.img.nxpart.0001.0003": 3],
+                                             splitAbove: 4, partSize: 4),
+                       [.part("romfs.img", index: 1, count: 3), .part("romfs.img", index: 2, count: 3)])
+        // the whole file on the device needs nothing, parts or not
+        XCTAssertEqual(ShellDataParts.toCopy(local: local, device: ["aoc/1.img": 4, "romfs.img": 10], splitAbove: 4, partSize: 4), [])
+        XCTAssertEqual(ShellDataParts.toCopy(local: local, device: [:], splitAbove: 10, partSize: 4), [.whole("aoc/1.img"), .whole("romfs.img")])
+        XCTAssertEqual(ShellDataParts.bytes(of: .part("romfs.img", index: 2, count: 3), local: local, partSize: 4), 2)
+
+        XCTAssertTrue(ShellDataParts.joinsParts(features: "data-parts 1\n"))
+        XCTAssertFalse(ShellDataParts.joinsParts(features: "data-parts 10\n"))
+        XCTAssertFalse(ShellDataParts.joinsParts(features: nil))
+    }
+
+    func testWritePartCutsTheRightBytes() throws {
+        let source = path("big.bin"), out = path("part.bin")
+        let bytes = Data((0..<250).map { UInt8($0) })
+        try bytes.write(to: URL(fileURLWithPath: source))
+        try ShellDataParts.writePart(source: source, index: 1, size: Int64(bytes.count), partSize: 100, to: out)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: out)), bytes[100..<200])
+        try ShellDataParts.writePart(source: source, index: 2, size: Int64(bytes.count), partSize: 100, to: out)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: out)), bytes[200..<250])
+    }
+
+    /// What the shared app does at its start (frontend-ios `DataParts`), for the fake device: the parts in order, then removed.
+    private func joinOnDevice(_ folder: String, file: String) throws {
+        let names = try fm.contentsOfDirectory(atPath: folder).filter { ShellDataParts.isPart($0, of: file) }.sorted()
+        var whole = Data()
+        for name in names { whole += try Data(contentsOf: URL(fileURLWithPath: folder + "/" + name)); try fm.removeItem(atPath: folder + "/" + name) }
+        try whole.write(to: URL(fileURLWithPath: folder + "/" + file))
+    }
+
+    func testALargeFileGoesInPartsAndAStoppedSendResumes() throws {
+        let f = try makeFixture()
+        let games = container + "/org.nxnative.shell/Documents/games/\(titleID)"
+        var i = installer(f)
+        i.partSize = 4
+        var log = ""
+        i.log = { log += $0 }
+        try write(state + "/fail-on", "romfs.img.nxpart.0001.0003")   // the device locks during the second part
+        var r = install(i, f)
+        XCTAssertEqual(r.failure, .shellDataIncomplete)
+        XCTAssertTrue(log.contains("The large files go over in 3 parts. The shared app joins them when it next opens."), log)
+        XCTAssertEqual(try String(contentsOfFile: games + "/romfs.img.nxpart.0000.0003"), "0123")
+        XCTAssertFalse(fm.fileExists(atPath: games + "/romfs.img"), "the whole file never goes over")
+        XCTAssertEqual(try String(contentsOfFile: games + "/aoc/1.img"), "abcd", "a file of one part goes whole")
+
+        try fm.removeItem(atPath: state + "/fail-on")
+        let before = copies().count
+        r = i.installData(titleID: titleID, archive: f.archive)
+        XCTAssertTrue(r.ok, r.message)
+        XCTAssertEqual(copies().count - before, 2, "the short second part and the third, not the first")
+        XCTAssertEqual(r.copied, 2)
+        XCTAssertEqual(try String(contentsOfFile: games + "/romfs.img.nxpart.0001.0003"), "4567")
+        XCTAssertEqual(try String(contentsOfFile: games + "/romfs.img.nxpart.0002.0003"), "89")
+
+        // before the app has joined them, the parts count as the data
+        XCTAssertEqual(i.installData(titleID: titleID, archive: f.archive).copied, 0)
+        // and after
+        try joinOnDevice(games, file: "romfs.img")
+        XCTAssertEqual(try String(contentsOfFile: games + "/romfs.img"), "0123456789")
+        let after = i.installData(titleID: titleID, archive: f.archive)
+        XCTAssertEqual(after.copied, 0)
+        XCTAssertEqual(after.message, "Installed on Z, the game data was already on the device")
+    }
+
+    func testSendingToAnAppThatMayNotJoinPartsSplitsOnlyWhatCannotGoWhole() throws {
+        let f = try makeFixture()
+        let docs = container + "/org.nxnative.shell/Documents"
+        let games = docs + "/games/\(titleID)"
+        try fm.createDirectory(atPath: docs, withIntermediateDirectories: true)
+        var i = installer(f)
+        i.partSize = 4
+        i.singleCopyLimit = 100
+        // an app that never said it joins parts: the 10-byte image fits one copy, so it goes whole
+        XCTAssertEqual(i.copyGameData(titleID: titleID, archive: f.archive, app: "", bundleID: "org.nxnative.shell",
+                                      outcome: .init(ok: true, message: "")).copied, 2)
+        XCTAssertEqual(try String(contentsOfFile: games + "/romfs.img"), "0123456789")
+        XCTAssertTrue(calls.contains { $0.contains("--source Documents/shell-features.txt") })
+
+        // too large for one copy: parts all the same
+        try fm.removeItem(atPath: games)
+        i.singleCopyLimit = 4
+        XCTAssertEqual(i.copyGameData(titleID: titleID, archive: f.archive, app: "", bundleID: "org.nxnative.shell",
+                                      outcome: .init(ok: true, message: "")).copied, 4)
+        XCTAssertTrue(fm.fileExists(atPath: games + "/romfs.img.nxpart.0002.0003"))
+
+        // an app that says it joins parts gets them for any file larger than one part
+        try fm.removeItem(atPath: games)
+        i.singleCopyLimit = 100
+        try write(docs + "/shell-features.txt", "data-parts 1\n")
+        XCTAssertEqual(i.copyGameData(titleID: titleID, archive: f.archive, app: "", bundleID: "org.nxnative.shell",
+                                      outcome: .init(ok: true, message: "")).copied, 4)
+        XCTAssertFalse(fm.fileExists(atPath: games + "/romfs.img"))
+    }
+
+    func testPartsOfAnotherImageAreSentAgain() throws {
+        let f = try fixtureWithRomFSTool()
+        let image = URL(fileURLWithPath: f.archive + "/romfs.img")
+        let games = container + "/org.nxnative.shell/Documents/games/\(titleID)"
+        try romfsImage().write(to: image)   // 58 bytes: 4 parts of 16
+        var i = installer(f)
+        i.partSize = 16
+        try write(state + "/fail-on", "romfs.img.nxpart.0003.0004")
+        XCTAssertEqual(install(i, f).failure, .shellDataIncomplete)
+        try fm.removeItem(atPath: state + "/fail-on")
+
+        // the same image: the three parts that went over stay
+        var before = copies().count
+        XCTAssertTrue(i.installData(titleID: titleID, archive: f.archive).ok)
+        XCTAssertEqual(copies().count - before, 1)
+
+        // another image of the same size: every part goes again
+        let update = romfsImage(index: 1)
+        try update.write(to: image)
+        before = copies().count
+        XCTAssertTrue(i.installData(titleID: titleID, archive: f.archive).ok)
+        XCTAssertEqual(copies().count - before, 4)
+        try joinOnDevice(games, file: "romfs.img")
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: games + "/romfs.img")), update)
+        XCTAssertEqual(i.installData(titleID: titleID, archive: f.archive).message, "Z already has this version of the game data.")
+    }
+
     // ---- through the model: the build with the third target, and the re-sign ----
 
     @MainActor func testBuildWithTheShellTargetInstallsAndResignsTheSharedApp() throws {
@@ -886,6 +1228,7 @@ import NXModel
         let modelStores = LauncherStores(xcrun: f.xcrun, defaults: testDefaults); let model = modelStores.build
         modelStores.repo.path = f.repo
         model.target = "ios"
+        model.home = path("home")
         model.outDir = path("out")
         modelStores.dependencies.pythonPath = "/usr/bin/python3"
         modelStores.dependencies.dotnetPath = "/usr/bin/true"
@@ -926,12 +1269,87 @@ import NXModel
         XCTAssertTrue(fm.fileExists(atPath: games + "/romfs.img"))
         XCTAssertEqual(ShellLibrary.load(root: f.root).games.map(\.titleID), [titleID])
 
-        // the re-sign after seven days: same project, same identifier, same app
+        // the re-sign after seven days: same project, same identifier, same app, even if the project was generated from an
+        // unmounted Gatekeeper AppTranslocation path or a moved launcher bundle
+        let pbxPath = f.root + "/project/DmShell.xcodeproj/project.pbxproj"
+        XCTAssertFalse((try String(contentsOfFile: pbxPath, encoding: .utf8)).contains(f.repo))
+        let translocated = "/private/var/folders/xx/T/AppTranslocation/2CFF0344-0DA8/d/NX2Apple.app/Contents/Resources/frontend-ios"
+        try write(pbxPath, """
+        F96F /* frontend-ios */ = {isa = PBXFileReference; name = "frontend-ios"; path = "../../../../../../../\(translocated.dropFirst())"; sourceTree = SOURCE_ROOT; };
+        376B /* XCLocalSwiftPackageReference */ = {isa = XCLocalSwiftPackageReference; relativePath = "\(translocated)"; };
+        """)
+        let pkgLink = f.root + "/project/frontend-ios", shellLink = f.root + "/project/Shell"
+        try? fm.removeItem(atPath: pkgLink); try? fm.removeItem(atPath: shellLink)
+        try fm.createSymbolicLink(atPath: pkgLink, withDestinationPath: translocated)
+        try fm.createSymbolicLink(atPath: shellLink, withDestinationPath: "/private/var/folders/xx/T/AppTranslocation/2CFF0344-0DA8/Shell")
         try write(container + "/org.nxnative.shell/Documents/save/slot1.bin", "my save")
+        model.home = path("home")
+        let cachedProfiles = model.home + "/Library/Developer/Xcode/UserData/Provisioning Profiles"
+        try fm.createDirectory(atPath: cachedProfiles, withIntermediateDirectories: true)
+        let staleExpiry = Date(timeIntervalSince1970: 1_900_000_000)
+        let freshExpiry = Date(timeIntervalSince1970: 1_900_604_800)
+        let staleProfile = try PropertyListSerialization.data(
+            fromPropertyList: [
+                "UUID": "STALE-UUID",
+                "Name": "iOS Team Provisioning Profile: org.nxnative.shell",
+                "TeamIdentifier": [team],
+                "Entitlements": ["application-identifier": "\(team).org.nxnative.shell"],
+                "ExpirationDate": staleExpiry
+            ],
+            format: .xml,
+            options: 0
+        )
+        let freshProfile = try PropertyListSerialization.data(
+            fromPropertyList: [
+                "UUID": "FRESH-UUID",
+                "Name": "iOS Team Provisioning Profile: org.nxnative.shell",
+                "TeamIdentifier": [team],
+                "Entitlements": ["application-identifier": "\(team).org.nxnative.shell"],
+                "ExpirationDate": freshExpiry
+            ],
+            format: .xml,
+            options: 0
+        )
+        let appPath = model.installedAppPath
+        try staleProfile.write(to: URL(fileURLWithPath: cachedProfiles + "/STALE-UUID.mobileprovision"))
+        try staleProfile.write(to: URL(fileURLWithPath: appPath + "/embedded.mobileprovision"))
+        try fm.createDirectory(atPath: appPath + "/_CodeSignature", withIntermediateDirectories: true)
+        try write(appPath + "/_CodeSignature/CodeResources", "old-sig")
+
+        // 1. If xcodebuild itself fails, staged profiles and _CodeSignature roll back intact.
+        try write(state + "/fail-xcodebuild", "")
+        let failedSign = expectation(description: "Failed xcodebuild")
+        model.resignOnDevice(app: appPath, device: device) { failedSign.fulfill() }
+        wait(for: [failedSign], timeout: 30)
+        try fm.removeItem(atPath: state + "/fail-xcodebuild")
+        XCTAssertTrue(fm.fileExists(atPath: cachedProfiles + "/STALE-UUID.mobileprovision"))
+        XCTAssertEqual(AppSignature.expiration(ofApp: appPath), staleExpiry)
+        XCTAssertEqual(try String(contentsOfFile: appPath + "/_CodeSignature/CodeResources"), "old-sig")
+
+        // 2. Once xcodebuild succeeds and embeds a new 7-day profile + signature, a later devicectl install failure
+        // keeps the newly signed DmShell.app intact rather than rolling the old profile back over the newly signed binary.
+        try freshProfile.write(to: URL(fileURLWithPath: state + "/new-profile"))
+        try write(state + "/fail-install", "")
+        let failedInstall = expectation(description: "Failed devicectl install after xcodebuild succeeded")
+        model.resignOnDevice(app: appPath, device: device) { failedInstall.fulfill() }
+        wait(for: [failedInstall], timeout: 30)
+        try fm.removeItem(atPath: state + "/fail-install")
+        XCTAssertFalse(fm.fileExists(atPath: cachedProfiles + "/STALE-UUID.mobileprovision"),
+                       "stale cached profile is committed as soon as xcodebuild writes the new signature")
+        XCTAssertEqual(AppSignature.expiration(ofApp: appPath), freshExpiry,
+                       "DmShell.app keeps its newly signed 7-day profile when only devicectl install fails")
+        XCTAssertEqual(try String(contentsOfFile: appPath + "/_CodeSignature/CodeResources"), "new-sig")
+
+        // 3. Full re-sign + install succeeds.
+        try staleProfile.write(to: URL(fileURLWithPath: cachedProfiles + "/STALE-UUID.mobileprovision"))
         let before = calls.count
         let resigned = expectation(description: "Re-signed")
-        model.resignOnDevice(app: model.installedAppPath, device: device) { resigned.fulfill() }
+        model.resignOnDevice(app: appPath, device: device) { resigned.fulfill() }
         wait(for: [resigned], timeout: 30)
+        try? fm.removeItem(atPath: state + "/new-profile")
+        XCTAssertFalse(fm.fileExists(atPath: cachedProfiles + "/STALE-UUID.mobileprovision"),
+                       "stale cached profile must be cleared so Xcode requests a fresh 7-day profile")
+        XCTAssertEqual(AppSignature.expiration(ofApp: appPath), freshExpiry)
         let log = Array(calls.dropFirst(before))
         let build = try XCTUnwrap(log.first { $0.hasPrefix("xcodebuild") })
         XCTAssertTrue(build.contains("-project \(f.root)/project/DmShell.xcodeproj -scheme DmShell"), build)
@@ -940,12 +1358,38 @@ import NXModel
         XCTAssertTrue(log.allSatisfy { !$0.contains("--remove-existing-content") })
         XCTAssertEqual(try String(contentsOfFile: container + "/org.nxnative.shell/Documents/save/slot1.bin"), "my save")
         XCTAssertEqual(model.doneNote, String(format: model.t("dev.resigned"), "iPhone"))
+        XCTAssertEqual(try fm.destinationOfSymbolicLink(atPath: pkgLink), f.repo + "/frontend-ios")
+        XCTAssertEqual(try fm.destinationOfSymbolicLink(atPath: shellLink), f.repo + "/frontend-ios/Shell/App")
+        let repairedPbx = try String(contentsOfFile: pbxPath, encoding: .utf8)
+        XCTAssertFalse(repairedPbx.contains("AppTranslocation"), repairedPbx)
+        XCTAssertTrue(repairedPbx.contains(#"relativePath = "frontend-ios";"#), repairedPbx)
+
+        // When repo moves to another checkout, Shell resolves under <checkout>/frontend-ios/Shell/App and legacy dangling links are removed
+        let checkout = path("moved-checkout")
+        try write(checkout + "/tools/engine.py", "")
+        try write(checkout + "/.upstream-ref", "deadbeef\n")
+        try write(checkout + "/frontend-ios/Package.swift", "// swift-tools-version: 5.9\n")
+        try fm.createDirectory(atPath: checkout + "/frontend-ios/Shell/App", withIntermediateDirectories: true)
+        for item in ["Sources", "Shell", "tools"] {
+            let link = f.root + "/project/" + item
+            try? fm.removeItem(atPath: link)
+            try fm.createSymbolicLink(atPath: link, withDestinationPath: "/missing/" + item)
+        }
+        try? fm.removeItem(atPath: pkgLink)
+        try fm.createSymbolicLink(atPath: pkgLink, withDestinationPath: "/missing/frontend-ios")
+        ShellInstall.refreshProjectLinks(root: f.root, resources: nil, repo: checkout)
+        XCTAssertEqual(try fm.destinationOfSymbolicLink(atPath: pkgLink), checkout + "/frontend-ios")
+        XCTAssertEqual(try fm.destinationOfSymbolicLink(atPath: f.root + "/project/Shell"), checkout + "/frontend-ios/Shell/App")
+        for item in ["Sources", "tools"] {
+            XCTAssertNil(try? fm.attributesOfItem(atPath: f.root + "/project/" + item))
+        }
     }
 
     @MainActor private func makeModel(_ f: Fixture) throws -> LauncherStores {
         let modelStores = LauncherStores(xcrun: f.xcrun, defaults: testDefaults); let model = modelStores.build
         modelStores.repo.path = f.repo
         model.target = "ios"
+        model.home = path("home")
         model.outDir = path("out")
         modelStores.dependencies.pythonPath = "/usr/bin/python3"
         modelStores.dependencies.dotnetPath = "/usr/bin/true"
@@ -1006,12 +1450,34 @@ import NXModel
         XCTAssertEqual(plans.count, 1)
         XCTAssertEqual(plans.first?.connection, .wired)
 
+        // A failed automatic install offers the export's Finder recovery too (#899).
+        // Use that install's folder, even if the selected build archive has since changed.
+        var revealed: [URL] = []
+        model.revealItem = { revealed.append($0) }
+        model.archivePath = temporary.appendingPathComponent("another-game").path
+        let beforeFinder = calls
+        model.copyWithFinder(oneGame: false)
+        XCTAssertEqual(revealed.map(\.path), [f.archive])
+        XCTAssertTrue(model.finderShown)
+        XCTAssertEqual(calls, beforeFinder, "Finder recovery does not start another copy or build")
+        XCTAssertFalse(model.done, "showing the manual instructions does not claim a successful transfer")
+        XCTAssertEqual(model.failure?.kind, .shellDataIncomplete)
+        model.running = true
+        model.copyWithFinder(oneGame: false)
+        model.running = false
+        model.copyWithFinder(oneGame: true)
+        XCTAssertEqual(revealed.count, 1, "no recovery during a transfer or for a single-game IPA")
+
         try fm.removeItem(atPath: state + "/fail-on")
         let signs = calls.filter { $0.hasPrefix("xcodebuild") }.count
         finish { model.fixBuildFailure(.shellDataIncomplete) }
         withExtendedLifetime(asked) {}
         XCTAssertNil(model.failure)
+        XCTAssertFalse(model.finderShown, "retrying the install clears the previous manual instructions")
+        model.copyWithFinder(oneGame: false)
+        XCTAssertEqual(revealed.count, 1, "a successful install does not offer the failure fallback")
         XCTAssertTrue(model.done, model.doneNote)
+        XCTAssertTrue(model.buildingGame, "retrying the data copy keeps buildingGame true so BuildRecorder and BuildNotifications record the completed iOS build")
         XCTAssertEqual(model.installedOn, device)
         XCTAssertEqual(calls.filter { $0.hasPrefix("xcodebuild") }.count, signs)
         XCTAssertEqual(try String(contentsOfFile: container + "/org.nxnative.shell/Documents/games/\(titleID)/romfs.img"), "0123456789")
@@ -1029,5 +1495,314 @@ import NXModel
         model.startBuild()
         XCTAssertFalse(model.running)
         XCTAssertEqual(model.doneNote, model.t("shell.needsDevice"))
+    }
+
+    @MainActor func testResignAfterDeletingAGameRegeneratesTheProjectAndPrunesEmbeddedFrameworks() throws {
+        let f = try makeFixture()
+        let secondID = "0100000000010000"
+        let secondFramework = path("work2/shell-framework/DmGame\(secondID).framework")
+        try write(secondFramework + "/game.manifest.json", "{}")
+        try write(secondFramework + "/DmGame\(secondID)", "executable")
+        let secondArchive = path("out/games", secondID)
+        try write(secondArchive + "/romfs.img", "second")
+
+        var first = installer(f)
+        first.decideCopy = { _ in .skip }
+        XCTAssertTrue(install(first, f).ok)
+        var second = installer(f)
+        second.decideCopy = { _ in .skip }
+        XCTAssertTrue(second.install(framework: secondFramework, titleID: secondID, name: "Second Game", archive: secondArchive).ok)
+
+        let embedded = f.root + "/derived-data/Build/Products/Release-iphoneos/DmShell.app/Frameworks"
+        XCTAssertTrue(fm.fileExists(atPath: embedded + "/DmGame\(titleID).framework"))
+        XCTAssertTrue(fm.fileExists(atPath: embedded + "/DmGame\(secondID).framework"))
+        XCTAssertEqual(ShellLibrary.load(root: f.root).games.map(\.titleID), [titleID, secondID])
+
+        // Delete the second game through GameDeletion (removes its mirrored framework and drops it from shell.json,
+        // while DmShell.xcodeproj / frameworks.txt still lists both games).
+        var secondGame = LibraryGame(titleID: secondID, name: "Second Game", archivePath: secondArchive)
+        secondGame.iosAppPath = ShellInstall.appPath(root: f.root)
+        secondGame.outputDirectory = path("out")
+        let deletion = GameDeletion.plan(for: secondGame, shellRoot: f.root, home: path("home"), support: URL(fileURLWithPath: path("support")))
+        XCTAssertEqual(deletion.run(saves: false, trash: { try self.fm.removeItem(at: $0) }), [])
+        XCTAssertFalse(fm.fileExists(atPath: ShellInstall.mirroredFramework(root: f.root, titleID: secondID)))
+        XCTAssertEqual(ShellLibrary.load(root: f.root).games.map(\.titleID), [titleID])
+
+        testDefaults.set(f.root, forKey: "shellRoot")
+        let modelStores = try makeModel(f)
+        let model = modelStores.build
+        model.target = BuildTarget.mac
+        XCTAssertEqual(model.runningTarget, BuildTarget.mac)
+        var observedRunningTarget = ""
+        var observedBuildingGame = true
+        let runningProbe = model.$running.filter { $0 }.prefix(1).sink { _ in
+            observedRunningTarget = model.runningTarget
+            observedBuildingGame = model.buildingGame
+        }
+        let resigned = expectation(description: "Re-signed after deletion")
+        model.resignOnDevice(app: ShellInstall.appPath(root: f.root), device: device) { resigned.fulfill() }
+        wait(for: [resigned], timeout: 30)
+        withExtendedLifetime(runningProbe) {}
+
+        XCTAssertEqual(observedRunningTarget, BuildTarget.ios, "re-signing while the Build form sits on mac-app still reports an iPhone activity")
+        XCTAssertFalse(observedBuildingGame, "re-signing does not mark the Build form's game as a running game build")
+        XCTAssertEqual(model.target, BuildTarget.mac, "re-signing leaves the Build form's target choice untouched")
+        XCTAssertEqual(model.runningTarget, BuildTarget.mac, "once the standalone re-sign ends, runningTarget returns to the Build form's target so OutcomeCard is not polluted")
+        XCTAssertEqual(model.doneNote, String(format: model.t("dev.resigned"), "iPhone"))
+        XCTAssertTrue(fm.fileExists(atPath: embedded + "/DmGame\(titleID).framework"))
+        XCTAssertFalse(fm.fileExists(atPath: embedded + "/DmGame\(secondID).framework"),
+                       "the deleted game's framework must be pruned from the built DmShell.app")
+        let fwlist = try String(contentsOfFile: f.root + "/project/frameworks.txt", encoding: .utf8)
+        XCTAssertTrue(fwlist.contains("DmGame\(titleID).framework"), fwlist)
+        XCTAssertFalse(fwlist.contains("DmGame\(secondID).framework"), fwlist)
+
+        // When all games' frameworks are gone on disk, re-signing reports the missing project instead of failing in xcodebuild.
+        try fm.removeItem(atPath: ShellInstall.mirroredFramework(root: f.root, titleID: titleID))
+        let empty = expectation(description: "No games left")
+        model.resignOnDevice(app: ShellInstall.appPath(root: f.root), device: device) { empty.fulfill() }
+        wait(for: [empty], timeout: 10)
+        XCTAssertEqual(model.doneNote, String(format: model.t("dev.resignNoProject"), model.shortPath(f.root + "/project/DmShell.xcodeproj")))
+    }
+
+    @MainActor func testInstallShellForwardsCompileSignInstallAndWeightedTransferProgressToBuildStoreStages() throws {
+        let f = try makeFixture()
+        try write(f.archive + "/romfs.img", String(repeating: "a", count: 60))
+        try write(f.archive + "/aoc/1.img", String(repeating: "b", count: 40))
+
+        let customXcrun = path("xcrun-progress")
+        let baseXcrun = try String(contentsOfFile: f.xcrun, encoding: .utf8)
+        let patchedXcrun = baseXcrun
+            .replacingOccurrences(
+                of: "print('CodeSign ' + app, flush=True)",
+                with: "print('CompileC /tmp/ShellMain.o /tmp/ShellMain.m', flush=True), print('CodeSign ' + app, flush=True)"
+            )
+            .replacingOccurrences(
+                of: "print('60%', flush=True)",
+                with: "sys.stdout.write('20%\\r50%\\n') or sys.stdout.flush()"
+            )
+        try patchedXcrun.write(toFile: customXcrun, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: customXcrun)
+
+        var custom = f
+        custom.xcrun = customXcrun
+        testDefaults.set(custom.root, forKey: "shellRoot")
+        let stores = try makeModel(custom)
+        let model = stores.build
+        let asked = stores.deviceStore.$shellCopy.compactMap { $0 }.sink { _ in
+            stores.deviceStore.answerCopy(.copy)
+        }
+
+        var signDetails: [String] = []
+        var installSnapshots: [(String, Double?)] = []
+        var copySnapshots: [(String, Double?)] = []
+        let sub = model.$stages.sink { stages in
+            if let sign = stages.first(where: { $0.id == ShellInstaller.signStageID && $0.state == .running }), !sign.detail.isEmpty {
+                signDetails.append(sign.detail)
+            }
+            if let inst = stages.first(where: { $0.id == ShellInstaller.installStageID && $0.state == .running }), !inst.detail.isEmpty {
+                installSnapshots.append((inst.detail, inst.percent))
+            }
+            if let copy = stages.first(where: { $0.id == ShellInstaller.copyStageID && $0.state == .running }), !copy.detail.isEmpty {
+                copySnapshots.append((copy.detail, copy.percent))
+            }
+        }
+
+        let finished = expectation(description: "installShell finished")
+        let doneSub = model.$running.dropFirst().filter { !$0 }.prefix(1).sink { _ in finished.fulfill() }
+        model.installShell(framework: custom.framework, titleID: titleID, name: "Test Game", archive: custom.archive)
+        wait(for: [finished], timeout: 30)
+        withExtendedLifetime(asked) {}
+        withExtendedLifetime(sub) {}
+        withExtendedLifetime(doneSub) {}
+
+        XCTAssertTrue(model.done, model.doneNote)
+        XCTAssertTrue(signDetails.contains("compiling"), "expected compiling detail in \(signDetails)")
+        XCTAssertTrue(signDetails.contains("signing"), "expected signing detail in \(signDetails)")
+        XCTAssertTrue(installSnapshots.contains { $0.0 == "installing" && $0.1 == 45 }, "expected 45% install progress in \(installSnapshots)")
+        // localFiles orders aoc/1.img (40 B) before romfs.img (60 B): 20% and 50% of 40 B = 8% and 20%, then 40 + 20%/50% of 60 B = 52% and 70%.
+        XCTAssertTrue(copySnapshots.contains { $0.0 == "1/2" && $0.1 == 8 }, "expected weighted 8% on first file in \(copySnapshots)")
+        XCTAssertTrue(copySnapshots.contains { $0.0 == "1/2" && $0.1 == 20 }, "expected weighted 20% on first file in \(copySnapshots)")
+        XCTAssertTrue(copySnapshots.contains { $0.0 == "2/2" && $0.1 == 52 }, "expected weighted 52% on second file in \(copySnapshots)")
+        XCTAssertTrue(copySnapshots.contains { $0.0 == "2/2" && $0.1 == 70 }, "expected weighted 70% on second file in \(copySnapshots)")
+
+        var partStages: [ShellStage] = []
+        var partBytes: [(Int64, Int64)] = []
+        let partArchive = path("out/part-games", titleID)
+        try write(partArchive + "/romfs.img", String(repeating: "z", count: 25))
+        var chunked = installer(custom)
+        chunked.partSize = 10
+        chunked.stage = { partStages.append($0) }
+        chunked.copyProgress = { partBytes.append(($0, $1)) }
+        let partOutcome = chunked.installData(titleID: titleID, archive: partArchive)
+        XCTAssertTrue(partOutcome.ok, partOutcome.message)
+        let runningParts = partStages.filter { $0.id == ShellInstaller.copyStageID && $0.state == .running && $0.percent != nil }
+        let percents = runningParts.compactMap(\.percent)
+        XCTAssertFalse(percents.isEmpty)
+        for pair in zip(percents, percents.dropFirst()) {
+            XCTAssertLessThanOrEqual(pair.0, pair.1, "part percentages must never regress across chunks: \(percents)")
+        }
+        XCTAssertTrue(runningParts.contains { $0.detail == "1/3" && $0.percent == 20 }, "\(runningParts)")
+        XCTAssertTrue(runningParts.contains { $0.detail == "2/3" && $0.percent == 60 }, "\(runningParts)")
+        XCTAssertTrue(runningParts.contains { $0.detail == "3/3" && $0.percent == 90 }, "\(runningParts)")
+        XCTAssertEqual(partBytes.last?.0, 25)
+    }
+
+    func testAppIDLimit9120DoesNotRetryTeamVariantAndReportsAppIDLimit() throws {
+        let f = try makeFixture()
+        try write(state + "/xcodebuild-error", """
+        /tmp/shell/project/DmShell.xcodeproj: error: Failed to register bundle identifier: The app identifier "org.nxnative.shell" cannot be registered to your development team because it is not available. (9120) (in target 'DmShell' from project 'DmShell')
+        /tmp/shell/project/DmShell.xcodeproj: error: No profiles for 'org.nxnative.shell' were found: Xcode couldn't find any iOS App Development provisioning profiles matching 'org.nxnative.shell'. (in target 'DmShell' from project 'DmShell')
+
+        """)
+        let outcome = install(installer(f), f)
+        XCTAssertFalse(outcome.ok)
+        XCTAssertEqual(outcome.step, .sign)
+        XCTAssertEqual(outcome.failure, .appIDLimit)
+        XCTAssertTrue(outcome.message.contains("9120"), outcome.message)
+        let builds = try String(contentsOfFile: state + "/calls.txt", encoding: .utf8).split(separator: "\n").filter { $0.hasPrefix("xcodebuild") }
+        XCTAssertEqual(builds.count, 1, "must not retry under org.nxnative.shell.<team> when 9120 is reached: \(builds)")
+    }
+
+    func testNamedArchiveImageInstallsToCanonicalDeviceRomfsImgOverwritingLegacyCopy() throws {
+        let f = try fixtureWithRomFSTool()
+        var i = installer(f)
+        i.decideCopy = { _ in .copy }
+        XCTAssertTrue(install(i, f).ok)
+
+        let deviceGameDir = container + "/org.nxnative.shell/Documents/games/\(titleID)"
+        try write(deviceGameDir + "/romfs.img", "legacy-romfs-copy")
+
+        let namedArchive = path("out/games/Hades")
+        try write(namedArchive + "/Hades.img", "fresh-hades-payload")
+        try write(namedArchive + "/aoc/dlc1.img", "dlc-payload")
+
+        let outcome = i.installData(titleID: titleID, archive: namedArchive)
+        XCTAssertTrue(outcome.ok, outcome.message)
+        XCTAssertEqual(try String(contentsOfFile: deviceGameDir + "/romfs.img", encoding: .utf8), "fresh-hades-payload")
+        XCTAssertEqual(try String(contentsOfFile: deviceGameDir + "/aoc/dlc1.img", encoding: .utf8), "dlc-payload")
+        XCTAssertFalse(fm.fileExists(atPath: deviceGameDir + "/Hades.img"))
+    }
+
+    @MainActor func testFastRefreshIncompatibleBeaconFallsBackToFullBuildAndReportsUpdatedShell() throws {
+        let f = try fixtureWithRomFSTool()
+        try write(f.repo + "/dm/gfx/nvn/dmsh_chain.h", "#define DMSH_CHAIN \"108c5f92c3c4\"\n")
+        let seedDir = path("seed-cache", titleID)
+        try write(seedDir + "/game_seed.json", """
+        {"schema": 1, "title_id": "\(titleID)", "chain": "108c5f92c3c4", "romfs_identity": "id-1"}
+        """)
+        let outDir = path("fast-out")
+        let prebuiltImg = outDir + "/games/\(titleID)/romfs.img"
+        try fm.createDirectory(atPath: (prebuiltImg as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        try romfsImage().write(to: URL(fileURLWithPath: prebuiltImg))
+        try fm.createDirectory(atPath: seedDir, withIntermediateDirectories: true)
+        try romfsImage().write(to: URL(fileURLWithPath: seedDir + "/romfs.img"))
+
+        var initial = installer(f)
+        initial.decideCopy = { _ in .skip }
+        XCTAssertTrue(install(initial, f).ok)
+
+        // Device holds an older v1.5.0 shared shell beacon (glueVersion 2, older shader chain).
+        let beaconJSON = """
+        {"schema":1,"glueVersion":2,"bundleID":"\(ShellLibrary.defaultBundleID)","teamID":"\(team)","chain":"b-df1800562702","version":"1.5.0","expiresAtEpoch":\(Int64(Date().timeIntervalSince1970) + 5 * 86400)}
+        """
+        try write(container + "/\(ShellLibrary.defaultBundleID)/\(ShellHotInstall.beaconRemotePath)", beaconJSON)
+        try "".write(toFile: state + "/calls.txt", atomically: true, encoding: .utf8)
+
+        testDefaults.set(f.root, forKey: "shellRoot")
+        testDefaults.set(seedDir.replacingOccurrences(of: "/\(titleID)", with: ""), forKey: "seedCacheDirectory")
+        let modelStores = try makeModel(f)
+        try write(f.repo + "/scripts/build_ipa_from_nsp.py", """
+        #!/usr/bin/env python3
+        import json, os, sys
+        if '--from-seed' in sys.argv:
+            wd = sys.argv[sys.argv.index('--work-dir') + 1]
+            tid = sys.argv[sys.argv.index('--title-id') + 1]
+            fw = os.path.join(wd, 'shell-framework', f'DmGame{tid}.framework')
+            os.makedirs(fw, exist_ok=True)
+            open(os.path.join(fw, f'DmGame{tid}'), 'w').write('exe')
+            json.dump({'title_id': tid, 'framework': f'DmGame{tid}.framework', 'framework_executable': f'DmGame{tid}', 'loader': 'FH'},
+                      open(os.path.join(fw, 'game.manifest.json'), 'w'))
+            sys.exit(0)
+        print('Usage: --from-seed')
+        """)
+        modelStores.localizer.lang = .zh
+        modelStores.deviceStore.postBuildTransferMode = .skip
+        let model = modelStores.build
+        let finished = expectation(description: "Fast refresh falls back to full build")
+        let sub = model.$done.filter { $0 }.prefix(1).sink { _ in finished.fulfill() }
+        model.startFastRefresh(titleID: titleID, target: 1, outDir: outDir, gameName: "Fast Game", externalImgPath: prebuiltImg)
+        wait(for: [finished], timeout: 30)
+        withExtendedLifetime(sub) {}
+
+        let recordedCalls = try String(contentsOfFile: state + "/calls.txt", encoding: .utf8).split(separator: "\n").map(String.init)
+        XCTAssertEqual(recordedCalls.filter { $0.hasPrefix("xcodebuild") }.count, 1, "fast refresh with incompatible beacon must rebuild full shell")
+        XCTAssertEqual(recordedCalls.filter { $0.hasPrefix("devicectl device install app") }.count, 1)
+        XCTAssertTrue(model.shellUpdatedOnDevice)
+        XCTAssertTrue(model.doneNote.contains("已为 iPhone 更新游戏壳"), model.doneNote)
+    }
+
+    @MainActor func testResignWithOutdatedDeviceBeaconOrStaleProjectStampUpgradesShellAndReportsNote() throws {
+        let f = try makeFixture()
+        try write(f.repo + "/dm/gfx/nvn/dmsh_chain.h", "#define DMSH_CHAIN \"108c5f92c3c4\"\n")
+        var first = installer(f)
+        first.decideCopy = { _ in .skip }
+        XCTAssertTrue(install(first, f).ok)
+
+        testDefaults.set(f.root, forKey: "shellRoot")
+        let modelStores = try makeModel(f)
+        modelStores.localizer.lang = .zh
+        let model = modelStores.build
+        let app = ShellInstall.appPath(root: f.root)
+        let nowEpoch = Int64(Date().timeIntervalSince1970)
+
+        // Scenario A: games unchanged (projectNeedsUpdate == false), but device beacon reports legacy glueVersion 2 -> must regenerate project & upgrade shell.
+        let legacyBeacon = """
+        {"schema":1,"glueVersion":2,"bundleID":"\(ShellLibrary.defaultBundleID)","teamID":"\(team)","chain":"b-df1800562702","version":"1.5.0","expiresAtEpoch":\(nowEpoch + 5 * 86400)}
+        """
+        try write(container + "/\(ShellLibrary.defaultBundleID)/\(ShellHotInstall.beaconRemotePath)", legacyBeacon)
+        try "".write(toFile: state + "/calls.txt", atomically: true, encoding: .utf8)
+        let marker = f.root + "/project/stale-sentinel"
+        try write(marker, "old")
+        try write(f.repo + "/frontend-ios/Shell/build_shell.sh",
+                  try String(contentsOfFile: f.repo + "/frontend-ios/Shell/build_shell.sh", encoding: .utf8) + "\nrm -f \"$SHELL_DIR/stale-sentinel\"\n")
+
+        let expA = expectation(description: "Resign upgrades legacy device shell")
+        model.resignOnDevice(app: app, device: device) { expA.fulfill() }
+        wait(for: [expA], timeout: 30)
+
+        XCTAssertFalse(fm.fileExists(atPath: marker), "resign with outdated device shell must regenerate shell project")
+        XCTAssertTrue(model.shellUpdatedOnDevice)
+        XCTAssertTrue(model.doneNote.contains("已续签并安装到 iPhone"), model.doneNote)
+        XCTAssertTrue(model.doneNote.contains("已为 iPhone 更新游戏壳"), model.doneNote)
+        let callsA = try String(contentsOfFile: state + "/calls.txt", encoding: .utf8).split(separator: "\n").map(String.init)
+        XCTAssertEqual(callsA.filter { $0.hasPrefix("xcodebuild") }.count, 1)
+        XCTAssertEqual(callsA.filter { $0.hasPrefix("devicectl device install app") }.count, 1)
+
+        // Scenario B: no device beacon on disk, but .shell-stamp.json missing (older launcher project) -> resign regenerates & reports shell update.
+        try fm.removeItem(atPath: container + "/\(ShellLibrary.defaultBundleID)/\(ShellHotInstall.beaconRemotePath)")
+        try fm.removeItem(atPath: ShellHotInstall.projectStampFile(root: f.root))
+        modelStores.localizer.lang = .en
+        let expB = expectation(description: "Resign upgrades missing stamp")
+        model.resignOnDevice(app: app, device: device) { expB.fulfill() }
+        wait(for: [expB], timeout: 30)
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: ShellHotInstall.projectStampFile(root: f.root)))
+        XCTAssertTrue(model.shellUpdatedOnDevice)
+        XCTAssertTrue(model.doneNote.contains("Re-signed and installed on iPhone"), model.doneNote)
+        XCTAssertTrue(model.doneNote.contains("Updated the game shell on iPhone"), model.doneNote)
+
+        // Scenario C: up-to-date stamp and matching device beacon -> plain resign without regenerating project or showing shell-updated note.
+        let currentBeacon = """
+        {"schema":1,"glueVersion":\(ShellHotInstall.glueVersion),"bundleID":"\(ShellLibrary.defaultBundleID)","teamID":"\(team)","chain":"b-108c5f92c3c4","version":"1.5.1","expiresAtEpoch":\(nowEpoch + 5 * 86400),"allowsHotPush":true,"certSHA1":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}
+        """
+        try write(container + "/\(ShellLibrary.defaultBundleID)/\(ShellHotInstall.beaconRemotePath)", currentBeacon)
+        try write(marker, "keep-me")
+        let expC = expectation(description: "Resign with current shell stays plain")
+        model.resignOnDevice(app: app, device: device) { expC.fulfill() }
+        wait(for: [expC], timeout: 30)
+
+        XCTAssertTrue(fm.fileExists(atPath: marker), "plain resign with matching project stamp and beacon skips regenerating project")
+        XCTAssertFalse(model.shellUpdatedOnDevice)
+        XCTAssertEqual(model.doneNote, "Re-signed and installed on iPhone")
     }
 }

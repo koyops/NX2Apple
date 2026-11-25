@@ -36,20 +36,42 @@ enum RomfsLanguages {
     }
 
     static func options(in url: URL, fm: FileManager = .default) -> [[String]] {
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: url.path, isDirectory: &isDir) else { return [] }
+        if !isDir.boolValue {
+            return cachedFromImage(url, fm: fm)
+        }
+        let entries = ((try? fm.contentsOfDirectory(atPath: url.path)) ?? []).sorted()
+        let romfsVariants = entries
+            .filter { $0 != "romfs.img" && $0 != "RomFS.img" && $0.lowercased() == "romfs.img" }
+            .map { url.appendingPathComponent($0) }
         let candidates = [
             url.appendingPathComponent("romfs.img"),
-            url.appendingPathComponent("RomFS.img"),
+            url.appendingPathComponent("RomFS.img")
+        ] + romfsVariants + [
             url.appendingPathComponent("romfs", isDirectory: true),
             url.appendingPathComponent("RomFS", isDirectory: true),
             url
         ]
         for candidate in candidates {
-            var isDir: ObjCBool = false
-            guard fm.fileExists(atPath: candidate.path, isDirectory: &isDir) else { continue }
-            let found = isDir.boolValue ? fromDirectory(candidate, fm: fm) : cachedFromImage(candidate, fm: fm)
+            let found = options(forRomfs: candidate, fm: fm)
+            if found.count > 1 { return found }
+        }
+        for name in entries where name.lowercased() != "romfs.img" && RomfsImageName.isNonPartImage(name) {
+            let image = url.appendingPathComponent(name)
+            guard let attrs = try? fm.attributesOfItem(atPath: image.path),
+                  attrs[.type] as? FileAttributeType == .typeRegular else { continue }
+            let found = cachedFromImage(image, fm: fm)
             if found.count > 1 { return found }
         }
         return []
+    }
+
+    /// Reads only the image or unpacked tree the launcher will use.
+    static func options(forRomfs url: URL, fm: FileManager = .default) -> [[String]] {
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: url.path, isDirectory: &isDir) else { return [] }
+        return isDir.boolValue ? fromDirectory(url, fm: fm) : cachedFromImage(url, fm: fm)
     }
 
     /// Whether a `DM_LANG` row is the all-languages row `dm/games/settings.py` writes for a game with no language list (no control
@@ -162,8 +184,14 @@ enum RomfsLanguages {
         }
         guard head[0..<8].elementsEqual("DMROMFS1".utf8) else { return [] }
         let idxOff = u64(head, 8), idxSize = u64(head, 16), count = u64(head, 24)
-        guard idxOff >= 32, idxOff <= fileSize, idxSize == fileSize - idxOff,
-              idxSize <= 64 * 1024 * 1024, count >= 1, count <= idxSize / 24,
+        guard idxOff >= 32, idxOff <= fileSize, idxSize <= fileSize - idxOff else { return [] }
+        let baseEnd = idxOff + idxSize
+        if fileSize > baseEnd {
+            guard RomfsTrailer.inspect(fd: handle.fileDescriptor, fileSize: fileSize, ioff: idxOff, isz: idxSize)?.baseRomfsSize == baseEnd else {
+                return []
+            }
+        }
+        guard idxSize <= 64 * 1024 * 1024, count >= 1, count <= idxSize / 24,
               (try? handle.seek(toOffset: idxOff)) != nil,
               let idxData = try? handle.read(upToCount: Int(idxSize)), idxData.count == Int(idxSize) else { return [] }
         let idx = [UInt8](idxData)

@@ -4,94 +4,85 @@ import NXCore
 import NXModel
 import NXLauncher
 
-/// The question before a game is deleted (#559): the same words as the iPhone and iPad app, the list of what goes to the Trash
-/// with its size, the saves as a separate switch that starts off, and Cancel as the default button.
+/// The question before a game is deleted (#559): the same words as the iPhone and iPad app,
+/// the list of what goes to the Trash with its size, the saves as a separate switch that starts off, and Cancel as the default
+/// button: Return and Escape both cancel (DSSheetKeys), only a click or the controller deletes.
 struct DeleteGameSheet: View {
     let game: LibraryGame
     let shellRoot: String
     /// The library entry goes once the files are gone. Called with the paths that could not be moved.
     let finished: ([String]) -> Void
+    /// Multi-build aware completion passing `(deletedUpstreamOrNilForAll, failedPaths)`.
+    let onComplete: ((EngineUpstreamKind?, [String]) -> Void)?
     @EnvironmentObject var loc: Localizer
     @EnvironmentObject private var focus: PadFocus
     @Environment(\.dismiss) private var dismiss
     @State private var plan: GameDeletion?
     @State private var saves = false
     @State private var working = false
+    @State private var deleteAllBuilds: Bool
+    @State private var selectedUpstream: EngineUpstreamKind
+    /// Off only for the gallery's "measuring" state, which keeps the spinner.
+    private let measures: Bool
 
-    init(game: LibraryGame, shellRoot: String, plan: GameDeletion? = nil, saves: Bool = false, finished: @escaping ([String]) -> Void = { _ in }) {
+    private var availableBuilds: [LibraryMacBuild] { game.sortedMacBuilds }
+    private var hasMultipleBuilds: Bool { availableBuilds.count > 1 }
+    private var activeUpstreamScope: EngineUpstreamKind? {
+        (hasMultipleBuilds && !deleteAllBuilds) ? selectedUpstream : nil
+    }
+
+    init(game: LibraryGame, shellRoot: String, plan: GameDeletion? = nil, saves: Bool = false, measures: Bool = true,
+         initialScopeUpstream: EngineUpstreamKind? = nil,
+         finished: @escaping ([String]) -> Void = { _ in },
+         onComplete: ((EngineUpstreamKind?, [String]) -> Void)? = nil) {
+        self.measures = measures
         self.game = game
         self.shellRoot = shellRoot
         self.finished = finished
+        self.onComplete = onComplete
         _plan = State(initialValue: plan)   // visual QA: a measured plan without files on disk
         _saves = State(initialValue: saves)
+        let builds = game.sortedMacBuilds
+        let defaultUp = initialScopeUpstream ?? game.activeMacUpstream(defaults: nil) ?? builds.first?.upstream ?? .nxnative
+        _selectedUpstream = State(initialValue: defaultUp)
+        _deleteAllBuilds = State(initialValue: builds.count <= 1)
     }
+
+    /// Whether anything goes to the Trash: a game with no files here only leaves the collection.
+    private var trashes: Bool { plan.map { !$0.items.isEmpty || $0.saves != nil } ?? true }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .top, spacing: 14) {
-                Image(systemName: "trash").font(.system(size: 20, weight: .medium)).foregroundStyle(Self.red)
-                    .frame(width: 40, height: 40).background(Self.red.opacity(0.14), in: Circle())
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(String(format: loc.t("delete.question"), game.name)).font(.manrope(22, .heavy)).tracking(-0.4)
-                        .fixedSize(horizontal: false, vertical: true)
-                    if plan.map({ !$0.items.isEmpty || $0.saves != nil }) ?? true {   // nothing goes to the Trash for a game with no files here
-                        Text(loc.t("delete.note")).font(.manrope(13)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        DSSheet(title: String(format: loc.t("delete.question"), game.displayName(loc.lang)),
+                message: trashes ? loc.t("delete.note") : "") {
+            if hasMultipleBuilds {
+                scopeSection
+            }
+            if let plan {
+                DSSection("") {
+                    if plan.items.isEmpty { DSRow(loc.t("delete.nothing")) { EmptyView() } }
+                    ForEach(Array(plan.items.enumerated()), id: \.element.id) { index, item in
+                        if index > 0 { DSRowDivider() }
+                        row(item)
                     }
                 }
-            }
-            .padding(.horizontal, 28).padding(.top, 26).padding(.bottom, 16)
-            VStack(alignment: .leading, spacing: 12) {
-                if let plan {
-                    card {
-                        if plan.items.isEmpty {
-                            Text(loc.t("delete.nothing")).font(.manrope(13)).foregroundStyle(.secondary)
-                                .padding(.horizontal, 18).padding(.vertical, 13)
-                        }
-                        ForEach(Array(plan.items.enumerated()), id: \.element.id) { index, item in
-                            if index > 0 { Divider().opacity(0.25).padding(.leading, 18) }
-                            row(item)
-                        }
-                    }
-                    savesCard(plan.saves)
-                } else {
-                    HStack(spacing: 10) { ProgressView().controlSize(.small); Text(loc.t("free.measuring")).foregroundStyle(.secondary) }
-                        .padding(.vertical, 20)
+                savesCard(plan.saves)
+            } else {
+                HStack(spacing: DS.Space.s) {
+                    ProgressView().controlSize(.small)
+                    Text(loc.t("free.measuring")).font(DS.Font.body).foregroundStyle(DS.Color.textSecondary)
                 }
-                Text(loc.t("delete.sources")).font(.manrope(12)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                    .padding(.horizontal, 2)
+                .padding(.vertical, DS.Space.xs)
             }
-            .padding(.horizontal, 28).padding(.bottom, 20)
-            Divider().opacity(0.3)
-            HStack(spacing: 12) {
-                Spacer(minLength: 8)
-                Button(loc.t("saves.cancel")) { dismiss() }
-                    .buttonStyle(LauncherSecondaryButtonStyle())
-                    .keyboardShortcut(.cancelAction)
-                    .padTarget("delete.cancel", scope: "delete") { dismiss() }
-                Button(action: delete) {
-                    Text(loc.t(saves && plan?.saves != nil ? "delete.confirmSaves" : "delete.confirm")).font(.manrope(13.5, .bold)).foregroundStyle(.white)
-                        .padding(.horizontal, 20).padding(.vertical, 9)
-                        .background(Self.fill, in: Capsule())
-                        .opacity(plan == nil || working ? 0.5 : 1)
-                }
-                .buttonStyle(.plain)
-                .disabled(plan == nil || working)
-                .padTarget("delete.confirm", scope: "delete", radius: 20) { delete() }
-            }
-            .padding(.horizontal, 28).padding(.vertical, 16)
+            Text(loc.t("delete.sources")).font(DS.Font.callout).foregroundStyle(DS.Color.textSecondary).fixedSize(horizontal: false, vertical: true)
+        } buttons: {
+            DSSheetConfirmButtons(cancelTitle: loc.t("saves.cancel"),
+                                  confirmTitle: loc.t(saves && plan?.saves != nil ? "delete.confirmSaves" : "delete.confirm"),
+                                  role: .destructive, enabled: plan != nil && !working, scope: "delete",
+                                  cancel: { dismiss() }, confirm: delete)
         }
         .padScope("delete", focus)
-        .frame(width: 520)
-        .fixedSize(horizontal: false, vertical: true)
-        .background(LauncherPalette.background)
-        .font(.manrope(13))
-        .preferredColorScheme(.dark)
-        .tint(LauncherPalette.cream)
-        .onAppear { if plan == nil { measure() } }
+        .onAppear { if plan == nil && measures { measure() } }
     }
-
-    static let red = Color(red: 1, green: 0.42, blue: 0.40)
-    static let fill = Color(red: 0.86, green: 0.25, blue: 0.24)
 
     private func title(_ kind: GameDeletion.Item.Kind) -> String {
         switch kind {
@@ -110,56 +101,88 @@ struct DeleteGameSheet: View {
     private func detail(_ item: GameDeletion.Item) -> String {
         if item.kind == .shellFramework { return loc.t("delete.part.shellFrameworkNote") }
         guard let first = item.paths.first else { return "" }
-        let shown = item.kind == .buildFolder ? (first as NSString).deletingLastPathComponent : first
-        return (shown as NSString).abbreviatingWithTildeInPath
-    }
-
-    private func row(_ item: GameDeletion.Item) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 16) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title(item.kind)).font(.manrope(14, .medium))
-                Text(detail(item)).font(.manrope(11.5)).foregroundStyle(.secondary).lineLimit(2).truncationMode(.middle)
-            }
-            Spacer(minLength: 12)
-            if item.bytes > 0 { sizeText(item.bytes) }
+        if item.kind == .buildFolder {
+            var seen = Set<String>()
+            let folders = item.paths.map { ($0 as NSString).deletingLastPathComponent }.filter { seen.insert($0).inserted }
+            return folders.map { ($0 as NSString).abbreviatingWithTildeInPath }.joined(separator: ", ")
         }
-        .padding(.horizontal, 18).padding(.vertical, 11)
+        return (first as NSString).abbreviatingWithTildeInPath
     }
 
-    @ViewBuilder private func savesCard(_ item: GameDeletion.Item?) -> some View {
-        card {
-            HStack(alignment: .top, spacing: 16) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(loc.t("delete.saves")).font(.manrope(14, .medium))
-                    Text(item == nil ? loc.t("delete.noSaves") : loc.t(saves ? "delete.savesOn" : "delete.savesOff"))
-                        .font(.manrope(12)).foregroundStyle(saves && item != nil ? Self.red : .secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer(minLength: 12)
-                if let item, item.bytes > 0 { sizeText(item.bytes) }
-                Toggle("", isOn: $saves).labelsHidden().toggleStyle(LauncherSwitchStyle()).disabled(item == nil || working)
+    private func helpText(_ item: GameDeletion.Item) -> String {
+        guard item.kind == .buildFolder else { return item.paths.first ?? "" }
+        var seen = Set<String>()
+        return item.paths.map { ($0 as NSString).deletingLastPathComponent }.filter { seen.insert($0).inserted }.joined(separator: "\n")
+    }
+
+    /// A part with where it is: the path on one mono line cut in the middle with the whole path as its tooltip (DSRow), the shared
+    /// app's note as prose.
+    private func row(_ item: GameDeletion.Item) -> some View {
+        DSRow(title(item.kind), detail: detail(item), help: helpText(item)) {
+            if item.bytes > 0 { sizeText(item.bytes) }
+            else if item.kind == .shellFramework {   // nothing here to measure: the size column says where it is (#1458)
+                Text(loc.t("delete.part.onDevice")).font(DS.Font.body).foregroundStyle(DS.Color.textSecondary).fixedSize()
             }
-            .padding(.horizontal, 18).padding(.vertical, 13)
-            .padTarget("delete.saves", scope: "delete", radius: 10, activate: { if item != nil { saves.toggle() } },
-                       adjust: { _ in if item != nil { saves.toggle() } })
+        }
+    }
+
+    private func savesCard(_ item: GameDeletion.Item?) -> some View {
+        DSSection("") {
+            DSRow(loc.t("delete.saves"), detail: item == nil ? loc.t("delete.noSaves") : loc.t(saves ? "delete.savesOn" : "delete.savesOff")) {
+                if let item, item.bytes > 0 { sizeText(item.bytes) }
+                Toggle(loc.t("delete.saves"), isOn: $saves).labelsHidden().toggleStyle(LauncherSwitchStyle()).disabled(item == nil || working)
+            }
+            .padTarget("delete.saves", scope: "delete", radius: DS.Radius.card, enabled: item != nil && !working,
+                       activate: { if item != nil { saves.toggle() } }, adjust: { _ in if item != nil { saves.toggle() } })
         }
     }
 
     private func sizeText(_ bytes: Int64) -> some View {
-        Text(FreeSpaceView.bytes(bytes)).font(.manrope(13, .semibold)).monospacedDigit().frame(minWidth: 70, alignment: .trailing)
+        Text(FreeSpaceView.bytes(bytes)).font(DS.Font.bodyStrong).foregroundStyle(DS.Color.textPrimary).monospacedDigit().fixedSize()
     }
 
-    private func card<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 0, content: content)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(LauncherPalette.surface.opacity(0.75), in: RoundedRectangle(cornerRadius: 14))
-            .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Color.white.opacity(0.06)))
+    @ViewBuilder private var scopeSection: some View {
+        let scopeOptions = [
+            ("single", loc.t("delete.scope.single")),
+            ("all", loc.t("delete.scope.all"))
+        ]
+        let engineOptions = availableBuilds.map { ($0.upstream.rawValue, $0.upstream.displayName) }
+        DSSection("") {
+            DSRow(loc.t("delete.scope.label")) {
+                LauncherSegmented(options: scopeOptions, selection: deleteAllBuilds ? "all" : "single") { next in
+                    let isAll = next == "all"
+                    if deleteAllBuilds != isAll {
+                        deleteAllBuilds = isAll
+                        if measures { remeasure() }
+                    }
+                }
+                .disabled(working)
+            }
+            if !deleteAllBuilds {
+                DSRowDivider()
+                DSRow(loc.t("delete.scope.engine")) {
+                    LauncherDropdown(options: engineOptions, selection: selectedUpstream.rawValue, label: loc.t("delete.scope.engine")) { raw in
+                        if let next = EngineUpstreamKind(rawValue: raw), next != selectedUpstream {
+                            selectedUpstream = next
+                            if measures { remeasure() }
+                        }
+                    }
+                    .disabled(working)
+                }
+            }
+        }
+    }
+
+    private func remeasure() {
+        plan = nil
+        saves = false
+        measure()
     }
 
     private func measure() {
-        let game = game, root = shellRoot
+        let game = game, root = shellRoot, scope = activeUpstreamScope
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = GameDeletion.plan(for: game, shellRoot: root)
+            let result = GameDeletion.plan(for: game, shellRoot: root, upstream: scope)
             DispatchQueue.main.async { plan = result }
         }
     }
@@ -168,12 +191,17 @@ struct DeleteGameSheet: View {
         guard let plan, !working else { return }
         working = true
         let withSaves = saves
+        let scope = activeUpstreamScope
         DispatchQueue.global(qos: .userInitiated).async {
             let failed = plan.run(saves: withSaves)
             DispatchQueue.main.async {
                 working = false
                 dismiss()
-                finished(failed)
+                if let onComplete {
+                    onComplete(scope, failed)
+                } else {
+                    finished(failed)
+                }
             }
         }
     }
@@ -184,10 +212,14 @@ extension View {
     func deleteGameSheet(_ game: Binding<LibraryGame?>, shellRoot: String, library: GameLibrary, loc: Localizer, pad: PadFocus,
                          scope: @escaping () -> String) -> some View {
         sheet(item: game) { game in
-            DeleteGameSheet(game: game, shellRoot: shellRoot) { failed in
-                library.remove(game.id)
+            DeleteGameSheet(game: game, shellRoot: shellRoot, onComplete: { removedUpstream, failed in
+                if let removedUpstream {
+                    library.removeBuildArtifact(upstream: removedUpstream, for: game.id)
+                } else {
+                    library.remove(game.id)
+                }
                 if !failed.isEmpty { library.error = String(format: loc.t("delete.failed"), failed.joined(separator: "\n")) }
-            }
+            })
             .environmentObject(pad)
         }
         .onChange(of: game.wrappedValue?.id) { id in pad.scope = id != nil ? "delete" : scope() }

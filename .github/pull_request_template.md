@@ -1,8 +1,8 @@
-<!-- One change per PR. CONTRIBUTING.md says where a change may go. The engine (`dm/`, `scripts/`, `docs/`, `ref/`) is not in this repository: it is seedds/nxnative plus `patches/`. -->
+<!-- One change per PR. CONTRIBUTING.md says where a change may go. The engine (`dm/`, `scripts/`, `docs/`, `ref/`) is not in this repository: it is seedds/nxnative plus the maintainers' `patches/`. We take no engine patches from outside: send them to seedds/nxnative. -->
 
 ## Fix or feature
 
-<!-- Tick one. A fix merges when CI is green and no "changes requested" review is open, a maintainer's feature after 48 hours. An outside PR merges after a maintainer tried it and reviewed it. A patch is renumbered at merge. Maintainers label it `bug` or `enhancement`. -->
+<!-- Tick one. A fix merges when CI is green and no "changes requested" review is open, a maintainer's feature after 48 hours. An outside PR merges after a maintainer tried it and reviewed it. A maintainer's patch is renumbered at merge. Maintainers label it `bug` or `enhancement`. -->
 - [ ] Fix
 - [ ] Feature
 
@@ -10,11 +10,15 @@ Feature from outside: the issue in a milestone is linked.
 
 ## What and why
 
-<!-- The symptom or the need, the cause, and the change. Link the issue (Fixes #...). -->
+<!-- Three short lines a maintainer reads in 30 seconds, one or two sentences each. Link the issue (Fixes #...).
+**Problem.** What goes wrong, or what is needed.
+**Cause.** Why. Leave out for a feature.
+**Change.** What this PR does.
+Put the long analysis, logs and traces in a <details> block below. See CONTRIBUTING.md, "Short and plain texts". -->
 
 ## Checked
 
-<!-- Delete what does not apply. Say what was not checked too. -->
+<!-- Delete what does not apply. One line each. Say what was not checked too. Long output goes in a <details> block. -->
 - Tests: <!-- `cd frontend && swift test`, frontend-qt tests if you changed it, `python3 tools/engine.py check` when `patches/` changed -->
 - Test for a fix: <!-- the test for the bug, or why none can exist (it needs a real device, iCloud or a real game) -->
 - Visual QA: <!-- `NX_LAUNCHER_CAPTURE_DIR=<dir> swift test` captures the views, for a UI change -->
@@ -28,7 +32,7 @@ Feature from outside: the issue in a milestone is linked.
 
 ## Scope
 
-- [ ] No engine file (`dm/`, `scripts/`, `docs/`, `ref/`) is added to the repository: a change there is a patch in `patches/` (a commit in `engine/`, then `tools/engine.py export`, and `tools/engine.py check` passes), with its `Upstream-Status`
-- [ ] A fix to the engine or a game profile also goes to seedds/nxnative as a PR in parallel: this PR's patch says `forwarded seedds/nxnative#...`, or `pending` until that PR is open
+- [ ] No engine file (`dm/`, `scripts/`, `docs/`, `ref/`) is added to the repository
+- [ ] No file in `patches/` is added or changed, unless a maintainer does it (engine fixes and game profiles go to seedds/nxnative as a PR)
 - [ ] A change to a launcher view has before and after screenshots above
 - [ ] No keys, game files or data extracted from a game in the change or the attachments

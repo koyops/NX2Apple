@@ -30,13 +30,35 @@ import NXModel
         let mac = BuildNotice.text(.finished, game: "Metroid Dread", target: "mac-app", device: nil, en)
         XCTAssertEqual(mac.title, "Metroid Dread is built")
         XCTAssertEqual(mac.body, "For this Mac, in your library")
-        XCTAssertEqual(BuildNotice.text(.finished, game: "Hades", target: "ios", device: nil, en).body, "For iPhone / iPad")
+        XCTAssertEqual(BuildNotice.text(.finished, game: "Hades", target: "ios", device: nil, en).body, "For iOS")
         XCTAssertEqual(BuildNotice.text(.finished, game: "Hades", target: "ios", device: "Jo’s iPhone", en).body, "Installed on Jo’s iPhone")
         let failed = BuildNotice.text(.failed(reason: "Extract · exit code 3"), game: "Hades", target: "ios", device: nil, en)
         XCTAssertEqual(failed.title, "Hades couldn’t be built")
-        XCTAssertEqual(failed.body, "For iPhone / iPad\nExtract · exit code 3")
+        XCTAssertEqual(failed.body, "For iOS\nExtract · exit code 3")
         let zh = BuildNotice.text(.failed(reason: ""), game: "Hades", target: "mac-app", device: nil) { L10n.string($0, .zh) }
         XCTAssertTrue(zh.title.contains("Hades") && !zh.title.contains("notify.") && !zh.body.contains("notify."), zh.title)
+        let updatedEn = BuildNotice.text(.finished, game: "Hades", target: "ios", device: "iPhone", en, shellUpdated: true)
+        XCTAssertEqual(updatedEn.body, "Installed on iPhone\nUpdated the game shell on iPhone")
+        let updatedZh = BuildNotice.text(.finished, game: "Hades", target: "ios", device: "iPhone", { L10n.string($0, .zh) }, shellUpdated: true)
+        XCTAssertTrue(updatedZh.body.contains("已为 iPhone 更新游戏壳"), updatedZh.body)
+    }
+
+    func testAFailedBuildEndsWithAFailureNotice() {
+        var failed = Stage(id: 2, name: "Mac shaders")
+        failed.state = .failed
+        failed.detail = "exit code 1"
+        // `done` stays false for a failure: the note or a failed stage tells it
+        XCTAssertEqual(BuildNotice.ended(stopped: false, running: false, done: false, note: "nxb: error", stages: []), .failed(reason: "nxb: error"))
+        XCTAssertEqual(BuildNotice.ended(stopped: false, running: false, done: false, note: "", stages: [failed]), .failed(reason: "Mac shaders · exit code 1"))
+        XCTAssertEqual(BuildNotice.ended(stopped: false, running: false, done: true, note: "Mac app ready", stages: []), .finished)
+        XCTAssertEqual(BuildNotice.ended(stopped: true, running: false, done: false, note: "Stopped", stages: []), .stopped)
+    }
+
+    func testNothingHasEndedWhileTheChainGoesOn() {
+        let done = Stage(id: 1, name: "Extract", state: .done)
+        XCTAssertNil(BuildNotice.ended(stopped: false, running: true, done: false, note: "", stages: [done]), "still running")
+        XCTAssertNil(BuildNotice.ended(stopped: false, running: true, done: true, note: "", stages: [done]), "the Mac target sets done before running goes false")
+        XCTAssertNil(BuildNotice.ended(stopped: false, running: false, done: false, note: "", stages: [done]), "the iPhone chain between its script and the install")
     }
 
     func testTheFailureReasonIsTheBuildsOwnLastWord() {
@@ -46,6 +68,10 @@ import NXModel
         XCTAssertEqual(BuildNotice.failureReason(note: "", stages: [Stage(id: 1, name: "Survey", state: .done), stage]), "Extract · exit code 3")
         XCTAssertEqual(BuildNotice.failureReason(note: "Build failed: no Program NCA", stages: [stage]), "Build failed: no Program NCA")
         XCTAssertEqual(BuildNotice.failureReason(note: "", stages: []), "")
+        // A script stage keeps its English name; the notice names it in the launcher's language (#1115)
+        var check = Stage(id: 4, name: "check v655360 files")
+        check.state = .failed
+        XCTAssertEqual(BuildNotice.failureReason(note: "", stages: [check]) { L10n.string($0, .zh) }, "检查 v655360 文件")
     }
 
     // MARK: Visual QA (matched by --filter testRenderLauncherForVisualQA)

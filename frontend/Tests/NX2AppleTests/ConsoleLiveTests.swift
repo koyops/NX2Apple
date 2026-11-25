@@ -1,5 +1,6 @@
 import XCTest
 import SwiftUI
+import NXModel
 @testable import NX2Apple
 @testable import NXCore
 @testable import NXLauncher
@@ -36,12 +37,12 @@ import SwiftUI
 
     private struct Launch { var game: LibraryGame; var environment: [String: String] }
 
-    private func makeDriver(controls: ControlLayout? = nil, pads: [ConsolePadSnapshot] = [], launched: @escaping (Launch) -> Void = { _ in }) throws
+    private func makeDriver(grace: TimeInterval = 0, controls: ControlLayout? = nil, pads: [ConsolePadSnapshot] = [], launched: @escaping (Launch) -> Void = { _ in }) throws
         -> (LiveConsoleDriver, GameLibrary, ControlLayout) {
         let library = GameLibrary(file: temporary.appendingPathComponent("library.json"))
         _ = try library.addApp(try makeApp())
         let layout = controls ?? ControlLayout(defaults: TestDefaults.make("ConsoleLiveTests"))
-        let driver = LiveConsoleDriver(library: library, controls: layout, repo: { "" }, lang: { .en }, labels: { L10n.string($0, .en) },
+        let driver = LiveConsoleDriver(launchGracePeriod: grace, library: library, controls: layout, repo: { "" }, lang: { .en }, labels: { L10n.string($0, .en) },
                                        pads: { pads }, launch: { game, env, done in launched(Launch(game: game, environment: env)); done(4242, nil) },
                                        artwork: { _, _ in nil }, startingTimeout: 0.2, observeSystem: false)
         return (driver, library, layout)
@@ -70,6 +71,60 @@ import SwiftUI
         XCTAssertEqual(LiveConsoleDriver.platforms(of: broken), [.mac])
     }
 
+    func testUnbuiltGameCanQueueAndStartWithSavedKeys() throws {
+        let (driver, library, _) = try makeDriver()
+        let stores = LauncherStores(localizer: Localizer(.en), defaults: testDefaults)
+        let package = temporary.appendingPathComponent("base.nsp")
+        try Data("package".utf8).write(to: package)
+        let keys = temporary.appendingPathComponent("prod.keys")
+        try Data("keys".utf8).write(to: keys)
+        var game = LibraryGame(titleID: "01001A9012346000", name: "Unbuilt")
+        game.inputs = ["base": [package.path]]
+        game.outputDirectory = temporary.path
+        library.upsert(game)
+        driver.refresh()
+        let queue = BuildQueueStore(file: nil, engineID: { "test-engine" }, busy: { false }, start: { _ in nil })
+        driver.bindBuilds(stores.build, queue: queue)
+        driver.buildEngineID = { "test-engine" }
+        driver.openOptions(game.id.uuidString)
+        let optionGame = try XCTUnwrap(driver.state.games.first { $0.id == game.id.uuidString })
+        XCTAssertEqual(driver.state.presentedSheet, .options(game.id.uuidString))
+        XCTAssertEqual(ConsoleGameOptionsList<LiveConsoleDriver>.firstTarget(optionGame), "console.options.build")
+
+        driver.buildGame(game.id.uuidString, queueOnly: true)
+        XCTAssertTrue(queue.entries.isEmpty)
+        XCTAssertEqual(driver.state.toast?.message, L10n.string("console.build.missingKeys", .en))
+
+        stores.build.saveKeys(keys.path)
+        driver.buildGame(game.id.uuidString, queueOnly: true)
+        XCTAssertEqual(queue.queued.count, 1)
+        XCTAssertEqual(queue.queued.first?.inputs["base"], [package.path])
+        XCTAssertEqual(queue.queued.first?.outputDirectory, temporary.path)
+        XCTAssertEqual(queue.queued.first?.engineID, "test-engine")
+        XCTAssertEqual(queue.queued.first?.target, BuildTarget.mac)
+        XCTAssertEqual(driver.state.presentedSheet, .builds)
+
+        driver.back()
+        driver.buildGame(game.id.uuidString, queueOnly: false)
+        XCTAssertEqual(queue.running?.gameID, game.id)
+        XCTAssertEqual(queue.entries.count, 1)
+        XCTAssertEqual(LiveConsoleDriver.builds(running: true, stopping: false, title: "Unbuilt", stages: [], queue: queue.entries).queue.first?.name, "Unbuilt")
+    }
+
+    func testUnbuiltGameReportsMissingPackageBeforeQueueing() throws {
+        let (driver, library, _) = try makeDriver()
+        let stores = LauncherStores(localizer: Localizer(.en), defaults: testDefaults)
+        var game = LibraryGame(titleID: "01001A9012346000", name: "Unbuilt")
+        game.inputs = ["base": [temporary.appendingPathComponent("gone.nsp").path]]
+        library.upsert(game)
+        driver.refresh()
+        let queue = BuildQueueStore(file: nil, engineID: { "test-engine" }, busy: { false }, start: { _ in nil })
+        driver.bindBuilds(stores.build, queue: queue)
+        driver.buildGame(game.id.uuidString, queueOnly: false)
+        XCTAssertTrue(queue.entries.isEmpty)
+        XCTAssertTrue(driver.state.toast?.message.contains("gone.nsp") == true)
+    }
+
     func testPlayRoutesToTheLaunchWithTheDesktopEnvironment() throws {
         var launches: [Launch] = []
         let (driver, _, layout) = try makeDriver { launches.append($0) }
@@ -82,8 +137,49 @@ import SwiftUI
         if let main = NSScreen.main { XCTAssertEqual(launches.first?.environment["DM_SCREEN"], GameStart.displayID(of: main).map(String.init), "the game opens on the launcher's display") }
         XCTAssertEqual(launches.first?.environment["DM_FULLSCREEN"], "1", "console mode plays fullscreen whatever Display says")
         XCTAssertEqual(launches.first?.game.titleID, titleID)
-        let expected = launches.first.map { GameStart.environment(for: $0.game, library: GameLibrary(file: temporary.appendingPathComponent("other.json")), controls: layout, repo: "", labels: { L10n.string($0, .en) }, fullscreen: true) }
-        XCTAssertEqual(launches.first?.environment, expected, "the same function the desktop Play uses, with the console's fullscreen")
+        let expected = launches.first.map { GameStart.environment(for: $0.game, library: GameLibrary(file: temporary.appendingPathComponent("other.json")), controls: layout, repo: "", labels: { L10n.string($0, .en) }, fullscreen: true, homeMenu: true) }
+        XCTAssertEqual(launches.first?.environment, expected, "the same function the desktop Play uses, with the console's fullscreen and Home menu")
+    }
+
+    func testBackDuringLaunchGracePreventsLaunchAndRetryLaunchesOnce() async throws {
+        var launches: [Launch] = []
+        let (driver, _, _) = try makeDriver(grace: 0.08) { launches.append($0) }
+        let id = try XCTUnwrap(driver.state.games.first?.id)
+        driver.play(id)
+        XCTAssertTrue(driver.state.launchCancellable)
+        XCTAssertTrue(launches.isEmpty)
+        driver.back()
+        XCTAssertNil(driver.state.startingGameID)
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertTrue(launches.isEmpty)
+        driver.play(id); driver.play(id)
+        for _ in 0..<50 where driver.state.starting != .opening { try await Task.sleep(nanoseconds: 20_000_000) }
+        XCTAssertEqual(launches.count, 1)
+        XCTAssertFalse(driver.state.launchCancellable)
+        driver.back()
+        XCTAssertNil(driver.state.startingGameID)
+        XCTAssertEqual(driver.tracking.gameID, id, "The real process stays tracked after dismissing loading")
+    }
+
+    func testCancelledPreparationCannotLaunchAfterRetryingSameGame() throws {
+        var launches: [Launch] = []
+        let (driver, _, _) = try makeDriver { launches.append($0) }
+        var releases: [() -> Void] = []
+        var ended = 0
+        driver.prepareLaunch = { releases.append($0) }
+        driver.gameEnded = { ended += 1 }
+        let id = try XCTUnwrap(driver.state.games.first?.id)
+        driver.play(id)
+        driver.back()
+        XCTAssertNil(driver.state.startingGameID)
+        driver.play(id)
+        XCTAssertEqual(releases.count, 2)
+        releases[0]()
+        XCTAssertTrue(launches.isEmpty)
+        XCTAssertEqual(ended, 1)
+        releases[1]()
+        XCTAssertEqual(launches.count, 1)
+        XCTAssertEqual(driver.state.startingGameID, id)
     }
 
     func testAGameStartsWithThePointerHiddenWhenTheConsoleHadItHidden() throws {
@@ -172,13 +268,24 @@ import SwiftUI
         XCTAssertNil(driver.state.presentedSheet, "before macOS 27 the Home button does not quit, so there is nothing to explain")
     }
 
-    /// #336: the game's quit prompt gets its texts in the launcher's language, with the game's name.
+    /// #336: the game's quit prompt gets its texts in the launcher's language, with the game's name. #952: a game started from console
+    /// mode also gets the Home menu's three (Resume, Back to console mode, its title) and the way back to the launcher.
     func testPlayPassesTheHomeQuitTexts() throws {
         var launches: [Launch] = []
-        let (driver, _, _) = try makeDriver { launches.append($0) }
+        let (driver, library, layout) = try makeDriver { launches.append($0) }
         driver.play(try XCTUnwrap(driver.state.games.first?.id))
-        let text = try XCTUnwrap(launches.first?.environment["DM_HOME_QUIT_TEXT"])
-        XCTAssertEqual(text.components(separatedBy: "\n"), ["Keep holding to quit", "Quit Hades?", "Unsaved progress will be lost.", "Quit", "Cancel"])
+        let environment = try XCTUnwrap(launches.first?.environment)
+        let text = try XCTUnwrap(environment["DM_HOME_QUIT_TEXT"])
+        XCTAssertEqual(text.components(separatedBy: "\n"), ["Keep holding to quit", "Quit Hades?", "Unsaved progress will be lost.", "Quit", "Cancel",
+                                                             "Resume", "Back to console mode", "Hades"])
+        XCTAssertEqual(environment["DM_HOME_MENU_LAUNCHER"], "1", "Back to console mode is offered")
+        XCTAssertEqual(environment["DM_LAUNCHER_BUNDLE_ID"], Bundle.main.bundleIdentifier, "the game hands the front back to this app")
+        // the desktop's Play stays as it was: no Home menu row, five texts
+        let game = try XCTUnwrap(library.games.first)
+        let desktop = GameStart.environment(for: game, library: library, controls: layout, repo: "", labels: { L10n.string($0, .en) })
+        XCTAssertNil(desktop["DM_HOME_MENU_LAUNCHER"])
+        XCTAssertNil(desktop["DM_LAUNCHER_BUNDLE_ID"])
+        XCTAssertEqual(desktop["DM_HOME_QUIT_TEXT"]?.components(separatedBy: "\n").count, 5)
     }
 
     func testOptionsRoundTripThroughSavedChoices() throws {
@@ -221,23 +328,63 @@ import SwiftUI
         XCTAssertNotNil(driver.state.toast, "a Bluetooth controller cannot be dropped by an app: the toast says where")
     }
 
-    func testJoyconSplitExpandsPairedJoyConIntoTwoSidewaysPlayers() throws {
+    /// A game's options page keeps what it read when it opened (its cloud save, whether Reset applies) across a rebuilt list, and
+    /// Reset shows as soon as an option differs.
+    func testOpenOptionsKeepTheirDetails() throws {
+        let (driver, _, _) = try makeDriver()
+        let id = try XCTUnwrap(driver.state.games.first?.id)
+        driver.openOptions(id)
+        XCTAssertNotNil(driver.state.games.first?.save, "the cloud save's state is read with the options")
+        XCTAssertNotNil(driver.state.games.first?.cheats)
+        driver.setOption(gameID: id, setting: "DM_FPS_TARGET", value: "30")
+        XCTAssertEqual(driver.state.games.first?.canReset, true, "an option that differs shows Reset at once")
+        driver.refresh()
+        XCTAssertNotNil(driver.state.games.first?.save, "a rebuilt list keeps the open page's details")
+        XCTAssertEqual(driver.state.games.first?.canReset, true)
+        driver.setOption(gameID: id, setting: "DM_FPS_TARGET", value: "60")
+    }
+
+    /// The console's button mapping is the Controls page's controller layout: a button changed there makes it Custom, Reset goes back
+    /// to the standard layout, and the sheet shows what the layout sends.
+    func testMappingChangesTheSharedControllerLayout() throws {
+        let (driver, _, layout) = try makeDriver(pads: [])
+        driver.openMenu()
+        XCTAssertEqual(driver.state.presentedSheet, .menu)
+        driver.openMapping()
+        XCTAssertEqual(driver.state.presentedSheet, .mapping)
+        driver.openMappingRow("A")
+        XCTAssertEqual(driver.state.mappingRow, "A")
+        driver.setPadSends(button: "A", to: "B")
+        driver.refreshPadLayout()
+        XCTAssertEqual(layout.padMode, .custom)
+        XCTAssertEqual(layout.environment["DM_PAD_MAP"], "A=B")
+        XCTAssertEqual(driver.state.padLayout.mode, .custom)
+        XCTAssertEqual(driver.state.padLayout.output("A"), "B")
+        XCTAssertTrue(driver.state.padLayout.changed("A"))
+        driver.setPadSends(button: "X", to: "nonsense")
+        XCTAssertNil(layout.environment["DM_PAD_MAP"]?.range(of: "X="), "an unknown button is refused")
+        driver.back()
+        XCTAssertNil(driver.state.mappingRow, "B in a button's choices goes back to the list")
+        XCTAssertEqual(driver.state.presentedSheet, .mapping)
+        driver.setPadMode(.byLabel)
+        driver.refreshPadLayout()
+        XCTAssertEqual(driver.state.padLayout.output("A"), "B")
+        XCTAssertEqual(driver.state.padLayout.output("X"), "Y")
+        driver.resetPadMapping()
+        driver.refreshPadLayout()
+        XCTAssertTrue(driver.state.padLayout.isDefault)
+        XCTAssertNil(layout.environment["DM_PAD_MAP"])
+        driver.back(); driver.back()
+        XCTAssertNil(driver.state.presentedSheet, "mapping, then the menu, close in turn")
+    }
+
+    func testPairedJoyConRemainsSinglePairedControllerInList() throws {
         let pads = [ConsolePadSnapshot(id: "jc", name: "Joy-Con (L/R)", category: "Nintendo Switch Joy-Con (L/R)", playerIndex: 1, battery: 0.75, charging: true)]
-        let (driver, _, layout) = try makeDriver(pads: pads)
+        let (driver, _, _) = try makeDriver(pads: pads)
         XCTAssertEqual(driver.state.controllers.map(\.name), ["Joy-Con (L/R)"])
         XCTAssertEqual(driver.state.controllers.map(\.kind), [.paired])
-        driver.setJoyconSplit(true)
-        XCTAssertTrue(layout.joyconSplit)
-        XCTAssertTrue(driver.state.joyconSplit)
-        XCTAssertEqual(driver.state.controllers.map(\.id), ["jc.L", "jc.R"])
-        XCTAssertEqual(driver.state.controllers.map(\.name), ["Joy-Con (L)", "Joy-Con (R)"])
-        XCTAssertEqual(driver.state.controllers.map(\.kind), [.gamepad, .gamepad])
-        XCTAssertEqual(driver.state.controllers.map(\.player), [1, 2])
-        XCTAssertEqual(driver.state.controllers.map(\.batteryPercent), [75, 75])
-        driver.setJoyconSplit(false)
-        XCTAssertFalse(layout.joyconSplit)
-        XCTAssertEqual(driver.state.controllers.map(\.name), ["Joy-Con (L/R)"])
         XCTAssertEqual(driver.state.controllers.map(\.player), [1])
+        XCTAssertEqual(driver.state.controllers.map(\.batteryPercent), [75])
     }
 
     func testEnteringAndLeavingConsoleModeRestoresTheWindowInOrder() async throws {
@@ -260,6 +407,23 @@ import SwiftUI
         XCTAssertEqual(calls, [true], "the window has not left full screen yet")
         try await Task.sleep(nanoseconds: 150_000_000)
         coordinator.toggle()
+    }
+
+    /// Console mode's Play: the launcher stays full screen while the game starts, and nothing changes the window when it quits.
+    func testAGameStartsWithTheConsoleStillFullScreen() {
+        var calls: [Bool] = []
+        let window = ConsoleFullScreenTestWindow(contentRect: .zero, styleMask: [.titled], backing: .buffered, defer: true)
+        window.isFull = true
+        let coordinator = ConsoleCoordinator(window: { window }, setFullScreen: { _, on, done in calls.append(on); done() }, fadeSeconds: 0.05)
+        coordinator.available = true
+        coordinator.enter()
+        var launched = 0
+        coordinator.startGameInFullScreen { launched += 1 }
+        XCTAssertEqual(launched, 1, "the game starts at once")
+        XCTAssertEqual(calls, [], "the window stays full screen")
+        coordinator.resumeFullScreenAfterGame()
+        XCTAssertEqual(calls, [], "and is left alone when the game quits")
+        XCTAssertTrue(coordinator.active)
     }
 
     func testAGameStartsFromAWindowThatLeftFullScreenAndFullScreenReturnsAfterIt() throws {
@@ -456,6 +620,11 @@ import SwiftUI
         XCTAssertEqual(LiveConsoleDriver.version(plist: try PropertyListSerialization.data(fromPropertyList: ["CFBundleShortVersionString": "1.2.3"], format: .xml, options: 0)), "1.2.3")
         XCTAssertEqual(LiveConsoleDriver.version(plist: try PropertyListSerialization.data(fromPropertyList: ["CFBundleVersion": "7"], format: .xml, options: 0)), "7")
         XCTAssertEqual(LiveConsoleDriver.version(plist: Data([0])), "")
+        let plist = { (info: [String: String]) in try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0) }
+        // #953: an update packed from a dump has no display version; its CFBundleShortVersionString is pack_app.py's 1.0, not what runs
+        XCTAssertEqual(LiveConsoleDriver.version(plist: try plist(["CFBundleShortVersionString": "1.0", "DMPackageVersion": "v458752"])), "v458752")
+        XCTAssertEqual(LiveConsoleDriver.version(plist: try plist(["CFBundleShortVersionString": "1.2.1", "DMDisplayVersion": "1.2.1", "DMPackageVersion": "v131072"])), "1.2.1")
+        XCTAssertEqual(LiveConsoleDriver.version(plist: try plist(["CFBundleShortVersionString": "1.0", "DMPackageVersion": "v0"])), "", "the base game without a display version")
         let ios = temporary.appendingPathComponent("ios.app")
         try FileManager.default.createDirectory(at: ios, withIntermediateDirectories: true)
         try PropertyListSerialization.data(fromPropertyList: ["CFBundleShortVersionString": "2.0.1"], format: .xml, options: 0).write(to: ios.appendingPathComponent("Info.plist"))
@@ -474,7 +643,7 @@ import SwiftUI
         XCTAssertEqual(ConsolePadSnapshot.batteryReading(level: 0, state: .charging).level, 0, "charging reports its real level, even a low one")
         let full = ConsolePadSnapshot.batteryReading(level: 0, state: .full)
         XCTAssertEqual(full.level, 1, "full: the full battery")
-        XCTAssertTrue(full.charging, "with the bolt")
+        XCTAssertFalse(full.charging, "full does not imply a charging cable (#1033)")
         let topped = ConsolePadSnapshot.batteryReading(level: 1.0, state: .charging)
         XCTAssertEqual(topped.level, 1)
         XCTAssertTrue(topped.charging)
@@ -496,7 +665,9 @@ import SwiftUI
     }
 
     func testSelectButtonGlyphAndInput() {
-        XCTAssertNil(ConsoleInput(.select), "in console mode Select does nothing special")
+        XCTAssertEqual(ConsoleInput(.select), .quickMenu, "in console mode Select opens the quick menu (#816)")
+        XCTAssertEqual(ConsoleInput(.plus), .menu, "so does the menu button")
+        XCTAssertEqual(ConsoleInput(.y), .options, "Y opens a game's options")
         XCTAssertEqual(ConsoleGlyphs.Role.select.element, .select)
         XCTAssertEqual(ConsoleGlyphs(family: .playStation, reported: [.select: "square.and.arrow.up"]).glyph(for: .select), .symbol("square.and.arrow.up"), "the controller's own symbol")
         for family in [ConsoleGlyphs.Family.xbox, .playStation, .nintendo, .neutral] {
@@ -510,7 +681,7 @@ import SwiftUI
     func testConnectNotificationPublishesTheNewControllerAtOnce() async throws {
         var current = [ConsolePadSnapshot(id: "first", name: "First", category: "DualShock 4", playerIndex: nil)]
         let library = GameLibrary(file: temporary.appendingPathComponent("library.json"))
-        let driver = LiveConsoleDriver(library: library, controls: ControlLayout(defaults: TestDefaults.make("ConsoleLiveTests")),
+        let driver = LiveConsoleDriver(launchGracePeriod: 0, library: library, controls: ControlLayout(defaults: TestDefaults.make("ConsoleLiveTests")),
                                        repo: { "" }, lang: { .en }, labels: { $0 }, pads: { current }, artwork: { _, _ in nil }, observeSystem: true)
         XCTAssertEqual(driver.state.controllers.map(\.id), ["first"])
         XCTAssertEqual(driver.state.controllers.map(\.player), [1])
@@ -561,7 +732,7 @@ import SwiftUI
         layout.padMerge = merge
         let pads = [ConsolePadSnapshot(id: "xbox", name: "Xbox Wireless Controller", category: "Xbox One", playerIndex: nil),
                     ConsolePadSnapshot(id: "ds4", name: "DUALSHOCK 4", category: "DualShock 4", playerIndex: nil)]
-        let driver = LiveConsoleDriver(library: GameLibrary(file: temporary.appendingPathComponent("library.json")), controls: layout, repo: { "" }, lang: { .en },
+        let driver = LiveConsoleDriver(launchGracePeriod: 0, library: GameLibrary(file: temporary.appendingPathComponent("library.json")), controls: layout, repo: { "" }, lang: { .en },
                                        labels: { $0 }, pads: { pads }, artwork: { _, _ in nil }, observeSystem: false)
         driver.captureSeconds = 0.2
         driver.openControllers()
@@ -612,7 +783,7 @@ import SwiftUI
     // MARK: Hardware placeholders and reconnects
 
     private func liveDriver(pads: @escaping () -> [ConsolePadSnapshot]) -> LiveConsoleDriver {
-        LiveConsoleDriver(library: GameLibrary(file: temporary.appendingPathComponent("library.json")),
+        LiveConsoleDriver(launchGracePeriod: 0, library: GameLibrary(file: temporary.appendingPathComponent("library.json")),
                           controls: ControlLayout(defaults: TestDefaults.make("ConsoleLiveTests")),
                           repo: { "" }, lang: { .en }, labels: { $0 }, pads: pads, artwork: { _, _ in nil }, observeSystem: false)
     }
@@ -654,7 +825,7 @@ import SwiftUI
     func testTwoControllersTogetherAndOneReconnects() {
         var list = [ConsolePadSnapshot(id: "ds4", name: "DUALSHOCK 4 Wireless Controller", category: "DualShock 4", playerIndex: nil, battery: nil),
                     ConsolePadSnapshot(id: "xbox", name: "Xbox Wireless Controller", category: "Xbox One", playerIndex: nil, battery: 0.8)]
-        let driver = LiveConsoleDriver(library: GameLibrary(file: temporary.appendingPathComponent("library.json")),
+        let driver = LiveConsoleDriver(launchGracePeriod: 0, library: GameLibrary(file: temporary.appendingPathComponent("library.json")),
                                        controls: ControlLayout(defaults: TestDefaults.make("ConsoleLiveTests")),
                                        repo: { "" }, lang: { .en }, labels: { $0 }, pads: { list }, artwork: { _, _ in nil }, observeSystem: false)
         XCTAssertEqual(driver.state.controllers.map(\.id), ["ds4", "xbox"], "both appear together")
@@ -733,7 +904,7 @@ import SwiftUI
     func testPlayerOutputOnConnectMakesTheBatteryAppear() async throws {
         var wroteOutput = false
         var sent: [(String, Int)] = []
-        let driver = LiveConsoleDriver(library: GameLibrary(file: temporary.appendingPathComponent("library.json")),
+        let driver = LiveConsoleDriver(launchGracePeriod: 0, library: GameLibrary(file: temporary.appendingPathComponent("library.json")),
                                        controls: ControlLayout(defaults: TestDefaults.make("ConsoleLiveTests")),
                                        repo: { "" }, lang: { .en }, labels: { $0 },
                                        pads: { [ConsolePadSnapshot(id: "g7", name: "DUALSHOCK 4 Wireless Controller", category: "DualShock 4", playerIndex: nil, battery: wroteOutput ? 0.72 : nil)] },
@@ -754,7 +925,7 @@ import SwiftUI
     func testRepeatedConnectAndDisconnectNotificationsAreIdempotent() {
         var list: [ConsolePadSnapshot] = []
         var writes: [(String, Int)] = []
-        let driver = LiveConsoleDriver(library: GameLibrary(file: temporary.appendingPathComponent("library.json")),
+        let driver = LiveConsoleDriver(launchGracePeriod: 0, library: GameLibrary(file: temporary.appendingPathComponent("library.json")),
                                        controls: ControlLayout(defaults: TestDefaults.make("ConsoleLiveTests")),
                                        repo: { "" }, lang: { .en }, labels: { $0 }, pads: { list }, artwork: { _, _ in nil }, observeSystem: false,
                                        playerOutput: { writes.append(($0, $1)) })
@@ -776,10 +947,7 @@ import SwiftUI
         XCTAssertTrue(driver.state.controllers.isEmpty)
     }
 
-    /// Regression test (#740): a paired Joy-Con is a single GCController instance with one shared `playerIndex` property.
-    /// Writing `.R`'s assigned player back to that shared hardware slot used to overwrite `.L`'s playerIndex, causing P1 and P2
-    /// to ping-pong on every reread and spawning an exponential storm of reread Tasks.
-    func testSplitJoyConPairDoesNotPingPongSharedHardwarePlayerIndex() {
+    func testPairedJoyConDoesNotRepeatPlayerOutputAcrossRereads() {
         var hardwarePlayerIndex: Int? = 1
         var writes: [(String, Int)] = []
         let layout = ControlLayout(defaults: TestDefaults.make("ConsoleLiveTests"))
@@ -792,21 +960,16 @@ import SwiftUI
             artwork: { _, _ in nil }, observeSystem: false,
             playerOutput: { id, player in
                 writes.append((id, player))
-                hardwarePlayerIndex = player   // shared GCController.playerIndex
+                hardwarePlayerIndex = player
             })
         XCTAssertEqual(driver.state.controllers.map(\.id), ["jc"])
         XCTAssertEqual(driver.state.controllers.map(\.player), [1])
+        let initialWrites = writes.count
 
-        driver.setJoyconSplit(true)
-        XCTAssertEqual(driver.state.controllers.map(\.id), ["jc.L", "jc.R"])
-        XCTAssertEqual(driver.state.controllers.map(\.player), [1, 2])
-        let countAfterSplit = writes.count
-
-        // Subsequent rereads (e.g. from primeOutputs or battery KVO) must keep L=1, R=2 stable and emit no new hardware writes.
         for _ in 0..<5 {
             driver.refreshControllers(announce: false)
-            XCTAssertEqual(driver.state.controllers.map(\.player), [1, 2], "P1 and P2 must not ping-pong across rereads")
-            XCTAssertEqual(writes.count, countAfterSplit, "no new player output writes when nothing changed")
+            XCTAssertEqual(driver.state.controllers.map(\.player), [1])
+            XCTAssertEqual(writes.count, initialWrites, "no new player output writes when nothing changed")
         }
     }
 }

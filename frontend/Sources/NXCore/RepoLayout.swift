@@ -9,6 +9,7 @@ package enum RepoLayout {
     /// tool the launcher calls goes into this list and is then checked before every build.
     package static let buildScript = "scripts/build_ipa_from_nsp.py"
     package static let romfsImageTool = "dm/tools/romfs_image.py"
+    package static let buildSeedTool = "dm/tools/build_seed.py"
     package static let requiredTools = [buildScript, romfsImageTool]
 
     /// Home shown as ~ (shorter in a one-line row, and it keeps the account name out of screenshots).
@@ -23,8 +24,46 @@ package enum RepoLayout {
 
     /// The tools of `requiredTools` that `dir` does not have (empty: the build tools are as new as this app needs).
     package static func missingTools(in dir: String) -> [String] {
-        let root = EngineLayout.root(dir)   // the checkout's engine/, or an engine tree itself
-        return requiredTools.filter { !FileManager.default.fileExists(atPath: root + "/" + $0) }
+        missingTools(in: dir, for: .nxnative)
+    }
+
+    package static func missingTools(in dir: String, for upstream: EngineUpstreamKind) -> [String] {
+        guard !dir.isEmpty else { return EngineUpstream.descriptor(for: upstream).requiredTools }
+        let descriptor = EngineUpstream.descriptor(for: upstream)
+        let fm = FileManager.default
+        switch upstream {
+        case .nxnative:
+            let root = EngineLayout.root(dir)
+            let prefix = root.hasSuffix("/") ? root : root + "/"
+            return descriptor.requiredTools.filter { !fm.fileExists(atPath: prefix + $0) }
+        case .s2arm, .macNativeGames, .nxkit, .kidWithSword, .noLagKart:
+            let prefix = dir.hasSuffix("/") ? dir : dir + "/"
+            return descriptor.requiredTools.filter { !fm.fileExists(atPath: prefix + $0) }
+        }
+    }
+
+    /// Whether the checkout's build script accepts `--progress` (JSON progress events).
+    package static func supportsProgressJson(_ dir: String) -> Bool {
+        let script = EngineLayout.root(dir) + "/" + buildScript
+        if !FileManager.default.fileExists(atPath: script), EngineLayout.hasEngineTool(dir) { return true }
+        guard let text = try? String(contentsOfFile: script, encoding: .utf8) else { return false }
+        return text.contains("'--progress'") || text.contains("\"--progress\"")
+    }
+
+    /// Whether the checkout's build script accepts `--bundle-id` for overriding the iOS app bundle identifier.
+    package static func supportsBundleID(_ dir: String) -> Bool {
+        let script = EngineLayout.root(dir) + "/" + buildScript
+        if !FileManager.default.fileExists(atPath: script), EngineLayout.hasEngineTool(dir) { return true }
+        guard let text = try? String(contentsOfFile: script, encoding: .utf8) else { return false }
+        return text.contains("'--bundle-id'") || text.contains("\"--bundle-id\"")
+    }
+
+    /// Whether the checkout's build script accepts `--env-file`.
+    package static func supportsEnvFile(_ dir: String) -> Bool {
+        let script = EngineLayout.root(dir) + "/" + buildScript
+        if !FileManager.default.fileExists(atPath: script), EngineLayout.hasEngineTool(dir) { return true }
+        guard let text = try? String(contentsOfFile: script, encoding: .utf8) else { return false }
+        return text.contains("'--env-file'") || text.contains("\"--env-file\"")
     }
 
     /// Whether the checkout's build script has this fork's `--work-dir` (issue #5): an upstream
@@ -43,6 +82,89 @@ package enum RepoLayout {
     package static func supportsRomfsFrom(_ dir: String) -> Bool {
         guard let text = try? String(contentsOfFile: EngineLayout.root(dir) + "/" + buildScript, encoding: .utf8) else { return false }
         return text.contains("'--romfs-from'") || text.contains("\"--romfs-from\"")
+    }
+
+    /// Whether the checkout's build script takes `--fallback-icon` (upstream `5714e328`, #784), which an older engine stops at with
+    /// "unrecognized arguments". Read from the script's argparse, as for `--romfs-from`.
+    package static func supportsFallbackIcon(_ dir: String) -> Bool {
+        guard let text = try? String(contentsOfFile: EngineLayout.root(dir) + "/" + buildScript, encoding: .utf8) else { return false }
+        return text.contains("'--fallback-icon'") || text.contains("\"--fallback-icon\"")
+    }
+
+    /// Whether the checkout's build script takes `--from-seed` (PR #3 fast refresh).
+    package static func supportsBuildSeed(_ dir: String) -> Bool {
+        guard let text = try? String(contentsOfFile: EngineLayout.root(dir) + "/" + buildScript, encoding: .utf8) else { return false }
+        return text.contains("'--from-seed'") || text.contains("\"--from-seed\"")
+    }
+
+    /// Whether the checkout's `build_seed.py` supports `scan-uncompressed` and `compress-seeds`.
+    package static func supportsSeedCompression(_ dir: String) -> Bool {
+        let script = EngineLayout.root(dir) + "/" + buildSeedTool
+        guard let text = try? String(contentsOfFile: script, encoding: .utf8) else { return false }
+        return text.contains("scan-uncompressed") && text.contains("compress-seeds")
+    }
+
+    /// Whether the checkout's build script takes `--seen-shaders` (partial Mac shader builds from `shader_seen.tsv`).
+    package static func supportsSeenShaders(_ dir: String) -> Bool {
+        guard let text = try? String(contentsOfFile: EngineLayout.root(dir) + "/" + buildScript, encoding: .utf8) else { return false }
+        return text.contains("'--seen-shaders'") || text.contains("\"--seen-shaders\"")
+    }
+
+    /// Whether the checkout's romfs tool takes `--extract-msl` (PR #3 shader trailer extraction).
+    package static func supportsExtractMsl(_ dir: String) -> Bool {
+        guard let text = try? String(contentsOfFile: EngineLayout.root(dir) + "/" + romfsImageTool, encoding: .utf8) else { return false }
+        return text.contains("'--extract-msl'") || text.contains("\"--extract-msl\"")
+    }
+
+    /// Whether the checkout's build script takes `--cheat-dir` for offline iOS cheat trampoline baking.
+    package static func supportsCheatDir(_ dir: String) -> Bool {
+        guard let text = try? String(contentsOfFile: EngineLayout.root(dir) + "/" + buildScript, encoding: .utf8) else { return false }
+        return text.contains("'--cheat-dir'") || text.contains("\"--cheat-dir\"")
+    }
+
+    /// Default Mac cheats directory (`~/Library/Application Support/nxnative/<TID>/cheats`) when it holds at least one `.txt` cheat file.
+    package static func existingCheatsDir(
+        titleID: String,
+        explicit: String? = nil,
+        home: String = NSHomeDirectory(),
+        fm: FileManager = .default
+    ) -> String? {
+        if let explicit {
+            let trimmed = explicit.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty, directoryHasCheatText(atPath: trimmed, titleID: titleID, fm: fm) {
+                return trimmed
+            }
+        }
+        let tid = titleID.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard !tid.isEmpty else { return nil }
+        let defaultDir = (home as NSString)
+            .appendingPathComponent("Library/Application Support/nxnative")
+            .appending("/\(tid)/cheats")
+        return directoryHasCheatText(atPath: defaultDir, titleID: tid, fm: fm) ? defaultDir : nil
+    }
+
+    private static func directoryHasCheatText(atPath path: String, titleID: String, fm: FileManager) -> Bool {
+        let tid = titleID.uppercased()
+        let dirs = [
+            path,
+            path + "/atmosphere/contents/\(tid)/cheats",
+            path + "/contents/\(tid)/cheats",
+        ]
+        for dir in dirs {
+            guard let names = try? fm.contentsOfDirectory(atPath: dir) else { continue }
+            for name in names where name.count >= 20 && name.lowercased().hasSuffix(".txt") && name.prefix(16).allSatisfy(\.isHexDigit) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Whether the checkout's build script allows opt-in iOS `--seen-shaders` (`ios_seen_shaders` + `DM_PARTIAL_SHADERS`).
+    package static func supportsIOSSeenShaders(_ dir: String) -> Bool {
+        guard let text = try? String(contentsOfFile: EngineLayout.root(dir) + "/" + buildScript, encoding: .utf8) else { return false }
+        return (text.contains("'--seen-shaders'") || text.contains("\"--seen-shaders\""))
+            && text.contains("ios_seen_shaders")
+            && text.contains("DM_PARTIAL_SHADERS")
     }
 
     /// The checkout of this repository the app drives. A released .app ships on its own,

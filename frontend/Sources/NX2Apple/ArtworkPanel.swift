@@ -1,3 +1,4 @@
+import AppKit
 import NXCore
 import NXLauncher
 import SwiftUI
@@ -19,6 +20,10 @@ struct ArtworkPanel: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @FocusState private var gridFocused: Bool
     @FocusState private var framingFocused: Bool
+    @State private var tileImages: [URL: NSImage] = [:]
+    @State private var framingPreviewImage: (file: URL, image: NSImage)?
+
+    private var tileFiles: [URL] { editor.tiles.compactMap(\.file) }
 
     private func t(_ key: String) -> String { labels(key) }
     private var slotName: String { editor.slot.rawValue }
@@ -27,20 +32,58 @@ struct ArtworkPanel: View {
         VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 4) {
                 Text(t("artwork.title")).font(.manrope(26, .heavy)).tracking(-0.6).accessibilityAddTraits(.isHeader)
-                Text(editor.gameName).font(.manrope(14)).foregroundStyle(.secondary).lineLimit(1)
+                Text(editor.gameName).font(DS.Font.body).foregroundStyle(DS.Color.textSecondary).lineLimit(1)
             }
             .padding(.horizontal, 24).padding(.top, 22).padding(.bottom, 14)
             tabs.padding(.horizontal, 24).padding(.bottom, 14)
-            ScrollView {
+            ScrollViewReader { proxy in
+              ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
                     grid
-                    if editor.isLoading { Text(t("artwork.loading")).font(.manrope(12)).foregroundStyle(.secondary) }
+                    if editor.isLoading { Text(t("artwork.loading")).font(DS.Font.callout).foregroundStyle(DS.Color.textSecondary) }
                     if editor.loadState == .offline { offline }
                     if let notice = editor.notice { noticeRow(notice) }
                     if editor.needsFraming { framing }
                 }
                 .padding(.horizontal, 24).padding(.top, 6).padding(.bottom, 16)
-                .task(id: editor.selectedFile) { await editor.measureSelected() }
+                .task(id: editor.selectedFile) {
+                    await editor.measureSelected()
+                    guard let file = editor.selectedFile else {
+                        framingPreviewImage = nil
+                        return
+                    }
+                    if let cached = ArtworkImages.shared.cachedImage(at: file, maxPixel: 800) {
+                        framingPreviewImage = (file, cached)
+                        return
+                    }
+                    let decoded = await ArtworkImages.shared.loadImage(at: file, maxPixel: 800)
+                    guard !Task.isCancelled, editor.selectedFile == file else { return }
+                    framingPreviewImage = decoded.map { (file, $0) }
+                }
+                .task(id: tileFiles) {
+                    let pending = tileFiles.filter { tileImages[$0] == nil }
+                    guard !pending.isEmpty else { return }
+                    for file in pending {
+                        guard !Task.isCancelled else { return }
+                        if let cached = ArtworkImages.shared.cachedImage(at: file, maxPixel: 480) {
+                            tileImages[file] = cached
+                            continue
+                        }
+                        if let decoded = await ArtworkImages.shared.loadImage(at: file, maxPixel: 480) {
+                            guard !Task.isCancelled else { return }
+                            tileImages[file] = decoded
+                        }
+                    }
+                }
+              }
+              .onChange(of: focus.focused) { id in
+                  guard focus.scope == "artwork", let id else { return }
+                  withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) { proxy.scrollTo(id, anchor: .center) }
+              }
+              .onChange(of: editor.cursor) { index in
+                  guard let index, editor.tiles.indices.contains(index) else { return }
+                  proxy.scrollTo("artwork.tile." + editor.tiles[index].id, anchor: .center)
+              }
             }
             Divider().opacity(0.3)
             footer
@@ -48,7 +91,7 @@ struct ArtworkPanel: View {
         .padScope("artwork", focus)
         .frame(width: Self.width).frame(maxHeight: .infinity)
         .background(LauncherPalette.background)
-        .font(.manrope(13))
+        .font(DS.Font.body)
         .modifier(GameFilesDrop(enabled: true, label: t("artwork.dropHint." + slotName), targeted: dropped) { paths in
             if let path = paths.first { Task { await editor.importFile(URL(fileURLWithPath: path)) } }
         })
@@ -69,8 +112,8 @@ struct ArtworkPanel: View {
                         Text(title).font(.manrope(14, on ? .bold : .medium))
                     }
                     .padding(.horizontal, 16).padding(.vertical, 8)
-                    .background(on ? Color.white.opacity(0.10) : .clear, in: RoundedRectangle(cornerRadius: 9))
-                    .contentShape(RoundedRectangle(cornerRadius: 9))
+                    .background(on ? LauncherPalette.ink(0.10) : .clear, in: Capsule())
+                    .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
                 .accessibilityAddTraits(on ? .isSelected : [])
@@ -115,19 +158,19 @@ struct ArtworkPanel: View {
         Button { editor.select(tile) } label: {
             Color.clear.aspectRatio(editor.tileAspect, contentMode: .fit)
                 .overlay {
-                    if let file = tile.file, let image = ArtworkImages.shared.image(at: file, maxPixel: 480) {
+                    if let file = tile.file, let image = tileImages[file] ?? ArtworkImages.shared.cachedImage(at: file, maxPixel: 480) {
                         ArtworkFill(image: image)
                     } else {
                         ZStack {
                             LauncherPalette.surface
-                            Image(systemName: tile.isFailed ? "photo.badge.exclamationmark" : "photo").font(.system(size: 15, weight: .light)).foregroundStyle(.secondary)
+                            Image(systemName: tile.isFailed ? "photo.badge.exclamationmark" : "photo").font(.system(size: 15, weight: .light)).foregroundStyle(LauncherPalette.secondaryText)
                         }
                     }
                 }
                 .overlay(alignment: .topLeading) { if tile.isHero { badge(t("artwork.heroBadge")) } }
                 .overlay(alignment: .bottomLeading) { if tile.isLowResolution { badge(t("artwork.lowResBadge")) } }
                 .clipShape(RoundedRectangle(cornerRadius: 5))
-                .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(tile.isSelected ? LauncherPalette.cream : Color.white.opacity(0.08), lineWidth: tile.isSelected ? 2 : 1))
+                .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(tile.isSelected ? LauncherPalette.accent : LauncherPalette.ink(0.08), lineWidth: tile.isSelected ? 2 : 1))
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -152,9 +195,9 @@ struct ArtworkPanel: View {
                         Image(systemName: "folder").font(.system(size: 14, weight: .light))
                         Text(t("artwork.chooseFile")).font(.manrope(10.5, .medium)).lineLimit(2).multilineTextAlignment(.center).minimumScaleFactor(0.8)
                     }
-                    .foregroundStyle(.secondary).padding(.horizontal, 4)
+                    .foregroundStyle(LauncherPalette.secondaryText).padding(.horizontal, 4)
                 }
-                .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(Color.white.opacity(0.22), style: StrokeStyle(lineWidth: 1, dash: [4, 3])))
+                .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(LauncherPalette.ink(0.22), style: StrokeStyle(lineWidth: 1, dash: [4, 3])))
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -174,12 +217,12 @@ struct ArtworkPanel: View {
     private var framing: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text(t("artwork.framing")).font(.manrope(13, .semibold))
+                Text(t("artwork.framing")).font(DS.Font.bodyStrong)
                 Spacer(minLength: 8)
                 if !editor.isCentered {
                     Button(t("artwork.framing.center")) { editor.recenter() }.buttonStyle(LauncherSecondaryButtonStyle())
                         .controlSize(.small)
-                        .padTarget("artwork.framing.center", scope: "artwork", radius: 9) { editor.recenter() }
+                        .padTarget("artwork.framing.center", scope: "artwork") { editor.recenter() }
                 }
             }
             .frame(minHeight: 32)
@@ -198,13 +241,15 @@ struct ArtworkPanel: View {
             let fitted = Self.fit(image, in: area.size)
             let slot = Self.band(band, in: fitted, focus: focus)
             ZStack(alignment: .topLeading) {
-                if let file, let picture = ArtworkImages.shared.image(at: file, maxPixel: 800) {
+                if let file,
+                   let picture = (framingPreviewImage?.file == file ? framingPreviewImage?.image : nil)
+                    ?? ArtworkImages.shared.cachedImage(at: file, maxPixel: 800) {
                     Image(nsImage: picture).resizable().frame(width: fitted.width, height: fitted.height)
                         .offset(x: fitted.minX, y: fitted.minY)
                 }
                 Path { path in path.addRect(fitted); path.addRect(slot) }
                     .fill(Color.black.opacity(0.55), style: FillStyle(eoFill: true))
-                Rectangle().strokeBorder(LauncherPalette.cream, lineWidth: 2)
+                Rectangle().strokeBorder(LauncherPalette.accent, lineWidth: 2)
                     .frame(width: slot.width, height: slot.height).offset(x: slot.minX, y: slot.minY)
                 Circle().fill(Color.black.opacity(0.35)).overlay(Circle().strokeBorder(LauncherPalette.cream, lineWidth: 2))
                     .frame(width: 18, height: 18).offset(x: slot.midX - 9, y: slot.midY - 9)
@@ -280,7 +325,7 @@ struct ArtworkPanel: View {
 
     private var offline: some View {
         HStack(spacing: 12) {
-            Label(t("artwork.offline"), systemImage: "wifi.slash").font(.manrope(13)).foregroundStyle(.secondary)
+            Label(t("artwork.offline"), systemImage: "wifi.slash").font(DS.Font.body).foregroundStyle(DS.Color.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 8)
             Button(t("artwork.retry")) { editor.retry() }.buttonStyle(LauncherSecondaryButtonStyle())
@@ -295,7 +340,7 @@ struct ArtworkPanel: View {
             case .error(let text): return (text, "exclamationmark.circle.fill", LauncherPalette.danger)
             }
         }()
-        return Label(text, systemImage: symbol).font(.manrope(13)).foregroundStyle(color).fixedSize(horizontal: false, vertical: true)
+        return Label(text, systemImage: symbol).font(DS.Font.body).foregroundStyle(color).fixedSize(horizontal: false, vertical: true)
     }
 
     /// Reset, Cancel and Save on one row when the reset text fits (English, Chinese, Swedish), else Reset on a row of its own above
@@ -318,21 +363,19 @@ struct ArtworkPanel: View {
     private var resetButton: some View {
         Button { editor.reset(editor.slot) } label: { Label(t("artwork.reset." + slotName), systemImage: "arrow.uturn.backward").lineLimit(1).fixedSize() }
             .buttonStyle(LauncherSecondaryButtonStyle())
-            .padTarget("artwork.reset", scope: "artwork", radius: 9) { editor.reset(editor.slot) }
+            .padTarget("artwork.reset", scope: "artwork") { editor.reset(editor.slot) }
     }
 
     @ViewBuilder private var cancelAndSave: some View {
         Button(t("artwork.cancel"), action: cancel).buttonStyle(LauncherSecondaryButtonStyle())
             .keyboardShortcut(.cancelAction)
-            .padTarget("artwork.cancel", scope: "artwork", radius: 9, activate: cancel)
+            .padTarget("artwork.cancel", scope: "artwork", activate: cancel)
         Button(action: save) {
-            Text(t("artwork.save")).font(.manrope(13.5, .bold)).foregroundStyle(.black)
+            Text(t("artwork.save")).font(.manrope(13.5, .bold))
                 .padding(.horizontal, 22).padding(.vertical, 9)
-                .background(LauncherPalette.cream, in: Capsule())
-                .opacity(editor.isDirty ? 1 : 0.4)
         }
-        .buttonStyle(.plain).keyboardShortcut("s", modifiers: .command).disabled(!editor.isDirty)
-        .padTarget("artwork.save", scope: "artwork", radius: 20) { if editor.isDirty { save() } }
+        .buttonStyle(LauncherActionButtonStyle()).keyboardShortcut("s", modifiers: .command).disabled(!editor.isDirty)
+        .padTarget("artwork.save", scope: "artwork", focusColor: LauncherPalette.onCream, enabled: editor.isDirty) { if editor.isDirty { save() } }
     }
 }
 
@@ -344,7 +387,7 @@ private struct SkeletonTile: View {
 
     var body: some View {
         RoundedRectangle(cornerRadius: 5)
-            .fill(Color.white.opacity(lit ? 0.10 : 0.05))
+            .fill(LauncherPalette.ink(lit ? 0.10 : 0.05))
             .aspectRatio(aspect, contentMode: .fit)
             .accessibilityHidden(true)
             .onAppear {

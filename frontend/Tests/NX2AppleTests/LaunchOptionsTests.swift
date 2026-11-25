@@ -1,6 +1,9 @@
+import AppKit
+import SwiftUI
 import XCTest
 @testable import NX2Apple
 @testable import NXCore
+@testable import NXModel
 @testable import NXLauncher
 
 /// Launch options beyond the app's own list: Display mode, the basic / advanced split, the render scale in pixels, and mods.
@@ -66,7 +69,7 @@ final class LaunchOptionsTests: IsolatedDefaultsTestCase {
         let langs = re.matches(in: nacp, range: NSRange(nacp.startIndex..., in: nacp)).map { m in
             (String(nacp[Range(m.range(at: 1), in: nacp)!]), String(nacp[Range(m.range(at: 2), in: nacp)!]))
         }
-        XCTAssertEqual(langs.count, 16)
+        XCTAssertEqual(langs.count, 18)
         for (code, name) in langs { XCTAssertEqual(L10n.string("launch.opt.DM_LANG." + code, .en), name, code) }
     }
 
@@ -98,6 +101,28 @@ final class LaunchOptionsTests: IsolatedDefaultsTestCase {
         let (plain, repo2) = try self.app(scale)
         XCTAssertNil(try XCTUnwrap(LaunchSetting.forMac(app: plain, titleID: "01007EF00011E000", repo: repo2, labels: { $0 })?.first).pixels(scale: 1, docked: true),
                      "without render_base the row stays in percent")
+    }
+
+    func testRenderScaleWithBaseCapDecodesAndClampsPixels() throws {
+        let pokopiaScale = #"{"env": "DM_RENDER_SCALE", "kind": "range", "label": "Render scale", "note": "", "default": "1.0", "section": "Game", "level": "basic", "min": 0.5, "max": 1.0, "step": 0.05, "base": {"docked": [1920, 1080], "handheld": [1920, 1080], "cap": {"docked": [1920, 1080], "handheld": [1600, 900]}}}"#
+        let (app, repo) = try self.app([pokopiaScale, opmode].joined(separator: ","))
+        let list = try XCTUnwrap(LaunchSetting.forMac(app: app, titleID: "0400A3A01EE4C000", repo: repo, labels: { $0 }))
+        let row = try XCTUnwrap(list.first { $0.env == "DM_RENDER_SCALE" }, "base.cap must not cause Lossy decoding to drop DM_RENDER_SCALE")
+        XCTAssertEqual(row.pixels(scale: 0.5, docked: false), "960×540")
+        XCTAssertEqual(row.pixels(scale: 0.75, docked: false), "1440×810")
+        XCTAssertEqual(row.pixels(scale: 0.9, docked: false), "1600×900", "handheld clamps to render_cap 1600x900")
+        XCTAssertEqual(row.pixels(scale: 1.0, docked: false), "1600×900")
+        XCTAssertEqual(row.pixels(scale: 1.0, docked: true), "1920×1080", "docked reaches full 1920x1080")
+
+        // Fallback from game.tsv also parses render_cap beside render_base
+        let profile = temporary.appendingPathComponent("repo/dm/games/0400A3A01EE4C000")
+        try FileManager.default.createDirectory(at: profile, withIntermediateDirectories: true)
+        try "title_id\t0400A3A01EE4C000\nrender_base\t1920x1080 1920x1080\nrender_cap\t1920x1080 1600x900\n"
+            .write(to: profile.appendingPathComponent("game.tsv"), atomically: true, encoding: .utf8)
+        let (fallbackApp, _) = try self.app(scale)
+        let fallback = try XCTUnwrap(LaunchSetting.forMac(app: fallbackApp, titleID: "0400A3A01EE4C000", repo: repo, labels: { $0 })?.first { $0.env == "DM_RENDER_SCALE" })
+        XCTAssertEqual(fallback.pixels(scale: 1.0, docked: false), "1600×900")
+        XCTAssertEqual(fallback.pixels(scale: 1.0, docked: true), "1920×1080")
     }
 
     func testModsAreFoundInTheirLayoutsAndPassedInListOrder() throws {
@@ -158,5 +183,142 @@ final class LaunchOptionsTests: IsolatedDefaultsTestCase {
         let list = try XCTUnwrap(LaunchSetting.forMac(app: app, titleID: "01007EF00011E000", repo: repo, labels: { L10n.string($0, .en) }))
         XCTAssertEqual(ResolutionNote.text(list, shown: { $0.env != "DM_PRESENT_UPSCALE" }, t: { L10n.string($0, .en) })?.detail,
                        "The closest setting is Console mode.", "a row the sheet hides (a sub-setting whose parent is off) is not named")
+    }
+
+    @MainActor func testFrameGenerationRowFollows30FpsAndRendersInEnglishAndChinese() throws {
+        let fps = #"{"env": "DM_FPS_TARGET", "kind": "choice", "label": "Frame rate", "note": "", "default": "30", "section": "Game", "options": [["30", "30 fps"], ["60", "60 fps"]], "level": "basic"}"#
+        let fg = #"{"env": "DM_FRAMEGEN", "kind": "toggle", "label": "Frame generation", "note": "Shows 60 frames a second while the game draws 30. MetalFX makes a frame between each two, with less work and heat than 60 fps, slightly more input delay, and possible smearing on fast motion.", "default": "0", "section": "Game", "on": "1", "off": "0", "needs": "DM_FPS_TARGET=30"}"#
+        let (app, repo) = try self.app([fps, fg, scale, opmode].joined(separator: ","))
+        let list = try XCTUnwrap(LaunchSetting.forMac(app: app, titleID: "01007EF00011E000", repo: repo, labels: { L10n.string($0, .zh) }))
+        let fgRow = try XCTUnwrap(list.first { $0.env == "DM_FRAMEGEN" })
+        XCTAssertEqual(LaunchCategory.of(fgRow), .performance)
+        XCTAssertEqual(fgRow.label, "帧生成")
+        XCTAssertTrue(fgRow.isShown(in: list) { $0.env == "DM_FPS_TARGET" ? "30" : $0.def })
+        XCTAssertFalse(fgRow.isShown(in: list) { $0.env == "DM_FPS_TARGET" ? "60" : $0.def })
+
+        guard let captureDir = ProcessInfo.processInfo.environment["NX_FRAMEGEN_CAPTURE_DIR"] else { return }
+        let outURL = URL(fileURLWithPath: captureDir)
+        try FileManager.default.createDirectory(at: outURL, withIntermediateDirectories: true)
+        NSApplication.shared.setActivationPolicy(.accessory)
+        let bundleURL = URL(fileURLWithPath: app)
+        let macOS = bundleURL.appendingPathComponent("Contents/MacOS")
+        try FileManager.default.createDirectory(at: macOS, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: macOS.appendingPathComponent("nxnative"), withDestinationURL: URL(fileURLWithPath: "/usr/bin/true"))
+        try FileManager.default.createSymbolicLink(at: macOS.appendingPathComponent("dmhost"), withDestinationURL: URL(fileURLWithPath: "/usr/bin/true"))
+        let domain = TestPreferences.domain(in: temporary, "framegen")
+        let plist: [String: Any] = ["DMTitleID": "01007EF00011E000", "CFBundleDisplayName": "The Legend of Zelda: Breath of the Wild",
+                                    "CFBundleExecutable": "nxnative", "CFBundleIdentifier": domain]
+        try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0).write(to: bundleURL.appendingPathComponent("Contents/Info.plist"))
+        defer { CFPreferencesAppSynchronize(domain as CFString) }
+        let game = LibraryGame(titleID: "01007EF00011E000", name: "The Legend of Zelda: Breath of the Wild", appPath: app)
+        let fpsSetting = try XCTUnwrap(list.first(where: { $0.env == "DM_FPS_TARGET" }))
+        let choices = SavedChoices(app: app, titleID: "01007EF00011E000")
+        XCTAssertEqual(LaunchDestination(game), .mac)
+        struct Snapshot: Codable { let games: [LibraryGame]; let folder: String }
+        let libFile = temporary.appendingPathComponent("library.json")
+        try JSONEncoder().encode(Snapshot(games: [game], folder: temporary.path)).write(to: libFile)
+        let library = GameLibrary(file: libFile)
+        let stores = LauncherStores(defaults: testDefaults)
+        stores.repo.path = repo
+        func snap(_ fileName: String, _ lang: Lang) throws {
+            stores.build.lang = lang
+            stores.localizer.lang = lang
+            let view = LaunchOptionsView(m: stores.build, library: library, gameID: library.games[0].id,
+                                         initialCategory: .performance, initialAdvancedOpen: true)
+                .environmentObject(PadFocus())
+                .environmentObject(stores.localizer)
+                .environmentObject(stores.saveSettings)
+                .environmentObject(stores.players)
+                .environment(\.dsSheetMaxHeight, 1080)
+                .launcherDropdownHost()
+            let host = NSHostingView(rootView: view)
+            let size = NSSize(width: LauncherSheet.width, height: 1040)
+            let window = OffscreenWindow(size: size)
+            window.contentView = host
+            window.orderFront(nil)
+            RunLoop.main.run(until: Date().addingTimeInterval(0.6))
+            host.layoutSubtreeIfNeeded()
+            let rep = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+            host.cacheDisplay(in: host.bounds, to: rep)
+            try XCTUnwrap(rep.representation(using: .png, properties: [:])).write(to: outURL.appendingPathComponent(fileName))
+            window.orderOut(nil)
+        }
+        for lang in [Lang.en, Lang.zh] {
+            choices.set(fpsSetting, "60")
+            try snap("framegen-before-\(lang.code).png", lang)
+            choices.set(fpsSetting, "30")
+            try snap("framegen-after-\(lang.code).png", lang)
+        }
+    }
+
+    @MainActor func testHiddenAdvancedSettingsDoNotRenderEmptyAdvancedCard() throws {
+        let enhanced = NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface")
+        let previousAX = NSApplication.shared.accessibilityAttributeValue(enhanced)
+        NSApplication.shared.accessibilitySetValue(true, forAttribute: enhanced)
+        defer { NSApplication.shared.accessibilitySetValue(previousAX ?? false, forAttribute: enhanced) }
+
+        let fps = #"{"env": "DM_FPS_TARGET", "kind": "choice", "label": "Frame rate", "note": "", "default": "30", "section": "Game", "options": [["30", "30 fps"], ["60", "60 fps"]], "level": "basic"}"#
+        let fg = #"{"env": "DM_FRAMEGEN", "kind": "toggle", "label": "Frame generation", "note": "", "default": "0", "section": "Game", "on": "1", "off": "0", "needs": "DM_FPS_TARGET=30"}"#
+        let (app, repo) = try self.app([fps, fg, scale, opmode].joined(separator: ","))
+        let list = try XCTUnwrap(LaunchSetting.forMac(app: app, titleID: "01007EF00011E000", repo: repo, labels: { L10n.string($0, .en) }))
+        let fpsSetting = try XCTUnwrap(list.first { $0.env == "DM_FPS_TARGET" })
+        NSApplication.shared.setActivationPolicy(.accessory)
+        let bundleURL = URL(fileURLWithPath: app)
+        let macOS = bundleURL.appendingPathComponent("Contents/MacOS")
+        try FileManager.default.createDirectory(at: macOS, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: macOS.appendingPathComponent("nxnative"), withDestinationURL: URL(fileURLWithPath: "/usr/bin/true"))
+        try FileManager.default.createSymbolicLink(at: macOS.appendingPathComponent("dmhost"), withDestinationURL: URL(fileURLWithPath: "/usr/bin/true"))
+        let domain = TestPreferences.domain(in: temporary, "hidden-adv")
+        let plist: [String: Any] = ["DMTitleID": "01007EF00011E000", "CFBundleDisplayName": "Breath of the Wild",
+                                    "CFBundleExecutable": "nxnative", "CFBundleIdentifier": domain]
+        try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0).write(to: bundleURL.appendingPathComponent("Contents/Info.plist"))
+        defer { CFPreferencesAppSynchronize(domain as CFString) }
+        let game = LibraryGame(titleID: "01007EF00011E000", name: "Breath of the Wild", appPath: app)
+        let choices = SavedChoices(app: app, titleID: "01007EF00011E000")
+        struct Snapshot: Codable { let games: [LibraryGame]; let folder: String }
+        let libFile = temporary.appendingPathComponent("library.json")
+        try JSONEncoder().encode(Snapshot(games: [game], folder: temporary.path)).write(to: libFile)
+        let library = GameLibrary(file: libFile)
+        let stores = LauncherStores(defaults: testDefaults)
+        stores.repo.path = repo
+        stores.build.lang = .en
+        stores.localizer.lang = .en
+
+        func renderedTexts() -> [String] {
+            let view = LaunchOptionsView(m: stores.build, library: library, gameID: library.games[0].id,
+                                         initialCategory: .performance, initialAdvancedOpen: true)
+                .environmentObject(PadFocus())
+                .environmentObject(stores.localizer)
+                .environmentObject(stores.saveSettings)
+                .environmentObject(stores.players)
+                .environment(\.dsSheetMaxHeight, 1080)
+                .launcherDropdownHost()
+            let host = NSHostingView(rootView: view)
+            let window = OffscreenWindow(size: NSSize(width: LauncherSheet.width, height: 1040))
+            window.contentView = host
+            window.orderFront(nil)
+            RunLoop.main.run(until: Date().addingTimeInterval(0.4))
+            host.layoutSubtreeIfNeeded()
+            var texts: [String] = []
+            func walk(_ element: AnyObject) {
+                if let label = element.accessibilityLabel?(), !label.isEmpty { texts.append(label) }
+                if let title = element.accessibilityTitle?(), !title.isEmpty { texts.append(title) }
+                if let value = element.accessibilityAttributeValue?(.value) as? String, !value.isEmpty { texts.append(value) }
+                let children = (element.accessibilityChildren?() ?? []) as [AnyObject]
+                for child in children { walk(child) }
+            }
+            walk(host)
+            window.orderOut(nil)
+            return texts
+        }
+
+        choices.set(fpsSetting, "60")
+        let texts60 = renderedTexts()
+        XCTAssertFalse(texts60.contains { $0.contains("Advanced settings") }, "hides Advanced card when all advanced rows are hidden by needs: \(texts60)")
+
+        choices.set(fpsSetting, "30")
+        let texts30 = renderedTexts()
+        XCTAssertTrue(texts30.contains { $0.contains("Advanced settings") }, "shows Advanced card when advanced row becomes visible: \(texts30)")
+        XCTAssertTrue(texts30.contains { $0.contains("Frame generation") }, "shows Frame generation row under 30 fps: \(texts30)")
     }
 }

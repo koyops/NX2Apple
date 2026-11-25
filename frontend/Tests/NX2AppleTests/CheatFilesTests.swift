@@ -55,6 +55,21 @@ import NXModel
         XCTAssertNil(CheatFiles.buildID(appPath: temporary.appendingPathComponent("none.app").path, iosAppPath: ""))
     }
 
+    /// #1469: a shared-shell build leaves no app of its own, the file sits in the game framework.
+    func testTheBuildIDOfASharedShellGameComesFromItsFramework() throws {
+        let root = temporary.appendingPathComponent("shell")
+        let shellApp = root.appendingPathComponent("derived-data/Build/Products/Release-iphoneos/DmShell.app")
+        try fm.createDirectory(at: shellApp, withIntermediateDirectories: true)
+        let tid = "010015100B514000"
+        try write("# BUILD_ID\tcd57b23fa4bbad65803d9788c01821ee\n", "dm/main.fixups.tsv", under: root.appendingPathComponent("frameworks/DmGame\(tid).framework"))
+        XCTAssertNil(CheatFiles.buildID(appPath: "", iosAppPath: shellApp.path), "without the title ID nothing is looked for")
+        XCTAssertEqual(CheatFiles.buildID(appPath: "", iosAppPath: shellApp.path, titleID: tid.lowercased()), build, "the mirror of the shared app's root")
+        XCTAssertEqual(CheatFiles.buildID(appPath: "", iosAppPath: "", titleID: tid, shellRoot: root.path), build, "the shell root the launcher uses")
+        let inApp = temporary.appendingPathComponent("Old.app")
+        try write("# BUILD_ID\t1111111111111111aaaaaaaaaaaaaaaa\n", "Frameworks/DmGame\(tid).framework/dm/main.fixups.tsv", under: inApp)
+        XCTAssertEqual(CheatFiles.buildID(appPath: "", iosAppPath: inApp.path, titleID: tid), "1111111111111111", "the framework inside the app")
+    }
+
     func testTheHostsThreeFoldersAreScannedInItsOrderAndTheFirstFileOfABuildWins() throws {
         try write("[A]\n00000000\n", "\(build).txt")
         try write("[B]\n00000000\n", "atmosphere/contents/\(titleID)/cheats/\(build).txt")
@@ -91,21 +106,21 @@ import NXModel
     }
 
     func testWordsAreEightHexDigitsAndAHeaderGluedToAWordIsSplitOff() {
-        let cheats = parse("[A]\n0400000000123456 00000001\nby someone\n[B] 04000000 00000008[C]\n04000000 00000009\n")
-        XCTAssertEqual(cheats.map(\.name), ["A", "B", "C"], "00000008[C] is a word and a header")
+        let cheats = parse("[A]\n0400000000123456 00000001\nby someone\n[B] 04000000 00000008 00000001[C]\n04000000 00000009 00000002\n")
+        XCTAssertEqual(cheats.map(\.name), ["A", "B", "C"], "00000001[C] is a word and a header")
         XCTAssertEqual(cheats.map(\.kind), [.cheat, .cheat, .cheat])
         XCTAssertEqual(cheats.map(\.broken), [false, false, false], "a glued word is whole words, prose alone on a line is ignored")
     }
 
     func testALineThatMixesWordsWithTextOrHoldsAPartialWordKeepsTheCheatOff() {
-        let cheats = parse("[A]\n04000000 0012 00000001\n[B]\n04000000 00000001 x\n[C]\njust some prose\n[D]\n04000000 00000001\n")
+        let cheats = parse("[A]\n04000000 0012 00000001\n[B]\n04000000 00000001 00000001 x\n[C]\njust some prose\n[D]\n04000000 00000001 00000001\n")
         XCTAssertEqual(cheats.map(\.broken), [true, true, true, false])
         XCTAssertEqual(cheats.map(\.kind), [.cheat, .cheat, .cheat, .cheat], "a cheat with only prose lines is a typo, not a label")
         XCTAssertEqual(cheats.map(\.switchable), [false, false, false, true])
     }
 
     func testAnUnclosedOrEmptyHeaderBelongsToNothingAndItsLinesAreIgnored() {
-        let cheats = parse("[A]\n04000000 00000001\n[Oops\n04000000 00000002\n[]\n04000000 00000003\n[B]\n04000000 00000004\n")
+        let cheats = parse("[A]\n04000000 00000001 00000001\n[Oops\n04000000 00000002 00000001\n[]\n04000000 00000003 00000001\n[B]\n04000000 00000004 00000001\n")
         XCTAssertEqual(cheats.map(\.name), ["A", "B"])
         XCTAssertEqual(cheats.map(\.broken), [false, false])
     }
@@ -127,6 +142,103 @@ import NXModel
         """)
         XCTAssertEqual(cheats.map(\.section), ["Items", "Items", "Items", ""])
         XCTAssertEqual(cheats.map(\.kind), [.label, .cheat, .label, .cheat])
+        XCTAssertEqual(cheats.map(\.isSectionMarker), [true, false, true, false])
+    }
+
+    func testEdiZonSectionMarkersWithZeroPlaceholdersBecomeLabelsWhileRealCodeOnMarkerSurvives() {
+        let cheats = parse("""
+        [--SectionStart:ItemPoint Gain--]
+        00000000 00000000 00000000
+        [x2]
+        040F0000 00351EA0 8B080936
+        [--SectionEnd:ItemPoint Gain--]
+        00000000 00000000 00000000
+        [Skip inoccent town by cheat shop]
+        00000000 00000000 00000000
+        [--SectionStart:Real Code--]
+        04000000 00180020 000003E7
+        """)
+        XCTAssertEqual(cheats.map(\.kind), [.label, .cheat, .label, .cheat, .cheat])
+        XCTAssertEqual(cheats.map(\.isSectionMarker), [true, false, true, false, true])
+        XCTAssertEqual(cheats.map(\.broken), [false, false, false, true, false])
+        XCTAssertEqual(cheats.map(\.switchable), [false, true, false, false, true])
+        XCTAssertEqual(cheats.map(\.section), ["ItemPoint Gain", "ItemPoint Gain", "ItemPoint Gain", "", "Real Code"])
+        XCTAssertEqual(CheatsCapabilitySummary(cheats: cheats).totalActive, 2)
+    }
+
+    func testDecodeFailuresMarkBrokenExcludeFromSwitchesAndSummaryAndSkipBadMasterFuse() throws {
+        let cheats = parse("""
+        {Broken Master}
+        FF000000 00000001
+        [Truncated T0]
+        04000000 00001000
+        [Unknown FF0]
+        80000040
+        FF000000 00000001
+        [Invalid Width]
+        00000000 00000000 00000000
+        [Pair - on]
+        04000000 00180010 00000001
+        [Pair - off]
+        FF000000 00000001
+        """)
+        XCTAssertEqual(cheats.map(\.broken), [true, true, true, true, false, true])
+        XCTAssertEqual(cheats.map(\.switchable), [false, false, false, false, true, false])
+        XCTAssertFalse(cheats[5].pairOff, "a broken off-half must not be hidden as a valid pairOff")
+        XCTAssertNil(cheats[2].triggerCombo, "broken entry must not surface key combo pills")
+        XCTAssertEqual(CheatsCapabilitySummary(cheats: cheats).totalActive, 1)
+        XCTAssertEqual(CheatFiles.enabledText(cheats, on: Set(cheats.map(\.key))), "Pair - on\n")
+
+        let masterDir = CheatFiles(titleID: titleID, folder: temporary.appendingPathComponent("cheats-bad-master"))
+        try write("{Broken Master}\nFF000000 00000001\n", "\(build).txt", under: masterDir.folder)
+        XCTAssertNil(masterDir.armBeforeLaunch(buildID: build))
+    }
+
+    func testZingSectionMarkersGroupEntriesAndStayOutOfEnabled() {
+        let cheats = parse("""
+        [Player Stats]
+        20000000
+        [Infinite HP]
+        04000000 00180020 000003E7
+        [Player Stats End]
+        20000001
+        [Loose]
+        04000000 00180040 00000001
+        """)
+        XCTAssertEqual(cheats.map(\.section), ["Player Stats", "Player Stats", "Player Stats", ""])
+        XCTAssertEqual(cheats.map(\.kind), [.label, .cheat, .label, .cheat])
+        XCTAssertEqual(cheats.map(\.isSectionMarker), [true, false, true, false])
+        XCTAssertEqual(cheats.map(\.switchable), [false, true, false, true])
+        XCTAssertEqual(CheatFiles.enabledText(cheats, on: ["Player Stats", "Infinite HP", "Player Stats End"]), "Infinite HP\n")
+    }
+
+    func testFourTierCapabilitiesAndKeyMaskExtractionMatchFixupsAndTrampolines() {
+        let trampolines = CheatTrampolineMetadata.parse("""
+        # BUILD_ID\t\(build)
+        # MAIN_RX_END\t0x100000
+        row_type\tname\tcheat_key\tkind\tslot_id\tvariant_mask\ttarget_off\tpatched_word\tkey_mask\tdetail
+        entry\tMoon Jump\tMoon Jump\tbaked_conditional\t0\t0x1\t0x400\t0xd503201f\t0x202\t
+        site\tMoon Jump\tMoon Jump\tbaked_conditional\t0\t0x1\t0x400\t0xd503201f\t0x202\t
+        """)
+        let raw = """
+        [Infinite HP]
+        04000000 00180020 000003E7
+        [Moon Jump]
+        80000202
+        04000000 00000400 D503201F
+        20000000
+        [2x Speed]
+        80000040
+        04000000 00000800 1E202800
+        20000000
+        [Max Rupees]
+        04100000 00004200 000F423F
+        """
+        let cheats = CheatFiles.parse(Data(raw.utf8), rxEnd: 0x100000, trampolines: trampolines, buildID: build)
+        XCTAssertEqual(cheats.map(\.capability), [.dataReady, .codeBaked, .codeNeedsBake, .fixedHeapWarning])
+        XCTAssertEqual(cheats[1].triggerCombo, "B + ZR")
+        XCTAssertEqual(cheats[2].triggerCombo, "L")
+        XCTAssertNil(cheats[0].triggerCombo)
     }
 
     func testTheMetaFileMakesOnePassCheatsAndPairsOutOfTheirSwitches() {
@@ -200,6 +312,124 @@ import NXModel
         XCTAssertTrue(files.safeMode)
     }
 
+    // ---- 30-second anti-crash fuse ----
+
+    func testCrashFuseDisablesOnlyNewlyEnabledCheatsWhenStableBaselineExists() throws {
+        try write("[Stable HP]\n04000000 00000010 00000001\n[Risky Moon Jump]\n04000000 00000020 00000002\n", "\(build).txt")
+        try write("Stable HP\n", "\(build).enabled")
+
+        let armed1 = files.armBeforeLaunch(buildID: build, now: Date(timeIntervalSince1970: 100))
+        XCTAssertEqual(armed1?.enabled, ["Stable HP"])
+        XCTAssertEqual(armed1?.newlyEnabled, ["Stable HP"])
+        XCTAssertTrue(files.disarmAndRecordStable(expectedBuildID: build, now: Date(timeIntervalSince1970: 135)))
+        XCTAssertNil(files.readArmed())
+        XCTAssertEqual(files.readStable()?.enabled, ["Stable HP"])
+
+        try write("Stable HP\nRisky Moon Jump\n", "\(build).enabled")
+        let armed2 = files.armBeforeLaunch(buildID: build, now: Date(timeIntervalSince1970: 200))
+        XCTAssertEqual(armed2?.enabled, ["Stable HP", "Risky Moon Jump"])
+        XCTAssertEqual(armed2?.newlyEnabled, ["Risky Moon Jump"])
+
+        let tripped = files.handleProcessExit(elapsed: 8.0, threshold: 30.0, now: Date(timeIntervalSince1970: 208))
+        XCTAssertEqual(tripped?.disabled, ["Risky Moon Jump"])
+        XCTAssertEqual(tripped?.disabledMaster, false)
+        XCTAssertNil(files.readArmed())
+        XCTAssertEqual(files.readTripped(), tripped)
+        XCTAssertEqual(files.enabledList(build), ["Stable HP"])
+        XCTAssertTrue(files.masterOn)
+
+        files.clearTripped()
+        XCTAssertNil(files.readTripped())
+    }
+
+    func testCrashFuseDisablesAllEnabledWhenNoNewlyEnabledAndMasterOffForMasterOnly() throws {
+        try write("[A]\n04000000 00000010 00000001\n[B]\n04000000 00000020 00000002\n", "\(build).txt")
+        try write("A\nB\n", "\(build).enabled")
+        _ = files.armBeforeLaunch(buildID: build)
+        XCTAssertTrue(files.disarmAndRecordStable())
+
+        let armed = files.armBeforeLaunch(buildID: build)
+        XCTAssertEqual(armed?.newlyEnabled, [])
+        let tripped = files.recoverIfArmed()
+        XCTAssertEqual(tripped?.disabled, ["A", "B"])
+        XCTAssertEqual(files.enabledList(build), [])
+
+        // Master-only file crashes before 30 s -> turns off master switch.
+        let masterDir = CheatFiles(titleID: titleID, folder: temporary.appendingPathComponent("cheats-master"))
+        try write("{Master Hook}\n04000000 00000010 00000001\n", "\(build).txt", under: masterDir.folder)
+        let armedMaster = masterDir.armBeforeLaunch(buildID: build)
+        XCTAssertEqual(armedMaster?.hadMasterOnly, true)
+        let trippedMaster = masterDir.recoverIfArmed()
+        XCTAssertEqual(trippedMaster?.disabledMaster, true)
+        XCTAssertFalse(masterDir.masterOn)
+    }
+
+    func testCrashFuseStableExitAt30sDoesNotTrip() throws {
+        try write("[A]\n04000000 00000010 00000001\n", "\(build).txt")
+        try write("A\n", "\(build).enabled")
+        _ = files.armBeforeLaunch(buildID: build)
+        let tripped = files.handleProcessExit(elapsed: 30.0, threshold: 30.0)
+        XCTAssertNil(tripped)
+        XCTAssertNil(files.readArmed())
+        XCTAssertEqual(files.readStable()?.enabled, ["A"])
+        XCTAssertEqual(files.enabledList(build), ["A"])
+    }
+
+    func testCheatFuseMonitorTripsOnEarlyExitAndDisarmsOnCleanStableExit() throws {
+        let support = temporary.appendingPathComponent("Support")
+        let app = temporary.appendingPathComponent("FuseGame.app")
+        try write("# BUILD_ID\tcd57b23fa4bbad65803d9788c01821ee\n", "Contents/Resources/dm/main.fixups.tsv", under: app)
+        let game = LibraryGame(titleID: titleID, name: "FuseGame", appPath: app.path)
+        let localFiles = CheatFiles(titleID: titleID, support: support)
+        try write("[Safe]\n04000000 00000010 00000001\n[Crash]\n04000000 00000020 00000002\n", "\(build).txt", under: localFiles.folder)
+        try write("Safe\n", "\(build).enabled", under: localFiles.folder)
+
+        let monitor = CheatFuseMonitor()
+        let t0 = Date(timeIntervalSince1970: 1000)
+        let pending1 = monitor.prepareAndArm(for: game, support: support, now: t0)
+        XCTAssertNotNil(pending1)
+        monitor.didStart(pid: 99001, pending: pending1, delaySeconds: 60)
+        XCTAssertNil(monitor.didExit(pid: 99001, threshold: 30, now: t0.addingTimeInterval(35)))
+        XCTAssertEqual(localFiles.readStable()?.enabled, ["Safe"])
+
+        try write("Safe\nCrash\n", "\(build).enabled", under: localFiles.folder)
+        let t1 = Date(timeIntervalSince1970: 2000)
+        let pending2 = monitor.prepareAndArm(for: game, support: support, now: t1)
+        XCTAssertNotNil(pending2)
+        monitor.didStart(pid: 99002, pending: pending2, delaySeconds: 60)
+        let tripped = monitor.didExit(pid: 99002, threshold: 30, now: t1.addingTimeInterval(5))
+        XCTAssertEqual(tripped?.disabled, ["Crash"])
+        XCTAssertEqual(localFiles.enabledList(build), ["Safe"])
+    }
+
+    func testCheatFuseMonitorTimerRefusesToDisarmWhenProcessIsGoneOrReused() async throws {
+        let support = temporary.appendingPathComponent("SupportReuse")
+        let app = temporary.appendingPathComponent("ReuseGame.app")
+        try write("# BUILD_ID\tcd57b23fa4bbad65803d9788c01821ee\n", "Contents/Resources/dm/main.fixups.tsv", under: app)
+        let game = LibraryGame(titleID: titleID, name: "ReuseGame", appPath: app.path)
+        let localFiles = CheatFiles(titleID: titleID, support: support)
+        try write("[A]\n04000000 00000010 00000001\n", "\(build).txt", under: localFiles.folder)
+        try write("A\n", "\(build).enabled", under: localFiles.folder)
+
+        var alive = false
+        let monitor = CheatFuseMonitor(isProcessAlive: { _, url in
+            alive && url == app.standardizedFileURL
+        })
+        let pending = monitor.prepareAndArm(for: game, support: support)
+        XCTAssertNotNil(pending)
+        monitor.didStart(pid: 99123, pending: pending, delaySeconds: 0.05)
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertNotNil(localFiles.readArmed(), "dead or PID-reused process must not disarm or record stable baseline")
+        XCTAssertNil(localFiles.readStable())
+
+        // Now simulate a genuinely matching live process: timer disarms and writes stable baseline.
+        alive = true
+        monitor.didStart(pid: 99124, pending: pending, delaySeconds: 0.05)
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertNil(localFiles.readArmed())
+        XCTAssertEqual(localFiles.readStable()?.enabled, ["A"])
+    }
+
     // ---- importing ----
 
     func testAnSDCardsCheatsFolderComesInAsFlatFilesInUpperCase() throws {
@@ -265,8 +495,30 @@ import NXModel
         let mStores = LauncherStores(defaults: testDefaults); let m = mStores.build; m.lang = .en
         XCTAssertEqual(CheatsView.importMessage(.init(imported: ["A", "B"]), loc: mStores.localizer).0, "Files imported: 2.")
         XCTAssertTrue(CheatsView.importMessage(.init(imported: ["A"], skipped: ["x.txt"]), loc: mStores.localizer).0.contains("x.txt"))
+        XCTAssertTrue(CheatsView.importMessage(.init(tooLarge: ["huge.txt"]), loc: mStores.localizer).0.contains("huge.txt"))
+        XCTAssertFalse(CheatsView.importMessage(.init(tooLarge: ["huge.txt"]), loc: mStores.localizer).1)
         XCTAssertFalse(CheatsView.importMessage(.init(), loc: mStores.localizer).1)
         XCTAssertTrue(CheatsView.importMessage(.init(imported: ["A"]), loc: mStores.localizer).1)
+    }
+
+    func testOversizedCheatFileRejectedOnImportAndRead() throws {
+        let cf = files
+        let src = temporary.appendingPathComponent("oversized")
+        try fm.createDirectory(at: src, withIntermediateDirectories: true)
+        let hugeURL = src.appendingPathComponent("CD57B23FA4BBAD65.txt")
+        let overLimit = Data(repeating: UInt8(ascii: "A"), count: CheatFiles.maxFileBytes + 64)
+        try overLimit.write(to: hugeURL)
+
+        let imported = try cf.importFiles(from: [hugeURL])
+        XCTAssertTrue(imported.imported.isEmpty)
+        XCTAssertEqual(imported.tooLarge, ["CD57B23FA4BBAD65.txt"])
+        XCTAssertFalse(fm.fileExists(atPath: cf.folder.appendingPathComponent("CD57B23FA4BBAD65.txt").path))
+
+        // Even if placed manually on disk, cheats(of:) skips oversized files without reading them into memory.
+        try fm.createDirectory(at: cf.folder, withIntermediateDirectories: true)
+        try overLimit.write(to: cf.folder.appendingPathComponent("CD57B23FA4BBAD65.txt"))
+        let found = try XCTUnwrap(cf.found().first)
+        XCTAssertNil(cf.cheats(of: found))
     }
 
     // ---- the copy to the device ----
@@ -280,6 +532,9 @@ import NXModel
         try write("A\n", "\(build).enabled")
         try write("x", ".cheats-off-\(titleID)")
         try write("x", ".cheats-running-\(titleID)")
+        try write("{}", ".cheats-armed.json")
+        try write("{}", ".cheats-stable.json")
+        try write("{}", ".cheats-tripped.json")
         try write("x", "\(build).enabled.tmp")
         var seen: [String] = [], args: [String] = []
         let t = transfer { a in
@@ -369,13 +624,32 @@ import NXModel
         }
         let info: [String: Any] = ["DMTitleID": game, "CFBundleDisplayName": "The Legend of Zelda: Breath of the Wild", "CFBundleExecutable": "nxnative"]
         try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0).write(to: app.appendingPathComponent("Contents/Info.plist"))
-        try write("# BUILD_ID\tcd57b23fa4bbad65803d9788c01821ee\n", "Contents/Resources/dm/main.fixups.tsv", under: app)
+        try write("# BUILD_ID\tcd57b23fa4bbad65803d9788c01821ee\n# MAIN_RX_END\t0x100000\n", "Contents/Resources/dm/main.fixups.tsv", under: app)
         let ios = temporary.appendingPathComponent("DmIOS.app")
         try fm.createDirectory(at: ios, withIntermediateDirectories: true)
         try PropertyListSerialization.data(fromPropertyList: ["CFBundleIdentifier": "com.example.zelda"], format: .xml, options: 0).write(to: ios.appendingPathComponent("Info.plist"))
+        try write("# BUILD_ID\tcd57b23fa4bbad65803d9788c01821ee\n# MAIN_RX_END\t0x100000\n", "dm/main.fixups.tsv", under: ios)
+        try write("""
+        # BUILD_ID\tCD57B23FA4BBAD65
+        # MAIN_RX_END\t0x100000
+        # SLOTS_USED\t1
+        row_type\tname\tcheat_key\tkind\tslot_id\tvariant_mask\ttarget_off\tpatched_word\tkey_mask\tdetail
+        entry\tMoon Jump\tMoon Jump\tbaked_conditional\t0\t0x1\t0x400\t0xd503201f\t0x202\t
+        site\tMoon Jump\tMoon Jump\tbaked_conditional\t0\t0x1\t0x400\t0xd503201f\t0x202\t
+        """, "dm/cheat_trampolines.tsv", under: ios)
 
         let modelStores = LauncherStores(defaults: testDefaults); let model = modelStores.build
         model.lang = .en
+        let mockRepo = temporary.appendingPathComponent("mock-repo")
+        try write("ap.add_argument('--from-seed')\nap.add_argument('--cheat-dir')\n", "scripts/build_ipa_from_nsp.py", under: mockRepo)
+        modelStores.repo.path = mockRepo.path
+        let mockSeeds = temporary.appendingPathComponent("mock-seeds")
+        let seedDir = mockSeeds.appendingPathComponent(game)
+        try write("{\"schema\":1,\"title_id\":\"\(game)\",\"gfx_api\":\"vulkan\"}\n", "seed.json", under: seedDir)
+        try write("main", "ExeFS/main", under: seedDir)
+        try fm.createDirectory(at: seedDir.appendingPathComponent("shader/pkg"), withIntermediateDirectories: true)
+        try write("vk", "shader/ios/vk/vk_shaders.metallib", under: seedDir)
+        testDefaults.set(mockSeeds.path, forKey: BuildCacheRoots.seedKey)
         MainActor.assumeIsolated { modelStores.dependencies.checked = true }
         MainActor.assumeIsolated { modelStores.dependencies.deps = [Dep(id: "test", name: "Xcode", hint: "", present: true, installCmd: [])] }
         let library = GameLibrary(file: temporary.appendingPathComponent("preview.json"))
@@ -384,32 +658,41 @@ import NXModel
         let support = temporary.appendingPathComponent("Application Support")
         let folder = CheatFiles.macFolder(titleID: game, support: support)
         try write("""
-        [Cheat Manager]
-        {Always unlimited stamina}
-        04000000 00000010 00000001
-        [--SectionStart:Link--]
-        [Infinite health]
-        04000000 00000020 00000002
-        [Infinite stamina]
-        04000000 00000030 00000003
-        [Max rupees]
-        04000000 00000040 00000004
-        [--SectionEnd:Link--]
-        [--SectionStart:World--]
+        [Movement & Combat]
+        20000000
+        [Moon Jump]
+        80000202
+        04000000 00000400 D503201F
+        20000000
         [Walk through walls]
-        04000000 00000050 00000005
+        80000040
+        04000000 00000800 1E202800
+        20000000
+        [Infinite health]
+        04000000 00180020 000003E7
+        [Max rupees]
+        04100000 00004200 000F423F
+        [Movement & Combat End]
+        20000001
+        [--SectionStart:Extras--]
+        00000000 00000000 00000000
+        {Always unlimited stamina}
+        04000000 00180010 00000001
+        {Broken Master}
+        FF000000 00000001
         [Always sunny]
-        04000000 00000060 00000006
+        04000000 00180060 00000006
         [Broken by hand]
-        04000000 00000060 0006 junk
-        [--SectionEnd:World--]
+        04000000 00180060 0006 junk
+        [--SectionEnd:Extras--]
+        00000000 00000000 00000000
         """, "CD57B23FA4BBAD65.txt", under: folder)
-        try write("[Other]\n04000000 00000001 00000001\n", "FF773E90972D5440.txt", under: folder)
-        try write("Infinite health\nAlways sunny\n", "CD57B23FA4BBAD65.enabled", under: folder)
+        try write("[Other]\n04000000 00180001 00000001\n", "FF773E90972D5440.txt", under: folder)
+        try write("Infinite health\nMoon Jump\nAlways sunny\n", "CD57B23FA4BBAD65.enabled", under: folder)
 
-        func shot(_ name: String, _ view: some View, height: CGFloat = 700) throws {
+        func shot(_ name: String, _ view: some View, height: CGFloat = 800) throws {
             let host = NSHostingView(rootView: view.environmentObject(PadFocus()))
-            let window = OffscreenWindow(size: NSSize(width: 600, height: height))
+            let window = OffscreenWindow(size: NSSize(width: 640, height: height))
             window.contentView = host
             window.orderFront(nil)
             RunLoop.main.run(until: Date().addingTimeInterval(0.6))
@@ -419,11 +702,26 @@ import NXModel
             window.orderOut(nil)
         }
         try shot("cheats", CheatsView(m: model, library: library, gameID: id, devicectl: DeviceControl { _ in (true, "") }, support: support).environmentObject(modelStores.localizer))
+        try shot("cheats-before-en", CheatsView(m: model, library: library, gameID: id, devicectl: DeviceControl { _ in (true, "") }, support: support).environmentObject(modelStores.localizer))
         try shot("cheats-drop", CheatsView(m: model, library: library, gameID: id, support: support, dropped: true).environmentObject(modelStores.localizer))
         model.lang = .de
         try shot("cheats-de", CheatsView(m: model, library: library, gameID: id, support: support).environmentObject(modelStores.localizer))
         model.lang = .zh
         try shot("cheats-zh", CheatsView(m: model, library: library, gameID: id, support: support).environmentObject(modelStores.localizer))
+        try shot("cheats-before-zh", CheatsView(m: model, library: library, gameID: id, support: support).environmentObject(modelStores.localizer))
+
+        // After triggering the 30-second anti-crash fuse on a newly enabled cheat ("Walk through walls").
+        let fuseFiles = CheatFiles(titleID: game, support: support)
+        _ = fuseFiles.armBeforeLaunch(buildID: "CD57B23FA4BBAD65")
+        _ = fuseFiles.disarmAndRecordStable()
+        try write("Infinite health\nAlways sunny\nWalk through walls\n", "CD57B23FA4BBAD65.enabled", under: folder)
+        _ = fuseFiles.armBeforeLaunch(buildID: "CD57B23FA4BBAD65")
+        _ = fuseFiles.handleProcessExit(elapsed: 7.0, threshold: 30.0)
+        model.lang = .en
+        try shot("cheats-after-tripped-en", CheatsView(m: model, library: library, gameID: id, devicectl: DeviceControl { _ in (true, "") }, support: support).environmentObject(modelStores.localizer))
+        model.lang = .zh
+        try shot("cheats-after-tripped-zh", CheatsView(m: model, library: library, gameID: id, devicectl: DeviceControl { _ in (true, "") }, support: support).environmentObject(modelStores.localizer))
+
         model.lang = .en
         try fm.removeItem(at: folder)
         try write("x", ".cheats-running-\(game)", under: folder)
@@ -457,7 +755,7 @@ import NXModel
     func testNoteIsTranslatedWithoutSemicolons() {
         for lang in [Lang.en, .zh, .sv, .de] {
             let text = L10n.string("cheats.iosNote", lang)
-            XCTAssertFalse(text.isEmpty); XCTAssertFalse(text.contains(";")); XCTAssertTrue(text.contains("iPhone"))
+            XCTAssertFalse(text.isEmpty); XCTAssertFalse(text.contains(";")); XCTAssertTrue(text.contains("iOS"))
             XCTAssertFalse(text.contains("#724"), "data cheats run on the iPhone now, only code cheats are refused there")
         }
         XCTAssertTrue(L10n.string("cheats.iosNote", .en).contains("Mac app"))

@@ -11,6 +11,7 @@ extension BuildStore {
     /// pruning the build folders this pipeline itself writes so a rescan is not slow.
     /// A folder of the game's files (base/, updates/, dlc/: a Switch 2 game) is read as one game instead (BuildStore+GameFolder.swift).
     package func scan(folder: String) {
+        hintedTitleID = nil
         if GameFolder.isCandidate(folder) { takeGameFolder(folder); return }
         leaveGameFolder()
         gameDir = folder
@@ -60,6 +61,7 @@ extension BuildStore {
     /// and left out (it is not moved to another row: the row the user chose stays as they set it).
     package func take(picked: [String], kind: InputKind) {
         if kind == .base, picked.count == 1, GameFolder.isCandidate(picked[0]) { scan(folder: picked[0]); return }   // a .nup file is one game
+        if kind == .base { hintedTitleID = nil }
         leaveGameFolder()   // a package picked for a row ends a game folder: the two never mix
         let id = kind == .base ? "base" : kind == .update ? "update" : kind == .dlc ? "dlc" : "keys"
         let baseName = kind == .base ? nil : (basePath as NSString).lastPathComponent
@@ -78,10 +80,12 @@ extension BuildStore {
             s.problem = problem
         }
         if kind == .base, let first = fitting.first { gameDir = (first as NSString).deletingLastPathComponent }
+        if kind == .keys, let keys = fitting.first { saveKeys(keys) }   // a keys file chosen for the row is kept for every game (#996)
     }
 
     /// Clearing a row of a game folder clears the folder: its rows are one game.
     package func clear(_ id: String) {
+        if id == "base" || gameFolder != nil || gameFolderRefused { hintedTitleID = nil }
         if gameFolder != nil || gameFolderRefused { leaveGameFolder(); return }
         updateSlot(id) { $0.paths = []; $0.problem = "" }
     }

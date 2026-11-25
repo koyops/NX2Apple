@@ -53,6 +53,7 @@ class BuildFailure(unittest.TestCase):
         m.repo_path = ''  # A failure-view fixture never starts a process in a detected checkout.
         m.lang = Lang('en')   # these assertions read English whatever the device language is
         w = MainWindow(m)
+        w._switch_page('builds')
         # Delete while the app exists: PySide destroys leftovers after it at exit and segfaults.
         self.addCleanup(self._delete, m, w)
         w.resize(900, height)
@@ -120,7 +121,7 @@ class BuildFailure(unittest.TestCase):
                          'stage bookkeeping must not win over the last real line')
         w._on_finished(False, m.t('msg.buildFailedReason', m._last_error))
         self.assertIn('no prod.keys', w.footer.text())
-        self.assertIn('see the log below', w.footer.text())
+        self.assertIn('See the log below', w.footer.text())
         w.close()
 
     def test_the_input_reminder_does_not_erase_the_failure(self):

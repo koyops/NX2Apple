@@ -5,10 +5,13 @@ import Foundation
 /// these win over the built-in defaults (ShellSettingsStore priority: game > shell > built-in).
 public final class ShellSettingsStore: @unchecked Sendable {
     public static let padMapKey = "padMap"
+    public static let padMergeKey = "padMerge"
+    public static let audioMixKey = "audioMix"
     public static let suiteName = "shell-settings"
     public static let dataFolderKey = "globalDataBookmark"
     public static let cloudSavesKey = "globalCloudSavesBookmark"
     public static let performanceHUDKey = "performanceHUD"       // true/false; a game's own row wins when set
+    public static let showFPSKey = "showFPS"                   // true/false; a game's own row wins when set
     public static let dataFolderNameKey = "globalDataFolderName"
     public static let cloudSavesNameKey = "globalCloudSavesFolderName"
     public static let touchSizeKey = "touchSize"                 // small, medium or large: DM_TOUCH_SIZE for every game
@@ -17,6 +20,7 @@ public final class ShellSettingsStore: @unchecked Sendable {
     public static let touchStickKey = "touchStick"               // corner, higher or inward: DM_TOUCH_STICK for every game
     /// Where the left stick sits, as the engine reads DM_TOUCH_STICK. The corner is the built-in place and is never stored.
     public static let touchStickPlaces = ["corner", "higher", "inward"]
+    public static let touchModeKey = "touchMode" // 2d/3d, separate from saved positions
     public static let touchLayoutKey = "touchLayout"             // the player's arrangement: DM_TOUCH_LAYOUT for every game
 
     /// The store the app reads and writes. Tests and previews swap it.
@@ -37,12 +41,16 @@ public final class ShellSettingsStore: @unchecked Sendable {
     public var performanceHUD: Bool? {   // nil: no shell-level choice, the game's own row decides
         defaults.object(forKey: Self.performanceHUDKey) as? Bool
     }
+    public var showFPS: Bool? {   // nil: no shell-level choice, the game's own row decides
+        defaults.object(forKey: Self.showFPSKey) as? Bool
+    }
 
     public func storeDataFolderName(_ name: String) { defaults.set(name, forKey: Self.dataFolderNameKey) }
     public func storeCloudSavesFolderName(_ name: String) { defaults.set(name, forKey: Self.cloudSavesNameKey) }
     public func clearDataFolderName() { defaults.removeObject(forKey: Self.dataFolderNameKey) }
     public func clearCloudSavesFolderName() { defaults.removeObject(forKey: Self.cloudSavesNameKey) }
     public func storePerformanceHUD(_ on: Bool) { defaults.set(on, forKey: Self.performanceHUDKey) }
+    public func storeShowFPS(_ on: Bool) { defaults.set(on, forKey: Self.showFPSKey) }
 
     /// The touch controls' size for every game: small, medium (the built-in size) or large.
     public var touchSize: String {
@@ -52,6 +60,13 @@ public final class ShellSettingsStore: @unchecked Sendable {
     public func storeTouchSize(_ size: String) {
         guard Self.touchSizes.contains(size) else { return }
         if size == "medium" { defaults.removeObject(forKey: Self.touchSizeKey) } else { defaults.set(size, forKey: Self.touchSizeKey) }
+    }
+
+    /// Unset keeps each game's original starting layout.
+    public var touchMode: String { defaults.string(forKey: Self.touchModeKey) == "2d" ? "2d" : "3d" }
+    public func storeTouchMode(_ mode: String) {
+        guard mode == "2d" || mode == "3d" else { return }
+        defaults.set(mode, forKey: Self.touchModeKey)
     }
 
     /// Where the left stick sits in every game: in the corner (the built-in place), higher, or further in.
@@ -92,12 +107,38 @@ public final class ShellSettingsStore: @unchecked Sendable {
     }
     public func resetPadMap() { defaults.removeObject(forKey: Self.padMapKey) }
 
+    /// Whether every connected controller and touch controls drive player 1 together (`DM_PAD_MERGE`).
+    public var padMerge: Bool { defaults.bool(forKey: Self.padMergeKey) }
+    public func storePadMerge(_ on: Bool) {
+        if on {
+            defaults.set(true, forKey: Self.padMergeKey)
+        } else {
+            defaults.removeObject(forKey: Self.padMergeKey)
+        }
+    }
+
+    /// Whether game audio mixes with other apps instead of interrupting background playback (`DM_AUDIO_MIX`).
+    public var audioMix: Bool { defaults.bool(forKey: Self.audioMixKey) }
+    public func storeAudioMix(_ on: Bool) {
+        if on {
+            defaults.set(true, forKey: Self.audioMixKey)
+        } else {
+            defaults.removeObject(forKey: Self.audioMixKey)
+        }
+    }
+
     /// DM_PAD_MAP is deliberately excluded. The host merges it per button at launch.
     /// The shell's value for each `DM_*` switch a game's own settings leave alone.
     public var gameDefaults: [String: String] {
         var values = performanceHUD.map { ["DM_METAL_HUD": $0 ? "1" : "0"] } ?? [:]
+        if let showFPS { values["DM_SHOW_FPS"] = showFPS ? "1" : "0" }
+        if padMerge { values["DM_PAD_MERGE"] = "1" }
+        if audioMix { values["DM_AUDIO_MIX"] = "1" }
         if touchSize != "medium" { values["DM_TOUCH_SIZE"] = touchSize }
         if touchStick != "corner" { values["DM_TOUCH_STICK"] = touchStick }
+        if let mode = defaults.string(forKey: Self.touchModeKey), mode == "2d" || mode == "3d" {
+            values["DM_PROF_PAD_LAYOUT"] = mode == "3d" ? "1" : "0"
+        }
         let layout = touchLayout.encoded
         if !layout.isEmpty { values["DM_TOUCH_LAYOUT"] = layout }
         return values

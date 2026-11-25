@@ -1,125 +1,349 @@
 import SwiftUI
+import TipKit
+#if os(iOS)
+import UIKit
+#endif
 
 /// The touch controls' layout editor (#414), a screen of the shell settings: the controls of one layout drawn as the game draws them, on
-/// this device's screen at its own proportions. Drag a control and it snaps to steps of a quarter key. Where it would cover another
-/// control or leave its area it turns red and goes back when let go. The area it may use shows while it is chosen. A chosen control also
-/// moves step by step with the arrows, a controller (A picks it up, the D-pad moves it, A or B puts it down) or VoiceOver's actions.
+/// this device's screen at its own proportions. Tap a control to select it, then drag it in a separate gesture; moves snap to steps
+/// of a quarter key. Where it would cover another control or leave its area it turns red and goes back when let go. The allowed area
+/// shows while it is chosen. A chosen control also moves step by step with the arrows, a controller (A picks it up, the D-pad moves it,
+/// A or B puts it down) or VoiceOver's actions.
 /// Reset this control and Reset all controls return one control or the whole shown layout to the built-in places, Reset all after
 /// a question. The engine places every control again on the
 /// device, so nothing the editor stores can break a game's layout.
 struct TouchLayoutEditorView: View {
     @Bindable var model: TouchLayoutEditorModel
     var close: () -> Void
-    /// Where the column beside the preview starts scrolled: the top, or the end for the captures of what lies below.
-    var columnAnchor: UnitPoint = .top
-    @Environment(\.shellFocus) private var focus
+    var cancel: (() -> Void)? = nil
+    @Environment(\.shellDismissTouchEditor) private var dismissEditor
+#if os(iOS)
+    @Environment(\.shellRotateTouchEditor) private var rotateEditor
+    @State private var liveGeometry: TouchLayoutGeometrySnapshot?
+#endif
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// The system's echo of a controller button: the editor's buttons do nothing for it (the shell's focus took it).
     @Environment(\.shellIgnoresPress) private var ignoresPress
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var idleActivity = 0
     /// The drag in progress: the control, where its offset started, and the spot drawn under the finger when the engine refuses it.
-    @State private var drag: DragState?
-    @State private var bounce: CGSize = .zero
+    @State var drag: DragState?
+    @GestureState private var dragGestureActive = false
+    @State var bounce: CGSize = .zero
+    @State private var optionsPresented = false
+    @State private var hintVisible = true
+    @State private var editorTip = TouchEditorTip()
+    @State private var hintHeight: CGFloat = 80
+    @State private var rejectionBannerVisible = false
+    @State private var rejectionDismissTask: Task<Void, Never>?
 
-    private struct DragState: Equatable {
+    struct DragState: Equatable {
         var control: TouchLayout.Control
         var start: TouchLayout.Offset
         var refused: TouchLayout.Offset?
-        var travelled: CGFloat = 0
     }
 
-    /// The width of the Arrange button in the shell settings, the same in every language (the longest label fits at the type's size).
-    static let buttonWidth: CGFloat = 148
     static let arrowSize: CGFloat = 48
 
     var body: some View {
         GeometryReader { proxy in
-            // Held sideways the preview takes the room the column beside it leaves: on a phone it is then nearly as large as the game.
-            let wide = proxy.size.width > proxy.size.height * 1.1 && proxy.size.width >= 600
-            if wide {
-                let column = Self.column(width: proxy.size.width), aspect = screen.size.width / screen.size.height
-                let w = max(200, min(proxy.size.width - column - 20 - 32, (proxy.size.height - 24) * aspect))
-                HStack(alignment: .top, spacing: 20) {
-                    canvas.frame(width: w, height: w / aspect)
-                        .frame(maxHeight: .infinity)
-                    // Everything else scrolls in the column: on the smallest phone it is taller than the screen.
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 14) { header; pickers; panel(compact: true) }.padding(.vertical, 12)
-                    }
-                    .scrollIndicators(.automatic)
-                    .defaultScrollAnchor(columnAnchor)
-                    .frame(width: column)
+            let contentInsets = proxy.safeAreaInsets
+            let windowSize = CGSize(width: proxy.size.width + contentInsets.leading + contentInsets.trailing,
+                                    height: proxy.size.height + contentInsets.top + contentInsets.bottom)
+#if os(iOS)
+            let isPad = UIDevice.current.userInterfaceIdiom == .pad
+            let sameOrientation = (windowSize.height > windowSize.width) == (screen.size.height > screen.size.width)
+            let canvasSize = sameOrientation ? windowSize : proxy.size
+#else
+            let division = reservedDivision(in: proxy)?.offsetBy(dx: contentInsets.leading, dy: contentInsets.top)
+            let actualScreen = TouchLayoutGeometrySnapshot(bounds: CGRect(origin: .zero, size: windowSize),
+                safeAreaInsets: .init(top: contentInsets.top, left: contentInsets.leading, bottom: contentInsets.bottom, right: contentInsets.trailing),
+                division: division, hingeStatus: nil).screen
+            let sameOrientation = (windowSize.height > windowSize.width) == (screen.size.height > screen.size.width)
+            let canvasSize = sameOrientation ? windowSize : proxy.size
+#endif
+            ZStack(alignment: sameOrientation ? .topLeading : .center) {
+                ShellPalette.background.ignoresSafeArea()
+                canvas
+                    .frame(width: sameOrientation ? canvasSize.width : nil, height: sameOrientation ? canvasSize.height : nil)
+                    .frame(maxWidth: sameOrientation ? nil : canvasSize.width, maxHeight: sameOrientation ? nil : canvasSize.height)
+                    .offset(x: sameOrientation ? -contentInsets.leading : 0, y: sameOrientation ? -contentInsets.top : 0)
+#if os(iOS)
+                    .allowsHitTesting(liveGeometry != nil)
+#endif
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+#if os(iOS)
+            .background {
+                TouchLayoutGeometryProbe { liveGeometry = $0 }
+                    .frame(width: proxy.size.width, height: proxy.size.height)
+            }
+            .onChange(of: liveGeometry, initial: true) { _, geometry in
+                guard let geometry else { return }
+                let context = Self.editorContext(geometry: geometry, isPad: isPad)
+                model.updateScreen(context.screen)
+                drag = nil
+                bounce = .zero
+            }
+#else
+            .onChange(of: actualScreen, initial: true) { _, newScreen in
+                model.updateScreen(newScreen)
+                drag = nil
+                bounce = .zero
+            }
+#endif
+        }
+        .simultaneousGesture(TapGesture().onEnded { hintVisible = false; idleActivity &+= 1 })
+        .task { try? Tips.configure([.displayFrequency(.immediate)]) }
+        .accessibilityIdentifier("touchLayout.editor")
+        .foregroundStyle(.white).preferredColorScheme(.dark)
+        .onChange(of: model.stepCount) { _, _ in if drag == nil { idleActivity &+= 1 } }
+        .onChange(of: model.selected) { _, _ in idleActivity &+= 1 }
+        .onChange(of: model.rejectCount) { _, _ in
+            guard model.rejected else { return }
+            rejectionDismissTask?.cancel()
+            withAnimation(reduceMotion ? nil : .easeOut(duration: 0.2)) {
+                rejectionBannerVisible = true
+            }
+            rejectionDismissTask = Task { @MainActor in
+                try? await Task.sleep(for: .seconds(2.4))
+                guard !Task.isCancelled else { return }
+                withAnimation(reduceMotion ? nil : .easeIn(duration: 0.2)) {
+                    rejectionBannerVisible = false
                 }
-                .padding(.horizontal, 16)
-                .frame(maxWidth: .infinity)
-            } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 18) {
-                        header
-                        pickers
-                        canvas
-                        if !model.kind.split && proxy.size.width < 560 {
-                            Label(ShellStrings.text("Turn the phone sideways for a larger preview."), systemImage: "rotate.right")
-                                .shellType(ShellType.note).foregroundStyle(.white.opacity(0.55))
-                        }
-                        panel(compact: false)
-                    }
-                    .padding(.horizontal, 24).padding(.vertical, 20)
-                    .frame(maxWidth: 640).frame(maxWidth: .infinity)
-                }
-                .scrollIndicators(.hidden)
-                .scrollDisabled(drag != nil)
             }
         }
-        .foregroundStyle(.white).preferredColorScheme(.dark)
+        .onChange(of: model.rejected) { _, rejected in
+            if !rejected {
+                rejectionDismissTask?.cancel()
+                rejectionDismissTask = nil
+                withAnimation(reduceMotion ? nil : .easeIn(duration: 0.16)) {
+                    rejectionBannerVisible = false
+                }
+            }
+        }
+        .onDisappear {
+            rejectionDismissTask?.cancel()
+            rejectionDismissTask = nil
+        }
+        .onChange(of: dragGestureActive) { wasActive, isActive in
+            guard wasActive, !isActive else { return }
+            Task { @MainActor in
+                guard drag != nil else { return }
+                drag = nil
+                bounce = .zero
+                model.dragEnded(rejected: false)
+            }
+        }
         .sensoryFeedback(.selection, trigger: model.stepCount)
         .sensoryFeedback(.warning, trigger: model.rejectCount)
+        .confirmationDialog(ShellStrings.text("Discard changes?"), isPresented: $model.confirmingExit, titleVisibility: .visible) {
+            Button(ShellStrings.text("Discard changes"), role: .destructive, action: discardAndClose)
+                .accessibilityIdentifier("touchLayout.discard")
+            Button(ShellStrings.text("Keep editing"), role: .cancel) { }
+                .accessibilityIdentifier("touchLayout.keepEditing")
+        } message: {
+            Text(ShellStrings.text("Your changes will be lost."))
+        }
     }
 
-    /// The column beside the preview held sideways: about a third of the width, never narrower than the buttons need.
-    static func column(width: CGFloat) -> CGFloat { min(340, max(250, (width * 0.34).rounded())) }
+    private var exactGeometryReady: Bool {
+        #if os(iOS)
+        liveGeometry != nil
+        #else
+        true
+        #endif
+    }
 
-    // MARK: Header and pickers
+    private func requestExit() {
+        guard !ignoresPress() else { return }
+        if model.requestExit() { discardAndClose() }
+    }
 
-    private var header: some View {
-        HStack(alignment: .center) {
-            Text(ShellStrings.text("Arrange controls")).shellType(ShellType.pageTitle)
-                .lineLimit(1).minimumScaleFactor(0.7).accessibilityAddTraits(.isHeader)
-            Spacer(minLength: 8)
-            Button { if !ignoresPress() { close() } } label: { Text(ShellStrings.text("Done")) }
-                .buttonStyle(ChipButtonStyle())
-                .accessibilityIdentifier("touchLayout.done")
-                .shellTarget("lay.done", radius: 22, action: close)
+    private func discardAndClose() {
+        guard !ignoresPress() else { return }
+        (cancel ?? close)()
+        dismissEditor?()
+    }
+
+    private func saveAndClose() {
+        guard !ignoresPress(), !model.invalidPlacement, exactGeometryReady else { return }
+        close()
+        dismissEditor?()
+    }
+
+    private var editorCancelButton: some View {
+        Button(action: requestExit) {
+            Label(ShellStrings.text("Exit"), systemImage: "xmark")
         }
+        .buttonStyle(.glass)
+        .accessibilityLabel(ShellStrings.text("Exit"))
+        .accessibilityIdentifier("touchLayout.back")
+        .shellTarget("lay.back", action: requestExit)
+    }
+
+    private var editorOptionsButton: some View {
+        Button { if !ignoresPress() { hintVisible = false; optionsPresented = true } } label: {
+            Image(systemName: "gearshape.fill").font(.system(size: 18, weight: .semibold))
+        }
+        .buttonStyle(.glass)
+        .buttonBorderShape(.circle)
+        .controlSize(.regular)
+        .frame(width: 44, height: 44)
+        .accessibilityLabel(ShellStrings.text("Touch controls options"))
+        .accessibilityIdentifier("touchLayout.options")
+        .shellTarget("lay.options") { hintVisible = false; optionsPresented = true }
+        .popover(isPresented: $optionsPresented, attachmentAnchor: .rect(.bounds)) {
+            optionsPopover
+                .frame(width: 320)
+                .presentationCompactAdaptation(.popover)
+        }
+    }
+
+    private var editorDoneButton: some View {
+        Button(action: saveAndClose) {
+            Label(ShellStrings.text("Save"), systemImage: "checkmark")
+        }
+        .buttonStyle(.glassProminent)
+        .labelStyle(.iconOnly)
+        .buttonBorderShape(.circle)
+        .tint(ShellPalette.cream)
+        .foregroundStyle(.black)
+        .disabled(model.invalidPlacement || !exactGeometryReady)
+        .accessibilityLabel(ShellStrings.text("Save"))
+        .accessibilityIdentifier("touchLayout.done")
+        .shellTarget("lay.done", enabled: !model.invalidPlacement && exactGeometryReady) {
+            saveAndClose()
+        }
+    }
+
+    private func reservedDivision(in proxy: GeometryProxy) -> CGRect? {
+        #if os(iOS)
+        if #available(iOS 27.1, *) { return proxy.reservedRegions(kind: .division).first?.frame }
+        #endif
+        return nil
+    }
+
+    struct EditorContext {
+        var screen: PadScreen
+        var phonePortraitFallback: Bool
+    }
+
+    static func editorContext(geometry: TouchLayoutGeometrySnapshot, isPad: Bool) -> EditorContext {
+        _ = isPad
+        return EditorContext(screen: geometry.screen, phonePortraitFallback: false)
+    }
+
+    private var liveHingeStatus: TouchLayoutGeometrySnapshot.HingeStatus? {
+        #if os(iOS)
+        liveGeometry?.hingeStatus
+        #else
+        nil
+        #endif
+    }
+
+    static func layoutTitle(screen: PadScreen, hingeStatus: TouchLayoutGeometrySnapshot.HingeStatus?) -> String {
+        if screen.size.height > screen.size.width { return ShellStrings.text("Portrait") }
+        return ShellStrings.text(hingeStatus == .closed ? "Landscape (Duo outer screen)" : "Landscape")
+    }
+
+    private var optionsPopover: some View {
+        VStack(spacing: 0) {
+            HStack {
+                editorCancelButton
+                Spacer()
+                editorDoneButton
+            }
+            .padding(16)
+            Divider()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    Text(Self.layoutTitle(screen: screen, hingeStatus: liveHingeStatus)).font(.headline)
+                        .accessibilityIdentifier("touchLayout.orientation")
+                    Text(ShellStrings.text(model.kind.split ? "Positions are saved for portrait and tabletop controls." : "Positions are shared across landscape views."))
+                        .font(.footnote).foregroundStyle(.secondary)
+                    NativeChoiceControl(row: sizeRow, targetPrefix: "lay.row.") { model.setSize($0) }
+                    NativeChoiceControl(row: layoutChoiceRow, targetPrefix: "lay.row.") { value in
+                        model.setKind(.of(full: value == "3d", split: model.kind.split))
+                    }
+                    if !(model.actualScreen?.partiallyOpen ?? false) && liveHingeStatus != .partiallyOpen {
+                        NativeChoiceControl(row: screenRow, targetPrefix: "lay.row.") { value in
+                            let portrait = value == "below"
+                            model.selectOrientation(portrait: portrait)
+                            #if os(iOS)
+                            rotateEditor?(portrait)
+                            #endif
+                        }
+                    }
+                    TouchControlsNote()
+                    Divider()
+                    Button(role: .destructive) {
+                        if !ignoresPress() { model.askReset() }
+                    } label: {
+                        Label(ShellStrings.text("Reset all controls"), systemImage: "arrow.counterclockwise")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(ShellButtonStyle(fills: true, destructive: true))
+                    .disabled(model.layoutIsBuiltIn || !exactGeometryReady)
+                    .accessibilityIdentifier("touchLayout.resetAll")
+                    .shellTarget("lay.resetAll", enabled: !model.layoutIsBuiltIn && exactGeometryReady) {
+                        model.askReset()
+                    }
+                }
+                .padding(16)
+            }
+            .scrollBounceBehavior(.basedOnSize)
+            .frame(idealHeight: 340)
+            .accessibilityIdentifier("touchLayout.options.scroll")
+        }
+        .frame(maxWidth: 320)
+        .confirmationDialog(
+            ShellStrings.text("Reset all controls"),
+            isPresented: Binding(get: { model.confirmingReset }, set: { if !$0 { model.cancelReset() } }),
+            titleVisibility: .visible
+        ) {
+            Button(ShellStrings.text("Reset all controls"), role: .destructive) {
+                if !ignoresPress() {
+                    model.reset()
+                    optionsPresented = false
+                }
+            }
+            .accessibilityIdentifier("touchLayout.resetAll.confirm")
+            Button(ShellStrings.text("Cancel"), role: .cancel) {
+                model.cancelReset()
+            }
+            .accessibilityIdentifier("touchLayout.resetAll.cancel")
+        } message: {
+            let layoutName = Self.layoutTitle(screen: screen, hingeStatus: liveHingeStatus)
+            Text(ShellStrings.text("Put every control of the \(layoutName) layout back in its built-in place?"))
+        }
+    }
+
+    private var sizeRow: SettingRow {
+        var row = ShellSettingsRows.touchSizeRow(model.store)
+        row.value = model.editing.size
+        return row
+    }
+
+    private var layoutChoiceRow: SettingRow {
+        SettingRow(id: Self.layoutRow, label: ShellStrings.text("Layout"),
+                   kind: .choice([SettingOption("2d", "2D"), SettingOption("3d", "3D")]),
+                   value: model.kind.full ? "3d" : "2d")
+    }
+
+    private var screenRow: SettingRow {
+        SettingRow(id: Self.poseRow, label: ShellStrings.text("Screen"),
+                   kind: .choice([SettingOption("over", ShellStrings.text("Landscape")), SettingOption("below", ShellStrings.text("Portrait"))]),
+                   value: model.kind.split ? "below" : "over")
     }
 
     /// The rows report to the editor, not to a game or the shell settings (LibraryView.pickChoice).
     static let gameID = "touchLayout"
     static let layoutRow = "lay.layout", poseRow = "lay.pose", togetherRow = "lay.together"
 
-    private var pickers: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            let layoutRow = SettingRow(id: Self.layoutRow, label: ShellStrings.text("Layout"),
-                                       note: ShellStrings.text("Switch in the game with the button at the top centre. 3D adds the D-pad, L3 and R3."),
-                                       kind: .choice([SettingOption("2d", "2D"), SettingOption("3d", "3D")]),
-                                       value: model.kind.full ? "3d" : "2d")
-            SettingControl(gameID: Self.gameID, row: layoutRow, targetPrefix: "lay.row.") { value in
-                model.setKind(.of(full: value == "3d", split: model.kind.split))
-            }.equatable()
-            if model.upright != nil {
-                let poseRow = SettingRow(id: Self.poseRow, label: ShellStrings.text("Screen"),
-                                         kind: .choice([SettingOption("over", ShellStrings.text("Over the picture")),
-                                                        SettingOption("below", ShellStrings.text("Below the picture"))]),
-                                         value: model.kind.split ? "below" : "over")
-                SettingControl(gameID: Self.gameID, row: poseRow, targetPrefix: "lay.row.") { value in
-                    model.setKind(.of(full: model.kind.full, split: value == "below"))
-                }.equatable()
-            }
-        }
-    }
-
     // MARK: The preview
 
-    private var screen: PadScreen { model.editing.screen }
+    var screen: PadScreen { model.editing.screen }
 
     private var canvas: some View {
         let g = model.geo
@@ -127,12 +351,17 @@ struct TouchLayoutEditorView: View {
         return GeometryReader { proxy in
             let k = proxy.size.width / screen.size.width
             ZStack(alignment: .topLeading) {
+                Color.clear
+                    .contentShape(Rectangle())
+                    .gesture(selectionTapGesture(k: k))
+                    .simultaneousGesture(dragGesture(k: k))
                 Canvas { context, _ in
                     context.scaleBy(x: k, y: k)
                     drawBackdrop(g, in: &context)
                     if let active { drawGuides(for: active, g, k: k, in: &context) }
                     for c in g.drawnControls where !isActive(c, active) { draw(c, g, k: k, in: &context) }
                 }
+                .allowsHitTesting(false)
                 if let active {
                     Canvas { context, _ in
                         context.scaleBy(x: k, y: k)
@@ -141,132 +370,219 @@ struct TouchLayoutEditorView: View {
                     .offset(x: activeOffset(g).width * k, y: activeOffset(g).height * k)
                     .allowsHitTesting(false)
                 }
+                let optionsPos = Self.optionsButtonPosition(
+                    swap: g.swap,
+                    screenInsets: screen.insets,
+                    canvasSize: proxy.size,
+                    scale: k
+                )
                 accessibilityElements(g, k: k)
+                TouchEditorCogHalo(active: exactGeometryReady && scenePhase == .active && drag == nil && !model.held && !optionsPresented && !model.confirmingExit,
+                                   activity: idleActivity, center: optionsPos)
+                editorOptionsButton.position(optionsPos)
+                if hintVisible && exactGeometryReady {
+                    TipView(editorTip, arrowEdge: .top)
+                        .accessibilityIdentifier("touchLayout.tip")
+                        .frame(width: min(280, proxy.size.width - 32))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { hintHeight = $0 }
+                        .position(x: optionsPos.x, y: min(optionsPos.y + 30 + hintHeight / 2, proxy.size.height - hintHeight / 2 - 16))
+                }
+                if drag == nil, let selected = model.selected,
+                   let box = g.box(of: model.editing.mover(selected))?.box,
+                   let bounds = g.box(of: model.editing.mover(selected))?.within {
+                    selectedToolbar(for: selected)
+                        .position(Self.selectionToolsPosition(
+                            toolbarWidth: selectedToolbarWidth(for: selected),
+                            box: box,
+                            bounds: bounds,
+                            division: screen.division,
+                            optionsCenter: optionsPos,
+                            canvasSize: proxy.size,
+                            scale: k
+                        ))
+                }
+                if rejectionBannerVisible && model.rejected {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(ShellPalette.attention)
+                            .accessibilityHidden(true)
+                        Text(ShellStrings.text("No room there. It went back to where it was."))
+                            .shellText(13, .medium, relativeTo: .footnote)
+                            .foregroundStyle(.white.opacity(0.92))
+                            .lineLimit(2)
+                            .multilineTextAlignment(.center)
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background {
+                        Capsule().fill(.ultraThinMaterial)
+                            .overlay(Capsule().fill(.black.opacity(0.68)))
+                    }
+                    .overlay(Capsule().strokeBorder(ShellPalette.attention.opacity(0.5), lineWidth: 1))
+                    .frame(maxWidth: min(360, proxy.size.width - 32))
+                    .position(
+                        x: proxy.size.width / 2,
+                        y: max(40, proxy.size.height - max(18, screen.insets.bottom * k + 14) - 22)
+                    )
+                    .allowsHitTesting(false)
+                    .transition(reduceMotion ? .opacity : .move(edge: .bottom).combined(with: .opacity))
+                    .accessibilityIdentifier("touchLayout.rejected")
+                }
             }
-            .contentShape(Rectangle())
-            .gesture(dragGesture(k: k))
         }
+        .clipped()
         .aspectRatio(screen.size.width / screen.size.height, contentMode: .fit)
         .background(PadDrawing.backdrop)
-        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).strokeBorder(.white.opacity(0.14), lineWidth: 3))
         .accessibilityElement(children: .contain)
         .accessibilityLabel(ShellStrings.text("Preview of the touch controls"))
         .accessibilityIdentifier("touchLayout.preview")
     }
 
-    /// Where the active control is drawn beyond its kept place: under the finger on a refused spot, or on its way back.
-    private func activeOffset(_ g: PadGeo) -> CGSize {
-        if let drag, let refused = drag.refused {
-            let kept = model.dragOffset(drag.control)
-            return CGSize(width: CGFloat(refused.dx - kept.dx) * g.step + bounce.width, height: CGFloat(refused.dy - kept.dy) * g.step + bounce.height)
-        }
-        return bounce
+    nonisolated static func optionsButtonPosition(
+        swap: CGPoint,
+        screenInsets: PadScreen.Insets,
+        canvasSize: CGSize,
+        scale: CGFloat
+    ) -> CGPoint {
+        let half: CGFloat = 22
+        let margin: CGFloat = 6
+        let minX = screenInsets.left * scale + half + margin
+        let maxX = max(minX, canvasSize.width - screenInsets.right * scale - half - margin)
+        let minY = screenInsets.top * scale + half + margin
+        let maxY = max(minY, canvasSize.height - screenInsets.bottom * scale - half - margin)
+        let x = min(max(swap.x * scale, minX), maxX)
+        let y = min(max(swap.y * scale, minY), maxY)
+        return CGPoint(x: x, y: y)
     }
 
-    /// The active control and the controls that move with it: the diamond's keys while they move together.
-    private func isActive(_ c: TouchLayout.Control, _ active: TouchLayout.Control?) -> Bool {
-        guard let active else { return false }
-        return model.editing.mover(c) == model.editing.mover(active)
-    }
-
-    private func drawBackdrop(_ g: PadGeo, in context: inout GraphicsContext) {
-        // The picture: the whole screen over which the controls float, or its own area above the controls on a split screen.
-        let picture = g.region.separated ? g.region.game : g.region.game.intersection(CGRect(origin: .zero, size: screen.size))
-        context.fill(Path(roundedRect: picture, cornerRadius: 10), with: .color(.white.opacity(g.region.separated ? 0.07 : 0.03)))
-        if g.region.separated {
-            context.fill(Path(g.region.controls), with: .color(.black.opacity(0.18)))
-        }
-    }
-
-    private func drawGuides(for active: TouchLayout.Control, _ g: PadGeo, k: CGFloat, in context: inout GraphicsContext) {
-        let m = model.editing.mover(active)
-        // The area it may use: a calm cream tint with a dashed edge.
-        if let area = model.editing.allowedArea(active) {
-            let path = Path(roundedRect: area.insetBy(dx: 1, dy: 1), cornerRadius: 14)
-            context.fill(path, with: .color(ShellPalette.cream.opacity(0.06)))
-            context.stroke(path, with: .color(ShellPalette.cream.opacity(0.55)), style: StrokeStyle(lineWidth: 1.5 / k, dash: [8 / k, 6 / k]))
-        }
-        // Its built-in place, dashed, once it has moved.
-        if model.editing.isMoved(m) {
-            var built = model.editing
-            built.putBack(m)
-            let home = built.geo
-            for c in home.drawnControls where model.editing.mover(c) == m {
-                for shape in Self.shapes(c, home) {
-                    context.stroke(PadDrawing.outline(shape), with: .color(ShellPalette.cream.opacity(0.5)), style: StrokeStyle(lineWidth: 1.5 / k, dash: [5 / k, 5 / k]))
-                }
+    nonisolated static func selectionToolsPosition(
+        toolbarWidth: CGFloat,
+        box: CGRect,
+        bounds: CGRect,
+        division: CGRect?,
+        optionsCenter: CGPoint,
+        canvasSize: CGSize,
+        scale: CGFloat
+    ) -> CGPoint {
+        var bounds = bounds
+        if let division, division.height > division.width, division.intersects(bounds) {
+            if box.midX < division.midX {
+                bounds.size.width = max(0, min(bounds.maxX, division.minX) - bounds.minX)
+            } else {
+                let right = bounds.maxX
+                bounds.origin.x = max(bounds.minX, division.maxX)
+                bounds.size.width = max(0, right - bounds.minX)
             }
         }
+        let halfWidth = toolbarWidth / 2, halfHeight = 30.0
+        let minX = bounds.minX * scale + halfWidth, maxX = bounds.maxX * scale - halfWidth
+        let minY = bounds.minY * scale + halfHeight, maxY = bounds.maxY * scale - halfHeight
+        let x = minX <= maxX ? min(max(box.midX * scale, minX), maxX) : bounds.midX * scale
+        let above = box.minY * scale - halfHeight - 8
+        let below = box.maxY * scale + halfHeight + 8
+        let preferAbove = above >= minY
+        let primaryY = minY <= maxY ? (preferAbove ? above : min(max(below, minY), maxY)) : bounds.midY * scale
+
+        func clamp(_ p: CGPoint) -> CGPoint {
+            CGPoint(
+                x: min(max(p.x, halfWidth), max(halfWidth, canvasSize.width - halfWidth)),
+                y: min(max(p.y, halfHeight), max(halfHeight, canvasSize.height - halfHeight))
+            )
+        }
+        func rect(at p: CGPoint) -> CGRect {
+            CGRect(x: p.x - halfWidth, y: p.y - halfHeight, width: toolbarWidth, height: halfHeight * 2)
+        }
+        let optionsRect = CGRect(x: optionsCenter.x - 28, y: optionsCenter.y - 28, width: 56, height: 56)
+
+        let primary = clamp(CGPoint(x: x, y: primaryY))
+        if !rect(at: primary).intersects(optionsRect) { return primary }
+
+        let alternateY = preferAbove ? below : above
+        let alternate = clamp(CGPoint(x: x, y: alternateY))
+        if !rect(at: alternate).intersects(optionsRect) { return alternate }
+
+        let leftCandidate = clamp(CGPoint(x: optionsRect.minX - halfWidth - 6, y: primary.y))
+        let rightCandidate = clamp(CGPoint(x: optionsRect.maxX + halfWidth + 6, y: primary.y))
+        let sideCandidates = [leftCandidate, rightCandidate]
+            .filter { !rect(at: $0).intersects(optionsRect) }
+            .sorted { abs($0.x - primary.x) < abs($1.x - primary.x) }
+        if let bestSide = sideCandidates.first { return bestSide }
+
+        return clamp(CGPoint(x: primary.x, y: optionsRect.maxY + halfHeight + 6))
     }
 
-    private enum Highlight { case none, chosen, refused }
-
-    /// The keys in the editor: brighter than in the settings' small preview, with lines of the same width at every preview size. The
-    /// chosen control is filled cream with dark type and a soft halo, a refused spot red, so it reads at a glance.
-    private func draw(_ c: TouchLayout.Control, _ g: PadGeo, k: CGFloat, highlight: Highlight = .none, in context: inout GraphicsContext) {
-        var style = PadDrawing.Style(fill: .white.opacity(0.17), line: .white.opacity(0.62), text: .white.opacity(0.9), ring: .white.opacity(0.07),
-                                     lineWidth: 1.5 / k)
-        var halo: Color?
-        switch highlight {
-        case .none: break
-        case .chosen:
-            style.fill = ShellPalette.cream.opacity(model.held ? 1 : 0.9); style.line = ShellPalette.cream; style.text = .black.opacity(0.85)
-            style.ring = ShellPalette.cream.opacity(0.22); style.lineWidth = 2.5 / k
-            halo = ShellPalette.cream.opacity(model.held ? 0.5 : 0.32)
-        case .refused:
-            style.fill = DeleteStyle.red.opacity(0.9); style.line = DeleteStyle.red; style.text = .white
-            style.ring = DeleteStyle.red.opacity(0.25); style.lineWidth = 2.5 / k
-            halo = DeleteStyle.red.opacity(0.4)
-        }
-        for shape in Self.shapes(c, g) {
-            if let halo { context.stroke(PadDrawing.outline(shape), with: .color(halo), lineWidth: (model.held ? 12 : 9) / k) }
-            PadDrawing.draw(shape, in: &context, style: style)
-        }
+    private func selectedToolbarWidth(for selected: TouchLayout.Control) -> CGFloat {
+        let count: CGFloat = selected == .face || selected.isFaceKey ? 2 : 1
+        return count * 44 + (count - 1) * 8 + 12
     }
 
-    /// The drawn shapes of one control, in the gamepad's look.
-    static func shapes(_ c: TouchLayout.Control, _ g: PadGeo) -> [TouchPadPreviewGeometry.Shape] {
-        switch c {
-        case .face: (0..<4).map { .circle(g.faceKey[$0], g.faceR, label: ["A", "B", "X", "Y"][$0]) }
-        case .a: [.circle(g.faceKey[0], g.faceR, label: "A")]
-        case .b: [.circle(g.faceKey[1], g.faceR, label: "B")]
-        case .x: [.circle(g.faceKey[2], g.faceR, label: "X")]
-        case .y: [.circle(g.faceKey[3], g.faceR, label: "Y")]
-        case .stick: [.ring(g.stick, g.stickR, knob: g.knobR)]
-        case .dpad: [.dpad(g.dpad, g.dpadR)]
-        case .zl, .l, .zr, .r:
-            [.drop(g.drop[PadGeo.dropIndex(c)], g.dropR[PadGeo.dropIndex(c)], tipRight: c == .zr || c == .r, label: c.title)]
-        case .l3: [.circle(g.click[0], g.clickR, label: "L3")]
-        case .r3: [.circle(g.click[1], g.clickR, label: "R3")]
-        case .minus: [.pill(g.pill[0], label: "−")]
-        case .plus: [.pill(g.pill[1], label: "+")]
+    private func selectedToolbar(for selected: TouchLayout.Control) -> some View {
+        GlassEffectContainer(spacing: 12) {
+        HStack(spacing: 8) {
+            selectedReset.labelStyle(.iconOnly).frame(width: 44, height: 44)
+
+            if selected == .face || selected.isFaceKey {
+                Toggle(isOn: Binding(get: { model.together }, set: { if !ignoresPress() { model.setTogether($0) } })) {
+                    Image(systemName: "square.on.square.squareshape.controlhandles")
+                        .foregroundStyle(model.together ? Color.black : Color.white)
+                }
+                .toggleStyle(.button)
+                .buttonStyle(.glass)
+                .frame(width: 44, height: 44)
+                .tint(ShellPalette.cream)
+                .accessibilityLabel(ShellStrings.text("Move A B X Y together"))
+                .accessibilityIdentifier("touchLayout.together")
+                .shellTarget("lay.row.\(Self.togetherRow)") { model.setTogether(!model.together) }
+            }
         }
+        .padding(6)
+        .frame(width: selectedToolbarWidth(for: selected), height: 56)
+        }
+
     }
 
     // MARK: Touch
 
+    private func selectionTapGesture(k: CGFloat) -> some Gesture {
+        SpatialTapGesture(coordinateSpace: .local)
+            .onEnded { value in model.select(touchedControl(at: value.location, scale: k)) }
+    }
+
+    private func touchedControl(at point: CGPoint, scale k: CGFloat) -> TouchLayout.Control? {
+        model.editing.control(at: CGPoint(x: point.x / k, y: point.y / k), slop: max(22 / k, 6))
+    }
+
+    static func canDrag(_ control: TouchLayout.Control, selected: TouchLayout.Control?, together: Bool) -> Bool {
+        guard let selected else { return false }
+        func mover(_ control: TouchLayout.Control) -> TouchLayout.Control {
+            together && control.isFaceKey ? .face : control
+        }
+        return mover(control) == mover(selected)
+    }
+
     private func dragGesture(k: CGFloat) -> some Gesture {
-        DragGesture(minimumDistance: 0, coordinateSpace: .local)
+        DragGesture(minimumDistance: 8, coordinateSpace: .local)
+            .updating($dragGestureActive) { _, state, _ in
+                state = true
+            }
             .onChanged { value in
+                guard exactGeometryReady else { return }
                 let t = CGSize(width: value.translation.width / k, height: value.translation.height / k)
                 if drag == nil {
-                    let start = CGPoint(x: value.startLocation.x / k, y: value.startLocation.y / k)
-                    // A finger is wider than a key in a small preview: anything within about 22 points of the screen counts.
-                    guard let c = model.editing.control(at: start, slop: max(22 / k, 6)) else { return }
+                    guard let c = touchedControl(at: value.startLocation, scale: k),
+                          Self.canDrag(c, selected: model.selected, together: model.together) else { return }
                     bounce = .zero
-                    model.select(c)
                     drag = DragState(control: c, start: model.dragOffset(c))
                 }
                 guard var d = drag else { return }
-                d.travelled = max(d.travelled, hypot(value.translation.width, value.translation.height))
-                if d.travelled < 4 { drag = d; return }   // a tap chooses the control and moves nothing
                 let result = model.dragTo(d.control, from: d.start, by: t)
                 d.refused = result.kept ? nil : result.offset
                 drag = d
             }
             .onEnded { _ in
-                guard let d = drag else { model.select(nil); return }
+                guard let d = drag else { return }
                 if let refused = d.refused {
                     // Back to its kept place, from under the finger.
                     let g = model.geo, kept = model.dragOffset(d.control)
@@ -276,7 +592,7 @@ struct TouchLayoutEditorView: View {
                     model.dragEnded(rejected: true)
                 } else {
                     drag = nil
-                    if d.travelled >= 4 { model.dragEnded(rejected: false) }
+                    model.dragEnded(rejected: false)
                 }
             }
     }
@@ -287,24 +603,28 @@ struct TouchLayoutEditorView: View {
     /// up). They take no touches, the drag above does.
     private func accessibilityElements(_ g: PadGeo, k: CGFloat) -> some View {
         let controls = model.together ? [TouchLayout.Control.face] + g.drawnControls.filter { !$0.isFaceKey } : g.drawnControls
-        return ForEach(controls, id: \.self) { c in
-            let box = g.box(of: c)?.box ?? .zero
-            Color.clear
-                .frame(width: max(box.width * k, 30), height: max(box.height * k, 30))
-                .position(x: box.midX * k, y: box.midY * k)
-                .accessibilityElement()
-                .accessibilityLabel(c.title)
-                .accessibilityValue(ShellStrings.text(model.editing.isMoved(c) ? "Moved" : "In its place"))
-                .accessibilityAddTraits(model.selected.map { model.editing.mover($0) == c } == true ? [.isButton, .isSelected] : .isButton)
-                .accessibilityAction { model.select(c) }
-                .accessibilityAction(named: ShellStrings.text("Move up")) { voiceOverMove(c, 0, -1) }
-                .accessibilityAction(named: ShellStrings.text("Move down")) { voiceOverMove(c, 0, 1) }
-                .accessibilityAction(named: ShellStrings.text("Move left")) { voiceOverMove(c, -1, 0) }
-                .accessibilityAction(named: ShellStrings.text("Move right")) { voiceOverMove(c, 1, 0) }
-                .accessibilityAction(named: ShellStrings.text("Reset this control")) { model.select(c); model.putBack() }
-                .shellTarget("lay.ctl.\(c.rawValue)", radius: max(box.width, box.height) * k / 2) { model.pickUp(c) }
-                .allowsHitTesting(false)
-        }
+        return ForEach(controls, id: \.self) { c in accessibilityElement(c, g, k: k) }
+    }
+
+    private func accessibilityElement(_ c: TouchLayout.Control, _ g: PadGeo, k: CGFloat) -> some View {
+        let box = g.box(of: c)?.box ?? .zero
+        let value: String = ShellStrings.text(model.editing.isMoved(c) ? "Moved" : "In its place")
+        let traits: AccessibilityTraits = (model.selected.map { model.editing.mover($0) == c } == true) ? [.isButton, .isSelected] : .isButton
+        return Color.clear
+            .frame(width: max(box.width * k, 30), height: max(box.height * k, 30))
+            .position(x: box.midX * k, y: box.midY * k)
+            .accessibilityElement()
+            .accessibilityLabel(c.title)
+            .accessibilityValue(value)
+            .accessibilityAddTraits(traits)
+            .accessibilityAction { model.select(c) }
+            .accessibilityAction(named: ShellStrings.text("Move up")) { voiceOverMove(c, 0, -1) }
+            .accessibilityAction(named: ShellStrings.text("Move down")) { voiceOverMove(c, 0, 1) }
+            .accessibilityAction(named: ShellStrings.text("Move left")) { voiceOverMove(c, -1, 0) }
+            .accessibilityAction(named: ShellStrings.text("Move right")) { voiceOverMove(c, 1, 0) }
+            .accessibilityAction(named: ShellStrings.text("Reset this control")) { model.select(c); model.putBack() }
+            .shellTarget("lay.ctl.\(c.rawValue)", radius: max(box.width, box.height) * k / 2) { model.pickUp(c) }
+            .allowsHitTesting(false)
     }
 
     private func voiceOverMove(_ c: TouchLayout.Control, _ dx: Int, _ dy: Int) {
@@ -314,143 +634,23 @@ struct TouchLayoutEditorView: View {
         AccessibilityNotification.Announcement(text).post()
     }
 
-    // MARK: The panel
+    // MARK: Contextual controls
 
-    /// What is chosen, the arrows, the diamond's switch, the two resets and the note. compact: the column beside the preview, with the
-    /// arrows in one row. Otherwise the arrows in a cross with the resets beside them, or under them where the width is short.
-    private func panel(compact: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 14) {
-            VStack(alignment: .leading, spacing: 14) {
-                status
-                if compact {
-                    arrowRow.frame(maxWidth: .infinity)
-                } else {
-                    ViewThatFits(in: .horizontal) {
-                        HStack(alignment: .center, spacing: 18) { arrowCross; resets.frame(width: Self.resetWidth) }
-                        VStack(alignment: .leading, spacing: 14) { arrowCross.frame(maxWidth: .infinity); resets }
-                    }
-                }
-                let together = SettingRow(id: Self.togetherRow, label: ShellStrings.text("Move A B X Y together"),
-                                          kind: .toggle(on: "1", off: "0"), value: model.together ? "1" : "0")
-                SettingControl(gameID: Self.gameID, row: together, targetPrefix: "lay.row.") { model.setTogether($0 == "1") }
-                    .equatable()
-            }
-            .shellCard(padding: compact ? 14 : 18)
-            if compact { resets }
-            Text(ShellStrings.text("Drag a control to move it. Tap one to choose it, then move it step by step with the arrows. Where a control would cover another or leave the screen, it goes back. For every game."))
-                .shellType(ShellType.note).foregroundStyle(.white.opacity(0.5)).fixedSize(horizontal: false, vertical: true)
+    /// Reset the selected control.
+    private var selectedReset: some View {
+        let canPutBack = exactGeometryReady && (model.selected.map { model.editing.isMoved($0) } ?? false)
+        return Button { if !ignoresPress() { model.putBack() } } label: {
+            Image(systemName: "arrow.counterclockwise")
         }
+            .buttonStyle(.glass)
+            .frame(width: 44, height: 44)
+            .accessibilityLabel(ShellStrings.text("Reset this control"))
+            .disabled(!canPutBack)
+            .accessibilityIdentifier("touchLayout.putBack")
+            .shellTarget("lay.putBack", enabled: canPutBack) { model.putBack() }
     }
 
-    /// The width of the two resets beside the arrows on an upright screen, the same in every language.
-    static let resetWidth: CGFloat = 236
 
-    /// Reset this control (the chosen one) and Reset all controls (the shown layout), one above the other and as wide as each other.
-    /// Reset all asks first, in place, and the question starts on Cancel: it takes the button's place in the focus.
-    private var resets: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            let canPutBack = model.selected.map { model.editing.isMoved($0) } ?? false
-            Button { if !ignoresPress() { model.putBack() } } label: { resetLabel("Reset this control", "arrow.uturn.backward") }
-                .buttonStyle(ShellButtonStyle(fills: true))
-                .disabled(!canPutBack)
-                .accessibilityIdentifier("touchLayout.putBack")
-                .shellTarget("lay.putBack", enabled: canPutBack) { model.putBack() }
-            if model.confirmingReset {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(ShellStrings.text("Put every control of the \(model.kind.full ? "3D" : "2D") layout back in its built-in place?"))
-                        .shellType(ShellType.note).foregroundStyle(.white.opacity(0.85)).fixedSize(horizontal: false, vertical: true)
-                        .accessibilityIdentifier("touchLayout.resetQuestion")
-                    Button { if !ignoresPress() { model.reset() } } label: { resetLabel("Reset all controls", "arrow.counterclockwise") }
-                        .buttonStyle(ShellButtonStyle(fills: true, destructive: true))
-                        .accessibilityIdentifier("touchLayout.resetConfirm")
-                        .shellTarget("lay.resetConfirm") { model.reset() }
-                    Button { if !ignoresPress() { model.cancelReset() } } label: { Text(ShellStrings.text("Cancel")).lineLimit(1).minimumScaleFactor(0.8) }
-                        .buttonStyle(ShellButtonStyle(fills: true))
-                        .accessibilityIdentifier("touchLayout.resetCancel")
-                        .shellTarget("lay.reset") { model.cancelReset() }
-                }
-                .padding(10)
-                .background(DeleteStyle.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
-                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(DeleteStyle.red.opacity(0.35)))
-            } else {
-                Button { if !ignoresPress() { model.askReset() } } label: { resetLabel("Reset all controls", "arrow.counterclockwise") }
-                    .buttonStyle(ShellButtonStyle(fills: true, destructive: true))
-                    .disabled(model.layoutIsBuiltIn)
-                    .accessibilityIdentifier("touchLayout.reset")
-                    .shellTarget("lay.reset", enabled: !model.layoutIsBuiltIn) { model.askReset() }
-            }
-        }
-    }
-
-    private func resetLabel(_ text: String.LocalizationValue, _ symbol: String) -> some View {
-        Label { Text(ShellStrings.text(text)).lineLimit(1).minimumScaleFactor(0.75) } icon: { Image(systemName: symbol) }
-    }
-
-    /// The chosen control and what to do next, or why it went back. It takes the card's whole width, so the words never wrap word by word.
-    private var status: some View {
-        HStack(alignment: .center, spacing: 12) {
-            Image(systemName: model.selected == nil ? "hand.tap" : model.held ? "hand.draw" : "scope")
-                .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(model.rejected ? DeleteStyle.red : ShellPalette.cream)
-                .frame(width: 36, height: 36)
-                .background((model.rejected ? DeleteStyle.red : ShellPalette.cream).opacity(0.14), in: Circle())
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 3) {
-                if let c = model.selected {
-                    let m = model.editing.mover(c)
-                    Text(m.title).shellType(ShellType.cardTitle)
-                    Text(model.rejected ? ShellStrings.text("No room there. It went back to where it was.")
-                         : model.held ? ShellStrings.text("Move it with the D-pad. A or B puts it down.")
-                         : ShellStrings.text(model.editing.isMoved(m) ? "Moved" : "In its place"))
-                        .shellType(ShellType.note)
-                        .foregroundStyle(model.rejected ? DeleteStyle.red : .white.opacity(0.65))
-                } else {
-                    Text(ShellStrings.text("Choose a control")).shellType(ShellType.cardTitle)
-                    Text(model.rejected ? ShellStrings.text("No room there. It went back to where it was.") : ShellStrings.text("Tap a control in the picture."))
-                        .shellType(ShellType.note).foregroundStyle(model.rejected ? DeleteStyle.red : .white.opacity(0.65))
-                }
-            }
-            .fixedSize(horizontal: false, vertical: true)
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .frame(minHeight: 44)
-        .accessibilityElement(children: .combine)
-        .accessibilityIdentifier("touchLayout.status")
-    }
-
-    /// The four arrows in one row, held sideways where height is short: one step of the chosen control each.
-    private var arrowRow: some View {
-        HStack(spacing: 8) {
-            arrow("chevron.left", "Move left", "left", -1, 0)
-            arrow("chevron.up", "Move up", "up", 0, -1)
-            arrow("chevron.down", "Move down", "down", 0, 1)
-            arrow("chevron.right", "Move right", "right", 1, 0)
-        }
-        .disabled(model.selected == nil)
-    }
-
-    /// Four arrows in a cross, on an upright screen.
-    private var arrowCross: some View {
-        let gap = Color.clear.frame(width: Self.arrowSize, height: Self.arrowSize)
-        return Grid(horizontalSpacing: 6, verticalSpacing: 6) {
-            GridRow { gap; arrow("chevron.up", "Move up", "up", 0, -1); gap }
-            GridRow { arrow("chevron.left", "Move left", "left", -1, 0); gap; arrow("chevron.right", "Move right", "right", 1, 0) }
-            GridRow { gap; arrow("chevron.down", "Move down", "down", 0, 1); gap }
-        }
-        .disabled(model.selected == nil)
-    }
-
-    private func arrow(_ symbol: String, _ label: String.LocalizationValue, _ id: String, _ dx: Int, _ dy: Int) -> some View {
-        Button { if !ignoresPress() { model.nudge(dx: dx, dy: dy) } } label: {
-            Image(systemName: symbol).font(.system(size: 18, weight: .semibold)).frame(width: Self.arrowSize, height: Self.arrowSize)
-        }
-        .buttonStyle(RoundIconButtonStyle(size: Self.arrowSize))
-        .opacity(model.selected == nil ? 0.4 : 1)
-        .buttonRepeatBehavior(.enabled)
-        .accessibilityLabel(ShellStrings.text(label))
-        .accessibilityIdentifier("touchLayout.\(id)")
-        .shellTarget("lay.arrow.\(id)", enabled: model.selected != nil, radius: Self.arrowSize / 2) { model.nudge(dx: dx, dy: dy) }
-    }
 }
 
 /// The Arrangement row of the shell settings' Touch controls group: whether the controls are where they are built in, and the button
@@ -459,19 +659,22 @@ struct TouchArrangeRow: View {
     var arranged: Bool
     @Environment(\.shellOpenTouchLayout) private var open
     var body: some View {
-        HStack(alignment: .center, spacing: 12) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(ShellStrings.text("Arrangement")).shellType(ShellType.settingLabel)
-                Text(ShellStrings.text(arranged ? "Your own" : "Built in")).shellType(ShellType.note).foregroundStyle(.white.opacity(0.5))
+        Button { open?() } label: {
+            HStack {
+                Label(ShellStrings.text("Touch controls"), systemImage: "hand.draw")
+                    .foregroundStyle(.primary)
+                Spacer(minLength: 8)
+                Text(ShellStrings.text(arranged ? "Your own" : "Built in"))
+                    .foregroundStyle(.secondary)
+                Image(systemName: "chevron.right")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+                    .accessibilityHidden(true)
             }
-            .accessibilityElement(children: .combine)
-            Spacer(minLength: 8)
-            Button(ShellStrings.text("Arrange…")) { open?() }
-                .buttonStyle(ShellButtonStyle(fills: true)).frame(width: TouchLayoutEditorView.buttonWidth)
-                .accessibilityIdentifier("shellSettings.arrange")
-                .accessibilityHint(ShellStrings.text("Move single controls where your thumbs want them."))
-                .shellTarget("shs.arrange") { open?() }
         }
+        .buttonStyle(.automatic)
+        .accessibilityIdentifier("shellSettings.arrange")
+        .shellTarget("shs.arrange") { open?() }
     }
 }
 
@@ -506,5 +709,21 @@ extension TouchLayout.Control {
         case .minus: ShellStrings.text("Minus")
         case .plus: ShellStrings.text("Plus")
         }
+    }
+}
+
+private struct TouchEditorTip: Tip {
+    let id = "nx2apple.touchLayoutEditor.optionsTip"
+    var title: Text { Text(ShellStrings.text("Edit controls here. Save when finished.")) }
+}
+
+private struct ShellDismissTouchEditorKey: EnvironmentKey {
+    nonisolated(unsafe) static let defaultValue: (() -> Void)? = nil
+}
+
+extension EnvironmentValues {
+    var shellDismissTouchEditor: (() -> Void)? {
+        get { self[ShellDismissTouchEditorKey.self] }
+        set { self[ShellDismissTouchEditorKey.self] = newValue }
     }
 }
